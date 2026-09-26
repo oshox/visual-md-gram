@@ -537,6 +537,18 @@ pub struct HighlightStyle {
 
     /// Similar to the CSS `opacity` property, this will cause the text to be less vibrant.
     pub fade_out: Option<f32>,
+
+    /// A multiplier applied to the whole line's font size and line height when this
+    /// highlight is present (e.g. `1.8` for an H1-sized heading line). Unlike every
+    /// other field here, this applies to the *entire display row* the highlighted
+    /// range falls on, not just the highlighted bytes — `TextStyle`'s doc comment
+    /// on this struct promises "a single font, uniformly sized and spaced text"
+    /// precisely because normal highlights only vary per-run styling within an
+    /// otherwise uniformly-shaped line; a consumer that wants real per-row sizing
+    /// (see `editor`'s `glass_md` heading support) must read this off any chunk on
+    /// the row and use it to pick that row's `shape_line` font size itself, since
+    /// `shape_line` only accepts one font size for the whole line it shapes.
+    pub font_size_scale: Option<f32>,
 }
 
 impl Eq for HighlightStyle {}
@@ -551,6 +563,9 @@ impl Hash for HighlightStyle {
         self.strikethrough.hash(state);
         state.write_u32(u32::from_be_bytes(
             self.fade_out.map(|f| f.to_be_bytes()).unwrap_or_default(),
+        ));
+        state.write_u32(u32::from_be_bytes(
+            self.font_size_scale.map(|f| f.to_be_bytes()).unwrap_or_default(),
         ));
     }
 }
@@ -860,6 +875,7 @@ impl From<&TextStyle> for HighlightStyle {
             underline: other.underline,
             strikethrough: other.strikethrough,
             fade_out: None,
+            font_size_scale: None,
         }
     }
 }
@@ -900,6 +916,7 @@ impl HighlightStyle {
                         .unwrap_or(source_fade)
                 })
                 .or(self.fade_out),
+            font_size_scale: other.font_size_scale.or(self.font_size_scale),
         }
     }
 }
@@ -1316,6 +1333,7 @@ mod tests {
                 color: Some(red()),
                 wavy: true,
             }),
+            font_size_scale: None,
         };
         let expected_style = style_b;
 
@@ -1348,6 +1366,7 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            font_size_scale: None,
         };
 
         let expected_style = HighlightStyle {
@@ -1366,6 +1385,7 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            font_size_scale: None,
         };
 
         let style_c = style_c.highlight(style_d);

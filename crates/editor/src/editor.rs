@@ -916,6 +916,14 @@ pub struct Editor {
     show_breakpoints: Option<bool>,
     show_wrap_guides: Option<bool>,
     show_indent_guides: Option<bool>,
+    /// Overrides `EditorSettings::gutter.folds` for this editor instance.
+    /// Unlike that global setting, this also suppresses the indentation-based
+    /// fold-affordance fallback (`EditorSnapshot::starts_indent`) that fires
+    /// independently of any actual crease existing — a real-code heuristic
+    /// that doesn't belong in a view where "foldable" isn't a meaningful
+    /// concept (e.g. a Markdown live-preview buffer whose own folds are
+    /// permanent decorative replacements, not user-collapsible regions).
+    show_fold_indicators: Option<bool>,
     buffers_with_disabled_indent_guides: HashSet<BufferId>,
     highlight_order: usize,
     highlighted_rows: HashMap<TypeId, Vec<RowHighlight>>,
@@ -1076,6 +1084,7 @@ pub struct EditorSnapshot {
     show_code_actions: Option<bool>,
     show_runnables: Option<bool>,
     show_breakpoints: Option<bool>,
+    show_fold_indicators: Option<bool>,
     git_blame_gutter_max_author_length: Option<usize>,
     pub display_snapshot: DisplaySnapshot,
     pub placeholder_display_snapshot: Option<DisplaySnapshot>,
@@ -1984,6 +1993,7 @@ impl Editor {
             show_breakpoints: None,
             show_wrap_guides: None,
             show_indent_guides,
+            show_fold_indicators: None,
             buffers_with_disabled_indent_guides: HashSet::default(),
             highlight_order: 0,
             highlighted_rows: HashMap::default(),
@@ -2561,6 +2571,7 @@ impl Editor {
             show_code_actions: self.show_code_actions,
             show_runnables: self.show_runnables,
             show_breakpoints: self.show_breakpoints,
+            show_fold_indicators: self.show_fold_indicators,
             git_blame_gutter_max_author_length,
             display_snapshot: self.display_map.update(cx, |map, cx| map.snapshot(cx)),
             placeholder_display_snapshot: self
@@ -6432,6 +6443,7 @@ impl Editor {
                 constrain_width: false,
                 merge_adjacent: false,
                 type_tag: Some(type_id),
+                collapsed_text: None,
             };
             let creases = new_newlines
                 .into_iter()
@@ -16757,6 +16769,11 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn set_show_fold_indicators(&mut self, show_fold_indicators: bool, cx: &mut Context<Self>) {
+        self.show_fold_indicators = Some(show_fold_indicators);
+        cx.notify();
+    }
+
     pub fn disable_expand_excerpt_buttons(&mut self, cx: &mut Context<Self>) {
         self.disable_expand_excerpt_buttons = true;
         cx.notify();
@@ -20438,6 +20455,19 @@ impl EditorSnapshot {
         let mut is_foldable = false;
 
         if let Some(crease) = self.crease_snapshot.query_row(buffer_row, self.buffer_snapshot()) {
+            // A crease that opts out of the gutter toggle (e.g. glass_md's
+            // permanent decorative replacements) shouldn't fall through to
+            // the generic `folded || ...` disclosure below either — that
+            // fallback exists for a real, user-collapsible region, not a
+            // crease that was never meant to be toggled via the gutter at
+            // all. See `Crease::hide_gutter_toggle`'s doc comment.
+            if let Crease::Inline {
+                hide_gutter_toggle: true,
+                ..
+            } = crease
+            {
+                return None;
+            }
             is_foldable = true;
             match crease {
                 Crease::Inline { render_toggle, .. } | Crease::Block { render_toggle, .. } => {

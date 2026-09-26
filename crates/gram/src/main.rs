@@ -549,6 +549,7 @@ pub fn main() {
         git_ui::init(cx);
         git_graph::init(cx);
         markdown_preview::init(cx);
+        glass_md::init(cx);
         svg_preview::init(cx);
         onboarding::init(cx);
         settings_ui::init(cx);

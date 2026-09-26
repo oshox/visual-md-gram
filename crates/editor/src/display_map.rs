@@ -1227,12 +1227,14 @@ impl DisplaySnapshot {
                     render_toggle,
                     render_trailer,
                     metadata,
+                    hide_gutter_toggle,
                 } => Some(Crease::Inline {
                     range: range.to_point(self.buffer_snapshot()),
                     placeholder: placeholder.clone(),
                     render_toggle: render_toggle.clone(),
                     render_trailer: render_trailer.clone(),
                     metadata: metadata.clone(),
+                    hide_gutter_toggle: *hide_gutter_toggle,
                 }),
                 Crease::Block {
                     range,
@@ -1288,6 +1290,7 @@ impl DisplaySnapshot {
                 render_toggle: None,
                 render_trailer: None,
                 metadata: None,
+                hide_gutter_toggle: false,
             })
         } else {
             None

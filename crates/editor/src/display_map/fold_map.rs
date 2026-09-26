@@ -4,7 +4,7 @@ use super::{
     Highlights,
     inlay_map::{InlayBufferRows, InlayChunks, InlayEdit, InlayOffset, InlayPoint, InlaySnapshot},
 };
-use gpui::{AnyElement, App, ElementId, HighlightStyle, Pixels, Window};
+use gpui::{AnyElement, App, ElementId, HighlightStyle, Pixels, SharedString, Window};
 use language::{Edit, HighlightId, Point};
 use multi_buffer::{
     Anchor, AnchorRangeExt, MBTextSummary, MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot, RowInfo, ToOffset,
@@ -32,6 +32,9 @@ pub struct FoldPlaceholder {
     pub merge_adjacent: bool,
     /// Category of the fold. Useful for carefully removing from overlapping folds.
     pub type_tag: Option<TypeId>,
+    /// Text provided by the language server to display in place of the folded range.
+    /// When set, this is used instead of the default "⋯" ellipsis.
+    pub collapsed_text: Option<SharedString>,
 }
 
 impl Default for FoldPlaceholder {
@@ -41,6 +44,7 @@ impl Default for FoldPlaceholder {
             constrain_width: true,
             merge_adjacent: true,
             type_tag: None,
+            collapsed_text: None,
         }
     }
 }
@@ -53,6 +57,7 @@ impl FoldPlaceholder {
             constrain_width: true,
             merge_adjacent: true,
             type_tag: None,
+            collapsed_text: None,
         }
     }
 }
@@ -61,6 +66,7 @@ impl fmt::Debug for FoldPlaceholder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FoldPlaceholder")
             .field("constrain_width", &self.constrain_width)
+            .field("collapsed_text", &self.collapsed_text)
             .finish()
     }
 }
@@ -69,7 +75,9 @@ impl Eq for FoldPlaceholder {}
 
 impl PartialEq for FoldPlaceholder {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.render, &other.render) && self.constrain_width == other.constrain_width
+        Arc::ptr_eq(&self.render, &other.render)
+            && self.constrain_width == other.constrain_width
+            && self.collapsed_text == other.collapsed_text
     }
 }
 
@@ -501,16 +509,22 @@ impl FoldMap {
                     if fold_range.end > fold_range.start {
                         const ELLIPSIS: &str = "⋯";
 
+                        let placeholder_text: SharedString =
+                            fold.placeholder.collapsed_text.clone().unwrap_or_else(|| ELLIPSIS.into());
+                        let chars_bitmap = placeholder_text
+                            .char_indices()
+                            .fold(0u128, |bitmap, (idx, _)| bitmap | 1u128.unbounded_shl(idx as u32));
+
                         let fold_id = fold.id;
                         new_transforms.push(
                             Transform {
                                 summary: TransformSummary {
-                                    output: MBTextSummary::from(ELLIPSIS),
+                                    output: MBTextSummary::from(placeholder_text.as_ref()),
                                     input: inlay_snapshot.text_summary_for_range(fold_range.start..fold_range.end),
                                 },
                                 placeholder: Some(TransformPlaceholder {
-                                    text: ELLIPSIS,
-                                    chars: 1,
+                                    text: placeholder_text,
+                                    chars: chars_bitmap,
                                     renderer: ChunkRenderer {
                                         id: ChunkRendererId::Fold(fold.id),
                                         render: Arc::new(move |cx| {
@@ -1013,7 +1027,7 @@ struct Transform {
 
 #[derive(Clone, Debug)]
 struct TransformPlaceholder {
-    text: &'static str,
+    text: SharedString,
     chars: u128,
     renderer: ChunkRenderer,
 }
@@ -1367,7 +1381,7 @@ impl<'a> Iterator for FoldChunks<'a> {
 
             self.output_offset.0 += placeholder.text.len();
             return Some(Chunk {
-                text: placeholder.text,
+                text: &placeholder.text,
                 chars: placeholder.chars,
                 renderer: Some(placeholder.renderer.clone()),
                 ..Default::default()

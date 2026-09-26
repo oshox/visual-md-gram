@@ -3689,6 +3689,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c426daf70099baff33fac0ba85151c42424861c56828cef9ba02dacb78eb6b26"
 
 [[package]]
+name = "glass_md"
+version = "3.3.0"
+dependencies = [
+ "assets",
+ "editor",
+ "gpui",
+ "language",
+ "multi_buffer",
+ "release_channel",
+ "settings",
+ "theme",
+ "tree-sitter",
+ "tree-sitter-md",
+ "util",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3938,6 +3955,7 @@ dependencies = [
  "git_graph",
  "git_hosting_providers",
  "git_ui",
+ "glass_md",
  "go_to_line",
  "gpui",
  "gpui_tokio",

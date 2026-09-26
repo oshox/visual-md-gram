@@ -166,6 +166,7 @@ impl VsCodeSettings {
             file_finder: None,
             git: self.git_settings_content(),
             git_panel: self.git_panel_settings_content(),
+            glass_md: None,
             global_lsp_settings: None,
             helix_mode: None,
             image_viewer: None,

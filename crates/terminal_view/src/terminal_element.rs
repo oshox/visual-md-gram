@@ -871,6 +871,7 @@ impl Element for TerminalElement {
                     }),
                     strikethrough: None,
                     fade_out: None,
+                    font_size_scale: None,
                 };
 
                 let text_style = TextStyle {
@@ -1481,6 +1482,7 @@ fn to_highlighted_range_lines(
         highlighted_range_lines.push(HighlightedRangeLine {
             start_x: origin.x + line_start as f32 * layout.dimensions.cell_width,
             end_x: origin.x + line_end as f32 * layout.dimensions.cell_width,
+            height: layout.dimensions.line_height,
         });
     }
 

@@ -74,6 +74,9 @@ pub struct SettingsContent {
     /// Configuration for Git-related features
     pub git: Option<GitSettings>,
 
+    /// Settings for glass_md's Obsidian-style live-preview Markdown editor.
+    pub glass_md: Option<GlassMdSettingsContent>,
+
     /// Common language server settings.
     pub global_lsp_settings: Option<GlobalLspSettingsContent>,
 
@@ -506,6 +509,20 @@ pub struct VimSettingsContent {
     pub custom_digraphs: Option<HashMap<String, Arc<str>>>,
     pub highlight_on_yank_duration: Option<u64>,
     pub cursor_shape: Option<CursorShapeSettings>,
+}
+
+/// Settings for glass_md's Obsidian-style live-preview Markdown editor: markdown
+/// formatting is rendered inline as you type, with raw markdown syntax revealed
+/// only on the line (or span) the cursor is touching. See
+/// docs/live-preview-spec.md for the full behavior spec.
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug, JsonSchema, MergeFrom)]
+pub struct GlassMdSettingsContent {
+    /// Whether to render Markdown buffers with live preview instead of plain
+    /// source text.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 #[derive(Copy, Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Debug)]

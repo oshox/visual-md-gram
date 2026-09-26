@@ -1595,13 +1595,17 @@ impl EditorElement {
                     };
 
                     let x = cursor_character_x - scroll_pixel_position.x.into();
-                    let y = ((cursor_position.row().as_f64() - scroll_position.y)
-                        * ScrollPixelOffset::from(line_height))
-                    .into();
+                    let y = LineWithInvisibles::row_y_offset(
+                        cursor_position.row(),
+                        line_layouts,
+                        visible_display_row_range.start,
+                        scroll_position,
+                        line_height,
+                    );
                     if selection.is_newest {
                         editor.pixel_position_of_newest_cursor = Some(point(
                             text_hitbox.origin.x + x + block_width / 2.,
-                            text_hitbox.origin.y + y + line_height / 2.,
+                            text_hitbox.origin.y + y + cursor_row_layout.row_height / 2.,
                         ));
 
                         if autoscroll_containing_element {
@@ -1631,7 +1635,7 @@ impl EditorElement {
                         color: player_color.cursor,
                         block_width,
                         origin: point(x, y),
-                        line_height,
+                        line_height: cursor_row_layout.row_height,
                         shape: selection.cursor_shape,
                         block_text,
                         cursor_name: None,
@@ -1917,9 +1921,11 @@ impl EditorElement {
         &self,
         crease_toggles: &mut [Option<AnyElement>],
         line_height: Pixels,
+        line_layouts: &[LineWithInvisibles],
         gutter_dimensions: &GutterDimensions,
         gutter_settings: crate::editor_settings::Gutter,
-        scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
+        scroll_position: gpui::Point<ScrollOffset>,
+        start_row: DisplayRow,
         gutter_hitbox: &Hitbox,
         window: &mut Window,
         cx: &mut App,
@@ -1930,9 +1936,10 @@ impl EditorElement {
                 let available_space = size(AvailableSpace::MinContent, AvailableSpace::Definite(line_height * 0.55));
                 let crease_toggle_size = crease_toggle.layout_as_root(available_space, window, cx);
 
+                let display_row = DisplayRow(start_row.0 + ix as u32);
                 let position = point(
                     gutter_dimensions.width - gutter_dimensions.right_padding,
-                    ix as f32 * line_height - (scroll_pixel_position.y % ScrollPixelOffset::from(line_height)).into(),
+                    LineWithInvisibles::row_y_offset(display_row, line_layouts, start_row, scroll_position, line_height),
                 );
                 let centering_offset = point(
                     (gutter_dimensions.fold_area_width() - crease_toggle_size.width) / 2.,
@@ -1964,6 +1971,8 @@ impl EditorElement {
         line_height: Pixels,
         content_origin: gpui::Point<Pixels>,
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
+        scroll_position: gpui::Point<ScrollOffset>,
+        start_row: DisplayRow,
         em_width: Pixels,
         window: &mut Window,
         cx: &mut App,
@@ -1984,9 +1993,15 @@ impl EditorElement {
                 };
                 let position = point(
                     Pixels::from(scroll_pixel_position.x) + line.width + padding,
-                    ix as f32 * line_height - (scroll_pixel_position.y % ScrollPixelOffset::from(line_height)).into(),
+                    LineWithInvisibles::row_y_offset(
+                        DisplayRow(start_row.0 + ix as u32),
+                        lines,
+                        start_row,
+                        scroll_position,
+                        line_height,
+                    ),
                 );
-                let centering_offset = point(px(0.), (line_height - size.height) / 2.);
+                let centering_offset = point(px(0.), (line.row_height - size.height) / 2.);
                 let origin = content_origin + position + centering_offset;
                 element.prepaint_as_root(origin, available_space, window, cx);
                 Some(CreaseTrailerLayout {
@@ -2128,7 +2143,8 @@ impl EditorElement {
                 continue;
             };
 
-            let pos_y = content_origin.y + line_height * (row.0 as f64 - scroll_position.y) as f32;
+            let pos_y = content_origin.y
+                + LineWithInvisibles::row_y_offset(row, line_layouts, start_row, scroll_position, line_height);
 
             let window_ix = row.0.saturating_sub(start_row.0) as usize;
             let pos_x = {
@@ -2326,6 +2342,8 @@ impl EditorElement {
         display_row: DisplayRow,
         row_info: &RowInfo,
         line_layout: &LineWithInvisibles,
+        line_layouts: &[LineWithInvisibles],
+        start_row: DisplayRow,
         crease_trailer: Option<&CreaseTrailerLayout>,
         em_width: Pixels,
         content_origin: gpui::Point<Pixels>,
@@ -2357,7 +2375,8 @@ impl EditorElement {
         text_style.line_height = line_height.into();
         let mut element = render_inline_blame_entry(entry.clone(), &text_style, cx)?;
 
-        let start_y = content_origin.y + line_height * ((display_row.as_f64() - scroll_position.y) as f32);
+        let start_y = content_origin.y
+            + LineWithInvisibles::row_y_offset(display_row, line_layouts, start_row, scroll_position, line_height);
 
         let start_x = {
             let line_end = if let Some(crease_trailer) = crease_trailer {
@@ -2948,6 +2967,7 @@ impl EditorElement {
         &self,
         gutter_hitbox: Option<&Hitbox>,
         gutter_dimensions: GutterDimensions,
+        line_layouts: &[LineWithInvisibles],
         line_height: Pixels,
         scroll_position: gpui::Point<ScrollOffset>,
         rows: Range<DisplayRow>,
@@ -3006,25 +3026,27 @@ impl EditorElement {
                 })
                 .unwrap_or_else(|| cx.theme().colors().editor_line_number);
             let shaped_line = self.shape_line_number(SharedString::from(&line_number), color, window, cx);
-            let scroll_top = scroll_position.y * ScrollPixelOffset::from(line_height);
+            let row_top = LineWithInvisibles::row_y_offset(display_row, line_layouts, rows.start, scroll_position, line_height);
+            let row_height = line_layouts.get(ix).map_or(line_height, |line| line.row_height);
             let line_origin = gutter_hitbox.map(|hitbox| {
                 hitbox.origin
                     + point(
                         hitbox.size.width - shaped_line.width - gutter_dimensions.right_padding,
-                        ix as f32 * line_height - Pixels::from(scroll_top % ScrollPixelOffset::from(line_height)),
+                        row_top,
                     )
             });
 
             #[cfg(not(test))]
             let hitbox = line_origin.map(|line_origin| {
                 window.insert_hitbox(
-                    Bounds::new(line_origin, size(shaped_line.width, line_height)),
+                    Bounds::new(line_origin, size(shaped_line.width, row_height)),
                     HitboxBehavior::Normal,
                 )
             });
             #[cfg(test)]
             let hitbox = {
                 let _ = line_origin;
+                let _ = row_height;
                 None
             };
 
@@ -3059,6 +3081,7 @@ impl EditorElement {
         cx: &mut App,
     ) -> Vec<Option<AnyElement>> {
         let include_fold_statuses = EditorSettings::get_global(cx).gutter.folds
+            && snapshot.show_fold_indicators.unwrap_or(true)
             && snapshot.mode.is_full()
             && self.editor.read(cx).buffer_kind(cx) == ItemBufferKind::Singleton;
         if include_fold_statuses {
@@ -3297,6 +3320,7 @@ impl EditorElement {
                         fragments: smallvec![LineFragment::Text(line)],
                         invisibles: Vec::new(),
                         font_size,
+                        row_height: style.text.line_height_in_pixels(window.rem_size()),
                     }
                 })
                 .collect()
@@ -3328,15 +3352,25 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> SmallVec<[AnyElement; 1]> {
+        // Computed up front (rather than via `LineWithInvisibles::prepaint`'s
+        // own uniform formula) so a row with a `row_height` override (e.g. a
+        // glass_md heading) shifts every row below it down by the right
+        // amount — see `row_y_offset`'s doc comment. Collected into a `Vec`
+        // before the mutable iteration below since `row_y_offset` needs an
+        // immutable view of the very slice being iterated mutably.
+        let line_ys: Vec<Pixels> = (0..line_layouts.len())
+            .map(|ix| {
+                let row = start_row + DisplayRow(ix as u32);
+                LineWithInvisibles::row_y_offset(row, line_layouts, start_row, scroll_position, line_height)
+            })
+            .collect();
         let mut line_elements = SmallVec::new();
         for (ix, line) in line_layouts.iter_mut().enumerate() {
-            let row = start_row + DisplayRow(ix as u32);
-            line.prepaint(
+            line.prepaint_with_custom_offset(
                 line_height,
-                scroll_position,
                 scroll_pixel_position,
-                row,
                 content_origin,
+                line_ys[ix],
                 &mut line_elements,
                 window,
                 cx,
@@ -5354,7 +5388,6 @@ impl EditorElement {
 
     fn paint_background(&self, layout: &EditorLayout, window: &mut Window, cx: &mut App) {
         window.paint_layer(layout.hitbox.bounds, |window| {
-            let scroll_top = layout.position_map.snapshot.scroll_position().y;
             let gutter_bg = cx.theme().colors().editor_gutter_background;
             window.paint_quad(fill(layout.gutter_hitbox.bounds, gutter_bg));
             window.paint_quad(fill(layout.position_map.text_hitbox.bounds, self.style.background));
@@ -5396,19 +5429,24 @@ impl EditorElement {
                         };
                         if let Some(range) = highlight_h_range {
                             let active_line_bg = cx.theme().colors().editor_active_line_background;
+                            let viewport_start = layout.visible_display_row_range.start;
+                            let top = LineWithInvisibles::row_y_offset(
+                                *start_row,
+                                &layout.position_map.line_layouts,
+                                viewport_start,
+                                layout.position_map.scroll_position,
+                                layout.position_map.line_height,
+                            );
+                            let bottom = LineWithInvisibles::row_y_offset(
+                                DisplayRow(end_row + 1),
+                                &layout.position_map.line_layouts,
+                                viewport_start,
+                                layout.position_map.scroll_position,
+                                layout.position_map.line_height,
+                            );
                             let bounds = Bounds {
-                                origin: point(
-                                    range.start,
-                                    layout.hitbox.origin.y
-                                        + Pixels::from(
-                                            (start_row.as_f64() - scroll_top)
-                                                * ScrollPixelOffset::from(layout.position_map.line_height),
-                                        ),
-                                ),
-                                size: size(
-                                    range.end - range.start,
-                                    layout.position_map.line_height * (end_row - start_row.0 + 1) as f32,
-                                ),
+                                origin: point(range.start, layout.hitbox.origin.y + top),
+                                size: size(range.end - range.start, bottom - top),
                             };
                             window.paint_quad(fill(bounds, active_line_bg));
                         }
@@ -5426,19 +5464,23 @@ impl EditorElement {
                         width -= layout.gutter_hitbox.size.width;
                     }
 
-                    let origin = point(
-                        origin_x,
-                        layout.hitbox.origin.y
-                            + Pixels::from(
-                                (highlight_row_start.as_f64() - scroll_top)
-                                    * ScrollPixelOffset::from(layout.position_map.line_height),
-                            ),
+                    let viewport_start = layout.visible_display_row_range.start;
+                    let top = LineWithInvisibles::row_y_offset(
+                        highlight_row_start,
+                        &layout.position_map.line_layouts,
+                        viewport_start,
+                        layout.position_map.scroll_position,
+                        layout.position_map.line_height,
                     );
-                    let size = size(
-                        width,
-                        layout.position_map.line_height
-                            * highlight_row_end.next_row().minus(highlight_row_start) as f32,
+                    let bottom = LineWithInvisibles::row_y_offset(
+                        highlight_row_end.next_row(),
+                        &layout.position_map.line_layouts,
+                        viewport_start,
+                        layout.position_map.scroll_position,
+                        layout.position_map.line_height,
                     );
+                    let origin = point(origin_x, layout.hitbox.origin.y + top);
+                    let size = size(width, bottom - top);
                     let mut quad = fill(Bounds { origin, size }, highlight.background);
                     if let Some(border_color) = highlight.border {
                         quad.border_color = border_color;
@@ -5582,7 +5624,6 @@ impl EditorElement {
     fn paint_line_numbers(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
         let is_singleton = self.editor.read(cx).buffer_kind(cx) == ItemBufferKind::Singleton;
 
-        let line_height = layout.position_map.line_height;
         window.set_cursor_style(CursorStyle::Arrow, &layout.gutter_hitbox);
 
         for line_layout in layout.line_numbers.values() {
@@ -5590,16 +5631,22 @@ impl EditorElement {
                 let Some(hitbox) = hitbox else {
                     continue;
                 };
+                // Each hitbox's own height, not the editor's uniform
+                // `line_height`: `layout_line_numbers` already sized it to
+                // match its row (see `row_height` there), so a line number
+                // stays vertically centered even next to a taller row (e.g.
+                // a glass_md heading).
+                let row_height = hitbox.size.height;
 
                 let Some(()) = (if !is_singleton && hitbox.is_hovered(window) {
                     let color = cx.theme().colors().editor_hover_line_number;
 
                     let line = self.shape_line_number(shaped_line.text.clone(), color, window, cx);
-                    line.paint(hitbox.origin, line_height, TextAlign::Left, None, window, cx)
+                    line.paint(hitbox.origin, row_height, TextAlign::Left, None, window, cx)
                         .log_err()
                 } else {
                     shaped_line
-                        .paint(hitbox.origin, line_height, TextAlign::Left, None, window, cx)
+                        .paint(hitbox.origin, row_height, TextAlign::Left, None, window, cx)
                         .log_err()
                 }) else {
                     continue;
@@ -5978,12 +6025,21 @@ impl EditorElement {
             .language_settings(cx)
             .show_whitespaces;
 
+        let start_row = layout.visible_display_row_range.start;
         for (ix, line_with_invisibles) in layout.position_map.line_layouts.iter().enumerate() {
-            let row = DisplayRow(layout.visible_display_row_range.start.0 + ix as u32);
-            line_with_invisibles.draw(
+            let row = DisplayRow(start_row.0 + ix as u32);
+            let line_y = LineWithInvisibles::row_y_offset(
+                row,
+                &layout.position_map.line_layouts,
+                start_row,
+                layout.position_map.scroll_position,
+                layout.position_map.line_height,
+            );
+            line_with_invisibles.draw_with_custom_offset(
                 layout,
                 row,
                 layout.content_origin,
+                line_y,
                 whitespace_setting,
                 invisible_display_ranges,
                 window,
@@ -6535,9 +6591,12 @@ impl EditorElement {
                 line_height: layout.position_map.line_height,
                 corner_radius,
                 start_y: layout.content_origin.y
-                    + Pixels::from(
-                        (row_range.start.as_f64() - layout.position_map.scroll_position.y)
-                            * ScrollOffset::from(layout.position_map.line_height),
+                    + LineWithInvisibles::row_y_offset(
+                        row_range.start,
+                        &layout.position_map.line_layouts,
+                        start_row,
+                        layout.position_map.scroll_position,
+                        layout.position_map.line_height,
                     ),
                 lines: row_range
                     .iter_rows()
@@ -6545,6 +6604,7 @@ impl EditorElement {
                         let line_layout = &layout.position_map.line_layouts[row.minus(start_row) as usize];
                         let alignment_offset = line_layout.alignment_offset(layout.text_align, layout.content_width);
                         HighlightedRangeLine {
+                            height: line_layout.row_height,
                             start_x: if row == range.start.row() {
                                 layout.content_origin.x
                                     + Pixels::from(
@@ -7282,6 +7342,13 @@ pub(crate) struct LineWithInvisibles {
     len: usize,
     pub(crate) width: Pixels,
     font_size: Pixels,
+    /// This row's own line height. Ordinarily equal to the editor's uniform
+    /// line height, but can be larger for a row whose highlight carries
+    /// `font_size_scale` (see `HighlightStyle::font_size_scale`), e.g. a
+    /// glass_md heading. `row_y_offset` below sums these to position every row
+    /// correctly regardless of what's above it, rather than assuming every
+    /// row occupies the same height.
+    pub(crate) row_height: Pixels,
 }
 
 enum LineFragment {
@@ -7330,6 +7397,15 @@ impl LineWithInvisibles {
         let mut row = 0;
         let mut line_exceeded_max_len = false;
         let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let uniform_line_height = text_style.line_height_in_pixels(window.rem_size());
+        // Tracks a whole-row font size override for the row currently being
+        // accumulated (e.g. a glass_md heading), read off any chunk on that
+        // row whose highlight carries `font_size_scale` — see
+        // `HighlightStyle::font_size_scale`'s doc comment for why this has
+        // to be a per-row, not per-run, size: `shape_line` only accepts one
+        // font size for the whole line it shapes. Reset to the uniform
+        // `font_size` every time a row boundary is crossed below.
+        let mut current_row_font_size = font_size;
         let min_contrast = EditorSettings::get_global(cx).minimum_contrast_for_highlights;
 
         let ellipsis = SharedString::from("⋯");
@@ -7341,6 +7417,9 @@ impl LineWithInvisibles {
             is_inlay: false,
             replacement: None,
         }]) {
+            if let Some(scale) = highlighted_chunk.style.and_then(|style| style.font_size_scale) {
+                current_row_font_size = font_size * scale;
+            }
             if let Some(replacement) = highlighted_chunk.replacement {
                 if !line.is_empty() {
                     let segments = bg_segments_per_row.get(row).map(|v| &v[..]).unwrap_or(&[]);
@@ -7351,7 +7430,7 @@ impl LineWithInvisibles {
                     };
                     let shaped_line = window
                         .text_system()
-                        .shape_line(line.clone().into(), font_size, text_runs, None);
+                        .shape_line(line.clone().into(), current_row_font_size, text_runs, None);
                     width += shaped_line.width;
                     len += shaped_line.len;
                     fragments.push(LineFragment::Text(shaped_line));
@@ -7369,7 +7448,7 @@ impl LineWithInvisibles {
                             };
                             let shaped_line = window.text_system().shape_line(
                                 chunk,
-                                font_size,
+                                current_row_font_size,
                                 &[text_style.to_run(highlighted_chunk.text.len())],
                                 None,
                             );
@@ -7383,7 +7462,11 @@ impl LineWithInvisibles {
                             window,
                             max_width: text_width,
                         });
-                        let line_height = text_style.line_height_in_pixels(window.rem_size());
+                        // Scaled by the same ratio as `current_row_font_size` so a
+                        // fold placeholder (e.g. a hidden heading marker) sized for
+                        // this row doesn't end up shorter than the row's actual text.
+                        let line_height =
+                            uniform_line_height * (f32::from(current_row_font_size) / f32::from(font_size));
                         let size = element.layout_as_root(
                             size(available_width, AvailableSpace::Definite(line_height)),
                             window,
@@ -7416,7 +7499,7 @@ impl LineWithInvisibles {
                         };
                         let line_layout = window
                             .text_system()
-                            .shape_line(x, font_size, &[run], None)
+                            .shape_line(x, current_row_font_size, &[run], None)
                             .with_len(highlighted_chunk.text.len());
 
                         width += line_layout.width;
@@ -7436,7 +7519,7 @@ impl LineWithInvisibles {
                         let shaped_line =
                             window
                                 .text_system()
-                                .shape_line(line.clone().into(), font_size, text_runs, None);
+                                .shape_line(line.clone().into(), current_row_font_size, text_runs, None);
                         width += shaped_line.width;
                         len += shaped_line.len;
                         fragments.push(LineFragment::Text(shaped_line));
@@ -7445,12 +7528,18 @@ impl LineWithInvisibles {
                             len: mem::take(&mut len),
                             fragments: mem::take(&mut fragments),
                             invisibles: std::mem::take(&mut invisibles),
-                            font_size,
+                            font_size: current_row_font_size,
+                            row_height: uniform_line_height
+                                * (f32::from(current_row_font_size) / f32::from(font_size)),
                         });
 
                         line.clear();
                         styles.clear();
                         row += 1;
+                        // The row that was just flushed is done; the next row
+                        // starts back at the uniform size unless a later chunk
+                        // on it declares its own `font_size_scale` again.
+                        current_row_font_size = font_size;
                         line_exceeded_max_len = false;
                         non_whitespace_added = false;
                         if row == max_line_count {
@@ -7591,27 +7680,90 @@ impl LineWithInvisibles {
         output_runs
     }
 
-    fn prepaint(
-        &mut self,
-        line_height: Pixels,
-        scroll_position: gpui::Point<ScrollOffset>,
-        scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
+    /// Computes the Y offset (relative to where `start_row` would sit at zero
+    /// scroll) at which `row` should be painted, generalizing the uniform
+    /// `line_height * (row - scroll_position.y)` formula used throughout this
+    /// file so per-row height overrides (see `row_height`'s doc comment,
+    /// e.g. a glass_md heading) are accounted for. This is the canonical
+    /// replacement for that formula everywhere a row's paint position is
+    /// computed — it reduces to exactly the uniform formula whenever every
+    /// row's `row_height` equals `line_height` (the overwhelming common
+    /// case), so it's a safe drop-in rather than a new code path with
+    /// different default behavior.
+    ///
+    /// `line_layouts` must be exactly the layouts for
+    /// `[start_row, start_row + line_layouts.len())`, i.e. what
+    /// `layout_lines`/`Self::from_chunks` produced for some visible range.
+    /// `row` need not itself be inside that range: this extrapolates using
+    /// the uniform `line_height` beyond it, matching what the original
+    /// formula did everywhere, since it had no finer-grained information to
+    /// do otherwise for rows outside the rendered viewport.
+    pub(crate) fn row_y_offset(
         row: DisplayRow,
-        content_origin: gpui::Point<Pixels>,
-        line_elements: &mut SmallVec<[AnyElement; 1]>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let line_y = f32::from(line_height) * Pixels::from(row.as_f64() - scroll_position.y);
-        self.prepaint_with_custom_offset(
-            line_height,
-            scroll_pixel_position,
-            content_origin,
-            line_y,
-            line_elements,
-            window,
-            cx,
-        );
+        line_layouts: &[LineWithInvisibles],
+        start_row: DisplayRow,
+        scroll_position: gpui::Point<ScrollOffset>,
+        line_height: Pixels,
+    ) -> Pixels {
+        let index = row.0 as i64 - start_row.0 as i64;
+
+        let cumulative_height = |rows: i64| -> Pixels {
+            if rows <= 0 {
+                return line_height * rows as f32;
+            }
+            let in_range_count = (rows as usize).min(line_layouts.len());
+            let mut sum = Pixels::ZERO;
+            for line in &line_layouts[..in_range_count] {
+                sum += line.row_height;
+            }
+            if rows as usize > line_layouts.len() {
+                sum += line_height * (rows as usize - line_layouts.len()) as f32;
+            }
+            sum
+        };
+
+        let first_row_height = line_layouts.first().map_or(line_height, |line| line.row_height);
+        let fractional_rows = scroll_position.y - start_row.as_f64();
+
+        cumulative_height(index) - first_row_height * fractional_rows as f32
+    }
+
+    /// The inverse of [`Self::row_y_offset`]: given a Y position relative to
+    /// where `start_row` would sit at zero scroll, finds which row it falls
+    /// in. Used for hit-testing (turning a mouse click's pixel position back
+    /// into a row) — see `PositionMap::point_for_position`. Reduces to
+    /// exactly the original `(y / line_height) + scroll_position.y` formula
+    /// whenever every row's `row_height` equals `line_height`, for the same
+    /// reason `row_y_offset` does.
+    pub(crate) fn row_for_y(
+        y: Pixels,
+        line_layouts: &[LineWithInvisibles],
+        start_row: DisplayRow,
+        scroll_position: gpui::Point<ScrollOffset>,
+        line_height: Pixels,
+    ) -> DisplayRow {
+        let line_height_f = f32::from(line_height);
+        let first_row_height = f32::from(line_layouts.first().map_or(line_height, |line| line.row_height));
+        let fractional_rows = (scroll_position.y - start_row.as_f64()) as f32;
+        let target = f32::from(y) + first_row_height * fractional_rows;
+
+        if target < 0.0 {
+            let rows_back = (-target / line_height_f).floor() as i64;
+            return DisplayRow((start_row.0 as i64 - rows_back - 1).max(0) as u32);
+        }
+
+        let mut acc = 0.0f32;
+        for (ix, line) in line_layouts.iter().enumerate() {
+            let next = acc + f32::from(line.row_height);
+            if target < next {
+                return DisplayRow(start_row.0 + ix as u32);
+            }
+            acc = next;
+        }
+
+        let remaining = target - acc;
+        let extra_rows = (remaining / line_height_f).floor().max(0.0) as u32;
+        DisplayRow(start_row.0 + line_layouts.len() as u32 + extra_rows)
     }
 
     fn prepaint_with_custom_offset(
@@ -7645,28 +7797,6 @@ impl LineWithInvisibles {
         }
     }
 
-    fn draw(
-        &self,
-        layout: &EditorLayout,
-        row: DisplayRow,
-        content_origin: gpui::Point<Pixels>,
-        whitespace_setting: ShowWhitespaceSetting,
-        selection_ranges: &[Range<DisplayPoint>],
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        self.draw_with_custom_offset(
-            layout,
-            row,
-            content_origin,
-            layout.position_map.line_height * (row.as_f64() - layout.position_map.scroll_position.y) as f32,
-            whitespace_setting,
-            selection_ranges,
-            window,
-            cx,
-        );
-    }
-
     fn draw_with_custom_offset(
         &self,
         layout: &EditorLayout,
@@ -7678,7 +7808,6 @@ impl LineWithInvisibles {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let line_height = layout.position_map.line_height;
         let mut fragment_origin =
             content_origin + gpui::point(Pixels::from(-layout.position_map.scroll_pixel_position.x), line_y);
 
@@ -7687,7 +7816,7 @@ impl LineWithInvisibles {
                 LineFragment::Text(line) => {
                     line.paint(
                         fragment_origin,
-                        line_height,
+                        self.row_height,
                         layout.text_align,
                         Some(layout.content_width),
                         window,
@@ -7708,7 +7837,7 @@ impl LineWithInvisibles {
             content_origin,
             line_y,
             row,
-            line_height,
+            self.row_height,
             whitespace_setting,
             window,
             cx,
@@ -7723,8 +7852,14 @@ impl LineWithInvisibles {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let line_height = layout.position_map.line_height;
-        let line_y = line_height * (row.as_f64() - layout.position_map.scroll_position.y) as f32;
+        let start_row = layout.visible_display_row_range.start;
+        let line_y = Self::row_y_offset(
+            row,
+            &layout.position_map.line_layouts,
+            start_row,
+            layout.position_map.scroll_position,
+            layout.position_map.line_height,
+        );
 
         let mut fragment_origin =
             content_origin + gpui::point(Pixels::from(-layout.position_map.scroll_pixel_position.x), line_y);
@@ -7734,7 +7869,7 @@ impl LineWithInvisibles {
                 LineFragment::Text(line) => {
                     line.paint_background(
                         fragment_origin,
-                        line_height,
+                        self.row_height,
                         layout.text_align,
                         Some(layout.content_width),
                         window,
@@ -8519,20 +8654,6 @@ impl Element for EditorElement {
                         }
                     }
 
-                    let line_numbers = self.layout_line_numbers(
-                        Some(&gutter_hitbox),
-                        gutter_dimensions,
-                        line_height,
-                        scroll_position,
-                        start_row..end_row,
-                        &row_infos,
-                        &active_rows,
-                        current_selection_head,
-                        &snapshot,
-                        window,
-                        cx,
-                    );
-
                     // We add the gutter breakpoint indicator to breakpoint_rows after painting
                     // line numbers so we don't paint a line number debug accent color if a user
                     // has their mouse over that line when a breakpoint isn't there
@@ -8618,6 +8739,27 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+
+                    // Laid out here, after `line_layouts`, rather than up
+                    // alongside the other gutter elements: it needs each
+                    // row's actual height (see `layout_line_numbers`'s use of
+                    // `line_layouts` below) to stay vertically aligned with
+                    // text rows whose height varies, e.g. a glass_md heading.
+                    let line_numbers = self.layout_line_numbers(
+                        Some(&gutter_hitbox),
+                        gutter_dimensions,
+                        &line_layouts,
+                        line_height,
+                        scroll_position,
+                        start_row..end_row,
+                        &row_infos,
+                        &active_rows,
+                        current_selection_head,
+                        &snapshot,
+                        window,
+                        cx,
+                    );
+
                     let new_renderer_widths = (!is_minimap).then(|| {
                         line_layouts
                             .iter()
@@ -8848,6 +8990,8 @@ impl Element for EditorElement {
                             line_height,
                             content_origin,
                             scroll_pixel_position,
+                            scroll_position,
+                            start_row,
                             em_width,
                             window,
                             cx,
@@ -8897,6 +9041,8 @@ impl Element for EditorElement {
                                     display_row,
                                     row_info,
                                     line_layout,
+                                    &line_layouts,
+                                    start_row,
                                     crease_trailer_layout,
                                     em_width,
                                     content_origin,
@@ -9105,9 +9251,11 @@ impl Element for EditorElement {
                         self.prepaint_crease_toggles(
                             &mut crease_toggles,
                             line_height,
+                            &line_layouts,
                             &gutter_dimensions,
                             gutter_settings,
-                            scroll_pixel_position,
+                            scroll_position,
+                            start_row,
                             &gutter_hitbox,
                             window,
                             cx,
@@ -10082,7 +10230,8 @@ impl PositionMap {
         let position = position - text_bounds.origin;
         let y = position.y.max(px(0.)).min(self.size.height);
         let x = position.x + (scroll_position.x as f32 * self.em_advance);
-        let row = ((y / self.line_height) as f64 + scroll_position.y) as u32;
+        let start_row = DisplayRow(scroll_position.y as u32);
+        let row = LineWithInvisibles::row_for_y(y, &self.line_layouts, start_row, scroll_position, self.line_height).0;
 
         let (column, x_overshoot_after_line_end) =
             if let Some(line) = self.line_layouts.get(row as usize - scroll_position.y as usize) {
@@ -10302,13 +10451,18 @@ pub struct HighlightedRange {
 pub struct HighlightedRangeLine {
     pub start_x: Pixels,
     pub end_x: Pixels,
+    /// This line's own height, e.g. a glass_md heading. `HighlightedRange::paint`
+    /// accumulates these rather than assuming every line is `line_height` tall,
+    /// so a selection spanning a resized row still draws over the actual text.
+    pub height: Pixels,
 }
 
 impl HighlightedRange {
     pub fn paint(&self, fill: bool, bounds: Bounds<Pixels>, window: &mut Window) {
         if self.lines.len() >= 2 && self.lines[0].start_x > self.lines[1].end_x {
+            let first_line_height = self.lines[0].height;
             self.paint_lines(self.start_y, &self.lines[0..1], fill, bounds, window);
-            self.paint_lines(self.start_y + self.line_height, &self.lines[1..], fill, bounds, window);
+            self.paint_lines(self.start_y + first_line_height, &self.lines[1..], fill, bounds, window);
         } else {
             self.paint_lines(self.start_y, &self.lines, fill, bounds, window);
         }
@@ -10353,9 +10507,21 @@ impl HighlightedRange {
         builder.move_to(first_top_right - top_curve_width);
         builder.curve_to(first_top_right + curve_height, first_top_right);
 
+        // Cumulative Y of each line's bottom edge, from each line's own
+        // `height` rather than a uniform `line_height` multiply, so a
+        // selection spanning a resized row (e.g. a glass_md heading) draws
+        // its box over the row's actual height instead of the editor's
+        // default.
+        let mut line_bottoms = Vec::with_capacity(lines.len());
+        let mut y = start_y;
+        for line in lines {
+            y += line.height;
+            line_bottoms.push(y);
+        }
+
         let mut iter = lines.iter().enumerate().peekable();
         while let Some((ix, line)) = iter.next() {
-            let bottom_right = point(line.end_x, start_y + (ix + 1) as f32 * self.line_height);
+            let bottom_right = point(line.end_x, line_bottoms[ix]);
 
             if let Some((_, next_line)) = iter.peek() {
                 let next_top_right = point(next_line.end_x, bottom_right.y);
@@ -10404,7 +10570,7 @@ impl HighlightedRange {
 
         if first_line.start_x > last_line.start_x {
             let curve_width = curve_width(last_line.start_x, first_line.start_x);
-            let second_top_left = point(last_line.start_x, start_y + self.line_height);
+            let second_top_left = point(last_line.start_x, line_bottoms[0]);
             builder.line_to(second_top_left + curve_height);
             if self.corner_radius > Pixels::ZERO {
                 builder.curve_to(second_top_left + curve_width, second_top_left);
@@ -10625,6 +10791,7 @@ mod tests {
                         margin: Pixels::ZERO,
                         git_blame_entries_width: None,
                     },
+                    &[],
                     line_height,
                     gpui::Point::default(),
                     DisplayRow(0)..DisplayRow(6),
@@ -10694,6 +10861,7 @@ mod tests {
                         margin: Pixels::ZERO,
                         git_blame_entries_width: None,
                     },
+                    &[],
                     line_height,
                     gpui::Point::default(),
                     DisplayRow(0)..DisplayRow(6),
@@ -10773,6 +10941,7 @@ mod tests {
                         margin: Pixels::ZERO,
                         git_blame_entries_width: None,
                     },
+                    &[],
                     line_height,
                     gpui::Point::default(),
                     DisplayRow(0)..DisplayRow(6),
@@ -10842,6 +11011,7 @@ mod tests {
                         margin: Pixels::ZERO,
                         git_blame_entries_width: None,
                     },
+                    &[],
                     line_height,
                     gpui::Point::default(),
                     DisplayRow(0)..DisplayRow(6),
@@ -10887,6 +11057,7 @@ mod tests {
                         margin: Pixels::ZERO,
                         git_blame_entries_width: None,
                     },
+                    &[],
                     line_height,
                     gpui::Point::default(),
                     DisplayRow(0)..DisplayRow(6),
@@ -11535,5 +11706,91 @@ mod tests {
             assert_eq!(out[2].color, text_color);
             assert_eq!(out[3].color, adjusted_bg1);
         }
+    }
+
+    fn line_with_row_height(row_height: f32) -> LineWithInvisibles {
+        LineWithInvisibles {
+            fragments: SmallVec::new(),
+            invisibles: Vec::new(),
+            len: 0,
+            width: Pixels::ZERO,
+            font_size: px(16.),
+            row_height: px(row_height),
+        }
+    }
+
+    #[test]
+    fn row_y_offset_matches_the_uniform_formula_when_every_row_is_default_height() {
+        let line_height = px(20.);
+        let lines: Vec<LineWithInvisibles> = (0..5).map(|_| line_with_row_height(20.)).collect();
+        let start_row = DisplayRow(10);
+        let scroll_position = gpui::Point::new(0.0, 10.3);
+        for row_offset in 0..5u32 {
+            let row = DisplayRow(start_row.0 + row_offset);
+            let actual = LineWithInvisibles::row_y_offset(row, &lines, start_row, scroll_position, line_height);
+            let expected = line_height * (row.as_f64() - scroll_position.y) as f32;
+            assert!(
+                (actual - expected).abs() < px(0.01),
+                "row {row_offset}: actual {actual:?} vs expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_y_offset_shifts_every_row_below_a_taller_row_down() {
+        let line_height = px(20.);
+        // Row 0 is a heading-sized row (1.8x); the rest are normal height.
+        let lines = vec![
+            line_with_row_height(36.),
+            line_with_row_height(20.),
+            line_with_row_height(20.),
+        ];
+        let start_row = DisplayRow(0);
+        let scroll_position = gpui::Point::new(0.0, 0.0);
+
+        let y0 = LineWithInvisibles::row_y_offset(DisplayRow(0), &lines, start_row, scroll_position, line_height);
+        let y1 = LineWithInvisibles::row_y_offset(DisplayRow(1), &lines, start_row, scroll_position, line_height);
+        let y2 = LineWithInvisibles::row_y_offset(DisplayRow(2), &lines, start_row, scroll_position, line_height);
+
+        assert_eq!(y0, px(0.));
+        assert_eq!(y1, px(36.), "row 1 should start right after the tall row 0's own height");
+        assert_eq!(y2, px(56.), "row 2 should start after row 0 (36) plus row 1 (20)");
+    }
+
+    #[test]
+    fn row_for_y_is_the_inverse_of_row_y_offset_with_a_resized_row() {
+        let line_height = px(20.);
+        let lines = vec![
+            line_with_row_height(36.),
+            line_with_row_height(20.),
+            line_with_row_height(20.),
+        ];
+        let start_row = DisplayRow(5);
+        let scroll_position = gpui::Point::new(0.0, 5.0);
+
+        for row_offset in 0..3u32 {
+            let row = DisplayRow(start_row.0 + row_offset);
+            let y = LineWithInvisibles::row_y_offset(row, &lines, start_row, scroll_position, line_height);
+            // A point a couple pixels into the row's own span should map back to that row --
+            // this is the exact hit-testing path mouse clicks and drag-selections go through
+            // (`PositionMap::point_for_position`), so a bug here means clicking on or dragging
+            // through a resized row (e.g. a glass_md heading) picks the wrong row entirely.
+            let found = LineWithInvisibles::row_for_y(y + px(1.), &lines, start_row, scroll_position, line_height);
+            assert_eq!(found, row, "row {row_offset}: y={y:?} mapped back to {found:?}");
+        }
+    }
+
+    #[test]
+    fn row_for_y_handles_fractional_scroll_through_a_resized_first_row() {
+        let line_height = px(20.);
+        let lines = vec![line_with_row_height(36.), line_with_row_height(20.)];
+        let start_row = DisplayRow(0);
+        // Scrolled halfway through the tall first row (18px of its 36px).
+        let scroll_position = gpui::Point::new(0.0, 0.5);
+
+        // The very top of the viewport should still land in row 0: we're only
+        // halfway through *its own* height, not past it.
+        let row = LineWithInvisibles::row_for_y(px(0.), &lines, start_row, scroll_position, line_height);
+        assert_eq!(row, DisplayRow(0));
     }
 }

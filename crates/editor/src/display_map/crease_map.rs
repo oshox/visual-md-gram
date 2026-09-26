@@ -133,6 +133,16 @@ pub enum Crease<T> {
         render_toggle: Option<RenderToggleFn>,
         render_trailer: Option<RenderTrailerFn>,
         metadata: Option<CreaseMetadata>,
+        /// If true, the gutter never shows a fold-toggle disclosure for this
+        /// crease's row, even while it's folded. `render_crease_toggle`
+        /// (in `editor.rs`) otherwise shows a toggle for *any* folded row
+        /// regardless of whether the crease responsible has its own
+        /// `render_toggle` — appropriate for a real collapsible region the
+        /// user folded themselves, but wrong for a crease that's a
+        /// permanent decorative text replacement (e.g. glass_md's hidden
+        /// Markdown markers) that was never meant to be toggled via the
+        /// gutter at all. See `Crease::without_gutter_toggle`.
+        hide_gutter_toggle: bool,
     },
     Block {
         range: Range<T>,
@@ -159,6 +169,33 @@ impl<T> Crease<T> {
             render_toggle: None,
             render_trailer: None,
             metadata: None,
+            hide_gutter_toggle: false,
+        }
+    }
+
+    /// Suppresses the gutter's fold-toggle disclosure for this crease's row.
+    /// See `hide_gutter_toggle`'s doc comment on why a permanent decorative
+    /// crease (as opposed to a real, user-collapsible region) wants this.
+    /// A no-op on a `Block` crease, which doesn't have a gutter disclosure
+    /// wired to it at all.
+    pub fn without_gutter_toggle(self) -> Self {
+        match self {
+            Crease::Inline {
+                range,
+                placeholder,
+                render_toggle,
+                render_trailer,
+                metadata,
+                ..
+            } => Crease::Inline {
+                range,
+                placeholder,
+                render_toggle,
+                render_trailer,
+                metadata,
+                hide_gutter_toggle: true,
+            },
+            Crease::Block { .. } => self,
         }
     }
 
@@ -206,6 +243,7 @@ impl<T> Crease<T> {
                 render_trailer(row, folded, window, cx).into_any_element()
             })),
             metadata: None,
+            hide_gutter_toggle: false,
         }
     }
 
@@ -216,6 +254,7 @@ impl<T> Crease<T> {
                 placeholder,
                 render_toggle,
                 render_trailer,
+                hide_gutter_toggle,
                 ..
             } => Crease::Inline {
                 range,
@@ -223,6 +262,7 @@ impl<T> Crease<T> {
                 render_toggle,
                 render_trailer,
                 metadata: Some(metadata),
+                hide_gutter_toggle,
             },
             Crease::Block { .. } => self,
         }

@@ -42,6 +42,7 @@ members = [
   "crates/git_graph",
   "crates/git_hosting_providers",
   "crates/git_ui",
+  "crates/glass_md",
   "crates/go_to_line",
   "crates/gpui",
   "crates/gpui_macros",
@@ -193,6 +194,7 @@ git = { path = "crates/git" }
 git_graph = { path = "crates/git_graph" }
 git_hosting_providers = { path = "crates/git_hosting_providers" }
 git_ui = { path = "crates/git_ui" }
+glass_md = { path = "crates/glass_md" }
 go_to_line = { path = "crates/go_to_line" }
 gpui = { path = "crates/gpui", default-features = false }
 gpui_macros = { path = "crates/gpui_macros" }
