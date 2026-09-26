@@ -30,6 +30,22 @@ jobs:
       CXX: clang++
       GRAM_RPM_COMPRESSION: zstd
     steps:
+      # This workspace's release target dir runs well past what fits in the
+      # runner's default free disk space, so free up the preinstalled
+      # toolchains we don't use before doing anything else.
+      - name: Free disk space
+        run: |
+          set -x
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+          docker image prune --all --force || true
+          df -h /
+
       - name: Checkout repo
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
@@ -43,6 +59,9 @@ jobs:
 
       - name: Install dependencies
         run: ./script/prepare-ci release
+
+      - name: Check disk space
+        run: df -h /
 
       - name: Bundle Linux rpm
         run: ./script/bundle-linux --rpm --no-build-remote
