@@ -1,3 +1,13 @@
+> [!WARNING]
+>
+> **This is a personal testing/proof-of-concept fork of Gram**, hosted at
+> [oshox/visual-md-gram](https://github.com/oshox/visual-md-gram), used to
+> experiment with a `glass_md` Obsidian-style live-preview Markdown editing
+> mode. It is **not** an official Gram release, is not affiliated with the
+> upstream project, and is not intended for production use. For the real
+> thing, see upstream at [Codeberg](https://codeberg.org/GramEditor/gram) and
+> [gram-editor.com](https://gram-editor.com).
+
 <div align="center">
 
 ![Gram Logo](./assets/images/docs_logo.png)
