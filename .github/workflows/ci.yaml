@@ -1,17 +1,11 @@
 # yaml-language-server: $schema=https://www.schemastore.org/github-workflow.json
 name: CI
 
+# Disabled from auto-running on this private fork to avoid burning Actions
+# minutes (this workflow builds on ubuntu/macos/windows on every push).
+# Trigger manually with `gh workflow run ci.yaml` if needed.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - test/*
-      - test-gh/*
-      - test-release/*
-      - test-release-gh/*
-    tags:
-      - "*"
 
 permissions:
   contents: read
