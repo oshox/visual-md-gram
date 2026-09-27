@@ -11578,6 +11578,7 @@ dependencies = [
  "component",
  "quote",
  "syn 2.0.119",
+ "ui",
 ]
 
 [[package]]
