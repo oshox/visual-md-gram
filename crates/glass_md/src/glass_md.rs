@@ -81,6 +81,33 @@
 //! only size itself to its own content and there's no way to make one
 //! stretch to the editor's actual visible width for a full-width `<hr>`.
 //!
+//! **M7** gives markdown prose its own proportional font
+//! (`theme::ThemeSettings::ui_font`, reusing Zed's own UI chrome font rather
+//! than inventing a new setting) while keeping code (inline spans and, as of
+//! M8, fenced-block content) on the normal `buffer_font` — i.e. exactly the
+//! font every markdown buffer already rendered in before this. This needed a
+//! real `gpui` change: `HighlightStyle` had no font-family field at all
+//! (only color/weight/italic/underline/strikethrough/background/
+//! `font_size_scale`), so `crates/gpui/src/style.rs` gained one, following
+//! the same precedent `font_size_scale` set. See `KEY_PROSE_FONT`/
+//! `KEY_CODE_FONT`'s own doc comment for the highlight-key ordering this
+//! relies on.
+//!
+//! **M8** adds fenced code blocks: the ` ``` `/`~~~` fence lines collapse to
+//! a full-width border (plus a language chip on the opening line) via the
+//! same `insert_blocks` mechanism the horizontal rule uses (see
+//! `apply_code_fence_borders`), and the content gets real per-language
+//! syntax coloring. That coloring needs a genuine `Arc<Language>` — a
+//! tree-sitter-grammar-backed object [`plan`] deliberately can't depend on
+//! (see its own doc comment) — resolved asynchronously via
+//! `LanguageRegistry::language_for_name_or_extension` (grammars load/compile
+//! lazily) and cached per-editor on `GlassMdAddon`; a `refresh` runs again
+//! once a language resolves so its highlighting appears without waiting on
+//! the next edit. See `ensure_code_languages_loaded`/
+//! `apply_code_syntax_highlights`. With no project or buffer-level language
+//! registry available at all, or an unrecognized language name, a fence's
+//! content simply stays plain (monospace, uncolored) rather than erroring.
+//!
 //! The parsing and decision logic lives in [`plan`], a pure function with no
 //! GPUI or `Editor` dependency. This module's job is only to drive it off
 //! editor events and translate its plain byte ranges into creases and
@@ -91,8 +118,9 @@ mod list_continuation;
 mod plan;
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 use editor::actions::Newline;
 use editor::display_map::{
@@ -103,9 +131,10 @@ use editor::{Addon, Anchor, Bias, Editor, EditorEvent, MultiBufferOffset, MultiB
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FontStyle, FontWeight, HighlightStyle, Hsla,
     InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, StrikethroughStyle,
-    Styled, Subscription, WeakEntity, Window, div, px, rgb, svg,
+    Styled, Subscription, Task, WeakEntity, Window, div, px, rgb, svg,
 };
 use gpui::prelude::FluentBuilder;
+use language::{HighlightId, Language, Rope};
 use plan::{GlyphKind, Plan, SpanStyle};
 use settings::{RegisterSetting, Settings, SettingsContent};
 use util::ResultExt;
@@ -158,6 +187,10 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         _newline_action: newline_action,
         folded_markers: Vec::new(),
         hr_blocks: Vec::new(),
+        code_fence_borders: Vec::new(),
+        code_languages: HashMap::new(),
+        pending_language_tasks: HashMap::new(),
+        active_syntax_ids: HashSet::new(),
     });
     refresh(editor, window, cx);
 
@@ -263,6 +296,28 @@ struct GlassMdAddon {
     /// string travels alongside the range: a horizontal rule's rendering
     /// never varies, so range equality alone is enough to diff old vs. new.
     hr_blocks: Vec<(Range<usize>, CustomBlockId)>,
+    /// Fenced-code-block fence-line border/chip blocks currently inserted
+    /// (see `apply_code_fence_borders`). Diffed on `(range, language)`
+    /// together, not range alone, the same reasoning `folded_markers`'
+    /// content key has: a fence's language name can change (the info string
+    /// gets edited) without its byte range moving, and the chip needs to be
+    /// recreated with the new text rather than mistaken for "unchanged".
+    code_fence_borders: Vec<(Range<usize>, Option<String>, CustomBlockId)>,
+    /// Resolved-language cache for fenced code blocks, keyed by the fence's
+    /// info-string name. `None` means resolution was attempted and the name
+    /// didn't match any known language/extension, so it isn't retried every
+    /// refresh. See `ensure_code_languages_loaded`.
+    code_languages: HashMap<String, Option<Arc<Language>>>,
+    /// In-flight language-resolution tasks, keyed the same way as
+    /// `code_languages`. Kept alive here (a dropped `Task` is cancelled);
+    /// each task removes its own entry on completion.
+    pending_language_tasks: HashMap<String, Task<()>>,
+    /// Which `GlassMdCodeSyntax` highlight keys (one per distinct
+    /// `HighlightId.0` actually present in view) the previous refresh left
+    /// active, so `apply_code_syntax_highlights` only has to clear the ones
+    /// that are no longer wanted rather than iterating every highlight
+    /// category the current theme happens to define.
+    active_syntax_ids: HashSet<u32>,
 }
 
 impl Addon for GlassMdAddon {
@@ -366,6 +421,15 @@ const KEY_BOLD: usize = 7;
 const KEY_ITALIC: usize = 8;
 const KEY_STRIKETHROUGH: usize = 9;
 const KEY_LINK: usize = 10;
+// Numbered higher than KEY_LINK deliberately: `CustomHighlightsChunks::next`
+// (crates/editor/src/display_map/custom_highlights.rs) folds every active
+// `GlassMdMarkdown` key into one `HighlightStyle` in ascending key order,
+// with each later style's set fields overriding earlier ones -- so
+// KEY_CODE_FONT (code content) needs a higher number than KEY_PROSE_FONT (as
+// close to "everything") to win a font-family conflict, even though in
+// practice inline code/fence ranges don't currently overlap prose spans.
+const KEY_PROSE_FONT: usize = 11;
+const KEY_CODE_FONT: usize = 12;
 
 fn heading_key(level: u8) -> usize {
     match level {
@@ -532,8 +596,13 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     }));
 
     apply_folds(editor, &snapshot, folds, window, cx);
-    apply_style_highlights(editor, &snapshot, &computed, cx);
+    apply_style_highlights(editor, &snapshot, &computed, enabled, cx);
     apply_horizontal_rules(editor, &snapshot, &computed, cx);
+    apply_code_fence_borders(editor, &snapshot, &computed, cx);
+    let code_languages: HashSet<String> =
+        computed.code_fence_content.iter().filter_map(|(_, name)| name.clone()).collect();
+    ensure_code_languages_loaded(editor, window, cx, code_languages);
+    apply_code_syntax_highlights(editor, &snapshot, &computed, cx);
 }
 
 fn to_anchor_range(snapshot: &MultiBufferSnapshot, range: &Range<usize>) -> Range<Anchor> {
@@ -896,10 +965,238 @@ fn render_horizontal_rule(cx: &mut BlockContext) -> AnyElement {
         .into_any_element()
 }
 
+/// Diffs `computed.code_fence_borders` against the blocks inserted by the
+/// previous refresh -- same shape as `apply_horizontal_rules`, keyed on
+/// `(range, language)` together instead of range alone for the same reason
+/// `apply_folds` diffs folds on `(range, key)`: editing a fence's info
+/// string changes its language without moving the border's byte range, and
+/// that edit needs to recreate the block with the new chip text rather than
+/// being mistaken for "unchanged".
+fn apply_code_fence_borders(editor: &mut Editor, snapshot: &MultiBufferSnapshot, computed: &Plan, cx: &mut Context<Editor>) {
+    let previous = editor
+        .addon_mut::<GlassMdAddon>()
+        .map(|addon| std::mem::take(&mut addon.code_fence_borders))
+        .unwrap_or_default();
+
+    let wanted: HashSet<(Range<usize>, Option<String>)> = computed.code_fence_borders.iter().cloned().collect();
+    let mut kept = Vec::new();
+    let mut stale_ids: collections::HashSet<CustomBlockId> = collections::HashSet::default();
+    for (range, language, id) in previous {
+        if wanted.contains(&(range.clone(), language.clone())) {
+            kept.push((range, language, id));
+        } else {
+            stale_ids.insert(id);
+        }
+    }
+    if !stale_ids.is_empty() {
+        editor.remove_blocks(stale_ids, None, cx);
+    }
+
+    let already_kept: HashSet<(Range<usize>, Option<String>)> =
+        kept.iter().map(|(range, language, _)| (range.clone(), language.clone())).collect();
+    let new_entries: Vec<(Range<usize>, Option<String>)> = computed
+        .code_fence_borders
+        .iter()
+        .filter(|entry| !already_kept.contains(*entry))
+        .cloned()
+        .collect();
+
+    if !new_entries.is_empty() {
+        let new_blocks: Vec<BlockProperties<Anchor>> = new_entries
+            .iter()
+            .map(|(range, language)| {
+                let anchor_range = to_anchor_range(snapshot, range);
+                let language = language.clone();
+                BlockProperties {
+                    placement: BlockPlacement::Replace(anchor_range.start..=anchor_range.end),
+                    height: Some(1),
+                    style: BlockStyle::Fixed,
+                    render: Arc::new(move |cx: &mut BlockContext| render_code_fence_border(cx, language.clone())),
+                    priority: 0,
+                }
+            })
+            .collect();
+        let ids = editor.insert_blocks(new_blocks, None, cx);
+        kept.extend(
+            new_entries
+                .into_iter()
+                .zip(ids)
+                .map(|((range, language), id)| (range, language, id)),
+        );
+    }
+
+    if let Some(addon) = editor.addon_mut::<GlassMdAddon>() {
+        addon.code_fence_borders = kept;
+    }
+}
+
+/// Renders a fenced code block's fence line the same way
+/// `render_horizontal_rule` renders a `---`: a full-width thin border using
+/// `BlockContext::max_width`, plus (only on the opening line, when a
+/// language was recognized in the info string) a small text chip.
+fn render_code_fence_border(cx: &mut BlockContext, language: Option<String>) -> AnyElement {
+    let colors = {
+        use theme::ActiveTheme;
+        cx.theme().colors()
+    };
+    div()
+        .w(cx.max_width)
+        .h(cx.line_height)
+        .flex()
+        .items_center()
+        .gap_2()
+        .when_some(language, |row, language| {
+            row.child(
+                div()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(colors.surface_background)
+                    .text_color(colors.text_muted)
+                    .text_xs()
+                    .child(language),
+            )
+        })
+        .child(div().flex_1().h(px(1.)).bg(colors.border))
+        .into_any_element()
+}
+
+/// Kicks off (and caches) `LanguageRegistry` resolution for every fenced
+/// code block's language name that isn't already cached or in flight.
+/// Resolution is inherently async — grammars load/compile lazily — so this
+/// only *starts* the load; `apply_code_syntax_highlights` picks up whatever
+/// is already cached by the time it runs, and the load's own completion
+/// callback triggers a fresh `refresh` so a block's highlighting appears the
+/// moment its language finishes loading rather than waiting on the next
+/// edit or scroll.
+fn ensure_code_languages_loaded(
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+    names: HashSet<String>,
+) {
+    // Prefer the buffer's own registry (works even for a bare buffer with no
+    // project attached -- the same setup
+    // `test_move_to_enclosing_bracket_in_markdown_code_block` in
+    // `crates/editor/src/editor_tests.rs` uses); fall back to the project's.
+    let registry = editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .and_then(|buffer| buffer.read(cx).language_registry())
+        .or_else(|| editor.project().map(|project| project.read(cx).languages().clone()));
+
+    for name in names {
+        let already_known = editor.addon::<GlassMdAddon>().is_some_and(|addon| {
+            addon.code_languages.contains_key(&name) || addon.pending_language_tasks.contains_key(&name)
+        });
+        if already_known {
+            continue;
+        }
+
+        let Some(registry) = registry.clone() else {
+            // No registry at all (no project, and the buffer never had one
+            // set) -- there's nothing to resolve against, ever, so cache
+            // `None` immediately rather than silently retrying every
+            // refresh.
+            if let Some(addon) = editor.addon_mut::<GlassMdAddon>() {
+                addon.code_languages.insert(name, None);
+            }
+            continue;
+        };
+
+        let task = cx.spawn_in(window, {
+            let name = name.clone();
+            async move |editor, cx| {
+                let language = registry.language_for_name_or_extension(&name).await.ok();
+                editor
+                    .update_in(cx, |editor, window, cx| {
+                        if let Some(addon) = editor.addon_mut::<GlassMdAddon>() {
+                            addon.code_languages.insert(name.clone(), language);
+                            addon.pending_language_tasks.remove(&name);
+                        }
+                        refresh(editor, window, cx);
+                    })
+                    .ok();
+            }
+        });
+
+        if let Some(addon) = editor.addon_mut::<GlassMdAddon>() {
+            addon.pending_language_tasks.insert(name, task);
+        }
+    }
+}
+
+/// For every fenced code block whose language has already resolved (per
+/// `ensure_code_languages_loaded`'s cache), runs the language's own
+/// tree-sitter highlighter over its content and applies the result via
+/// `highlight_text_key` -- one key per distinct `HighlightId` actually
+/// present, using its numeric value directly as the key (bounded by however
+/// many named highlight categories the current theme defines, `HighlightId`
+/// being just an index into `SyntaxTheme::highlights`) rather than the small
+/// fixed `KEY_*` constants the rest of this file uses, via its own marker
+/// type (`GlassMdCodeSyntax`) so the two key spaces can never collide.
+/// Diffed against the previous refresh's active id set so a refresh only
+/// touches however many distinct syntax categories are actually in view,
+/// not the theme's whole catalog.
+fn apply_code_syntax_highlights(editor: &mut Editor, snapshot: &MultiBufferSnapshot, computed: &Plan, cx: &mut Context<Editor>) {
+    let syntax_theme = {
+        use theme::ActiveTheme;
+        cx.theme().syntax().clone()
+    };
+    let text = snapshot.text();
+
+    let mut ranges_by_id: HashMap<u32, Vec<Range<usize>>> = HashMap::new();
+    for (content_range, language_name) in &computed.code_fence_content {
+        let Some(name) = language_name else { continue };
+        let Some(language) = editor
+            .addon::<GlassMdAddon>()
+            .and_then(|addon| addon.code_languages.get(name))
+            .cloned()
+            .flatten()
+        else {
+            continue;
+        };
+        let Some(content_text) = text.get(content_range.clone()) else {
+            continue;
+        };
+        let rope = Rope::from(content_text);
+        for (local_range, highlight_id) in language.highlight_text(&rope, 0..content_text.len()) {
+            ranges_by_id
+                .entry(highlight_id.0)
+                .or_default()
+                .push(local_range.start + content_range.start..local_range.end + content_range.start);
+        }
+    }
+
+    let active_ids: HashSet<u32> = ranges_by_id.keys().copied().collect();
+    let previous_ids = editor
+        .addon_mut::<GlassMdAddon>()
+        .map(|addon| std::mem::replace(&mut addon.active_syntax_ids, active_ids.clone()))
+        .unwrap_or_default();
+
+    for id in previous_ids.difference(&active_ids) {
+        editor.highlight_text_key::<GlassMdCodeSyntax>(*id as usize, Vec::new(), HighlightStyle::default(), false, cx);
+    }
+    for (id, ranges) in &ranges_by_id {
+        let Some(style) = HighlightId(*id).style(&syntax_theme) else {
+            continue;
+        };
+        let anchor_ranges = ranges.iter().map(|range| to_anchor_range(snapshot, range)).collect();
+        editor.highlight_text_key::<GlassMdCodeSyntax>(*id as usize, anchor_ranges, style, false, cx);
+    }
+}
+
+/// Marker type namespacing fenced-code-block syntax highlights (see
+/// `apply_code_syntax_highlights`) away from [`GlassMdMarkdown`]'s own small
+/// fixed key set -- a `HighlightId` value can be much larger than any
+/// `KEY_*` constant here, so sharing one key space would risk collisions.
+struct GlassMdCodeSyntax;
+
 fn apply_style_highlights(
     editor: &mut Editor,
     snapshot: &MultiBufferSnapshot,
     computed: &Plan,
+    enabled: bool,
     cx: &mut Context<Editor>,
 ) {
     let anchor_ranges = |ranges: &[Range<usize>]| -> Vec<Range<Anchor>> {
@@ -999,6 +1296,55 @@ fn apply_style_highlights(
         KEY_LINK,
         anchor_ranges(&spans_of(SpanStyle::Link)),
         link_style(link_color),
+        false,
+        cx,
+    );
+
+    // Prose/code font split (M7). glass_md doesn't otherwise touch fonts at
+    // all: every markdown buffer today renders entirely in the editor's
+    // normal `buffer_font` (headings just get bigger via `font_size_scale`
+    // above), so there is no existing proportional "reading" font to
+    // contrast code against. This gives markdown prose the same proportional
+    // font Zed's own UI chrome already uses (`ui_font` — reusing an existing
+    // theme token rather than introducing a new setting), while code (inline
+    // spans, and fenced blocks once M8 populates `code_font_ranges`) stays
+    // on `buffer_font`, i.e. exactly the font it already was.
+    //
+    // The prose layer covers the *whole buffer*, not just the viewport: it's
+    // a single O(1) highlight entry regardless of document size (unlike the
+    // tree-walked per-construct decorations above), so there's no perf
+    // reason to scope it, and doing so would risk a font flicker right at
+    // the viewport boundary while scrolling. `KEY_CODE_FONT` is numbered
+    // higher than `KEY_PROSE_FONT` specifically so it wins this conflict
+    // wherever the two overlap (see the constants' own doc comment).
+    let (ui_font_family, buffer_font_family) = {
+        let settings = theme::ThemeSettings::get_global(cx);
+        (settings.ui_font.family.clone(), settings.buffer_font.family.clone())
+    };
+    let prose_ranges: Vec<Range<Anchor>> = if enabled {
+        vec![snapshot.anchor_before(MultiBufferOffset(0))..snapshot.anchor_after(snapshot.len())]
+    } else {
+        Vec::new()
+    };
+    editor.highlight_text_key::<GlassMdMarkdown>(
+        KEY_PROSE_FONT,
+        prose_ranges,
+        HighlightStyle {
+            font_family: Some(ui_font_family),
+            ..Default::default()
+        },
+        false,
+        cx,
+    );
+    let mut code_font_ranges = spans_of(SpanStyle::InlineCode);
+    code_font_ranges.extend(computed.code_fence_content.iter().map(|(range, _)| range.clone()));
+    editor.highlight_text_key::<GlassMdMarkdown>(
+        KEY_CODE_FONT,
+        anchor_ranges(&code_font_ranges),
+        HighlightStyle {
+            font_family: Some(buffer_font_family),
+            ..Default::default()
+        },
         false,
         cx,
     );
@@ -1278,11 +1624,42 @@ mod integration_tests {
         );
     }
 
-    /// Exercises the horizontal-rule block-decoration path (M6) end to end:
-    /// confirms `apply_horizontal_rules` actually reaches
-    /// `Editor::insert_blocks` through a real `refresh()`, reading
-    /// `GlassMdAddon::hr_blocks` directly the same way the M3 fold tests
-    /// already read `folded_markers`.
+    /// Exercises the prose/code font split (M7) through a real `refresh()`:
+    /// confirms `apply_style_highlights` actually reaches `highlight_text_key`
+    /// with `KEY_PROSE_FONT`/`KEY_CODE_FONT`, using the same
+    /// `all_text_highlights` test-support accessor `signature_help`'s own
+    /// tests rely on for the equivalent inspection.
+    #[gpui::test]
+    async fn prose_and_inline_code_get_different_fonts(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇSome prose with `code` inside.\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+
+            let (ui_font_family, buffer_font_family) = {
+                let settings = theme::ThemeSettings::get_global(cx);
+                (settings.ui_font.family.clone(), settings.buffer_font.family.clone())
+            };
+            let highlights = editor.all_text_highlights(window, cx);
+
+            assert!(
+                highlights
+                    .iter()
+                    .any(|(style, ranges)| style.font_family.as_ref() == Some(&ui_font_family) && !ranges.is_empty()),
+                "expected a highlight covering prose text in the UI font, got {highlights:?}"
+            );
+            assert!(
+                highlights.iter().any(|(style, ranges)| style.font_family.as_ref() == Some(&buffer_font_family)
+                    && !ranges.is_empty()),
+                "expected a highlight covering the inline code span in the buffer font, got {highlights:?}"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn horizontal_rule_inserts_exactly_one_block(cx: &mut TestAppContext) {
         init_test(cx);
@@ -1311,6 +1688,128 @@ mod integration_tests {
             refresh(editor, window, cx);
             let hr_blocks = &editor.addon::<GlassMdAddon>().unwrap().hr_blocks;
             assert!(hr_blocks.is_empty(), "a touched thematic break should not be blocked, got {hr_blocks:?}");
+        });
+    }
+
+    /// Exercises the fenced-code-block border/chip block path (M8) end to
+    /// end: confirms `apply_code_fence_borders` reaches `insert_blocks`
+    /// through a real `refresh()`, same established pattern as the
+    /// horizontal-rule block test above.
+    #[gpui::test]
+    async fn fenced_code_block_inserts_two_border_blocks(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇtext above\n\n```rust\nfn main() {}\n```\n\ntext below\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+            let borders = &editor.addon::<GlassMdAddon>().unwrap().code_fence_borders;
+            assert_eq!(borders.len(), 2, "expected an opening and a closing border block, got {borders:?}");
+            assert!(
+                borders.iter().any(|(_, language, _)| language.as_deref() == Some("rust")),
+                "the opening border should carry the language name, got {borders:?}"
+            );
+        });
+    }
+
+    /// A fence line the cursor is touching should not become a border block
+    /// (its raw ` ``` ` shows through instead), matching the same
+    /// untouched-vs-touched convention the horizontal rule follows.
+    #[gpui::test]
+    async fn touched_fence_line_drops_its_border_block(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇ```rust\nfn main() {}\n```\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+            let borders = &editor.addon::<GlassMdAddon>().unwrap().code_fence_borders;
+            assert_eq!(borders.len(), 1, "only the untouched closing line should be blocked, got {borders:?}");
+            assert!(borders[0].1.is_none(), "the closing border never carries a language, got {borders:?}");
+        });
+    }
+
+    /// With no `LanguageRegistry` attached at all (the default for a bare
+    /// test buffer), an unresolvable language name should degrade cleanly:
+    /// cached as `None` and never retried, no panic anywhere in the
+    /// highlighting path.
+    #[gpui::test]
+    async fn unresolvable_language_is_cached_as_none_without_panicking(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇ```not-a-real-language\ncode\n```\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+        });
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+            let addon = editor.addon::<GlassMdAddon>().unwrap();
+            assert_eq!(addon.code_languages.get("not-a-real-language"), Some(&None));
+            assert!(addon.pending_language_tasks.is_empty());
+        });
+    }
+
+    /// End-to-end through real async language resolution: attaches a test
+    /// `LanguageRegistry` (`language::LanguageRegistry::test`, registered
+    /// with `language::rust_lang()` -- the same test-support helper
+    /// `crates/editor/src/editor_tests.rs`'s own markdown-code-block test
+    /// uses) directly on the buffer (no `Project` needed, mirroring
+    /// `test_move_to_enclosing_bracket_in_markdown_code_block`), lets the
+    /// spawned load complete via `run_until_parked`, and confirms real
+    /// syntax-highlight ranges reach `highlight_text_key`.
+    #[gpui::test]
+    async fn resolved_language_produces_real_syntax_highlighting(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇ```rust\nfn main() {}\n```\n");
+        let registry = std::sync::Arc::new(language::LanguageRegistry::test(cx.executor()));
+        registry.add(language::rust_lang());
+        // A freshly-constructed test registry has no theme wired in, so
+        // every loaded grammar's `highlight_map` stays empty and
+        // `highlight_text` returns nothing -- in the real app this happens
+        // via a global theme-change observer; tests need to do it
+        // explicitly.
+        cx.update_editor(|_editor, _window, cx| {
+            use theme::ActiveTheme;
+            registry.set_theme(cx.theme().clone());
+        });
+        cx.update_buffer(|buffer, cx| {
+            buffer.set_language_registry(registry);
+            buffer.set_language(Some(markdown_language()), cx);
+        });
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+        });
+        // Let the spawned `language_for_name_or_extension` future (and the
+        // `refresh` it triggers on completion) run to completion.
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, window, cx| {
+            assert!(
+                editor.addon::<GlassMdAddon>().unwrap().code_languages.contains_key("rust"),
+                "rust should have been resolved (or at least attempted) by now"
+            );
+            let highlights = editor.all_text_highlights(window, cx);
+            let syntax_theme = {
+                use theme::ActiveTheme;
+                cx.theme().syntax().clone()
+            };
+            assert!(
+                highlights.iter().any(|(style, ranges)| {
+                    !ranges.is_empty()
+                        && syntax_theme
+                            .highlights
+                            .iter()
+                            .any(|(_, theme_style)| theme_style == style)
+                }),
+                "expected at least one real syntax-theme-derived highlight from the rust fence's content"
+            );
         });
     }
 

@@ -111,6 +111,23 @@ pub struct Plan {
     /// simply left out of this list, so its raw `---` shows through exactly
     /// like an untouched-vs-touched heading marker.
     pub horizontal_rules: Vec<Range<usize>>,
+    /// One entry per fenced-code-block *line* (the opening ` ``` `+info
+    /// string, or the closing ` ``` `) not touched by a selection; the
+    /// `Option<String>` is the trimmed language name, `Some` only for the
+    /// opening line. Rendered the same way as `horizontal_rules` (a
+    /// full-width `insert_blocks` border, plus a language chip on the
+    /// opening one) and for the same reason — a fold can't stretch to the
+    /// real editor width. A touched line is simply left out, so its raw
+    /// ` ``` ` shows through.
+    pub code_fence_borders: Vec<(Range<usize>, Option<String>)>,
+    /// One entry per fenced code block's `code_fence_content`, with its
+    /// trimmed language name if any — *always* present regardless of
+    /// selection, unlike every other category here: per spec, a code
+    /// block's content highlighting never toggles off, only the fence lines
+    /// do. Byte ranges only; the actual `Language`/syntax highlighting is
+    /// necessarily computed in glass_md.rs (this module has no GPUI/
+    /// `Language` dependency by design), see `apply_code_syntax_highlights`.
+    pub code_fence_content: Vec<(Range<usize>, Option<String>)>,
 }
 
 /// Computes the live-preview decoration plan for `text`, given the current
@@ -280,6 +297,10 @@ fn walk_block(
             }
             return;
         }
+        "fenced_code_block" => {
+            plan_fenced_code_block(node, text, selections, plan);
+            return;
+        }
         _ => {}
     }
     let mut cursor = node.walk();
@@ -445,6 +466,85 @@ fn plan_block_quote(
             walk_block(child, text, selections, inline_parser, visible_range, plan);
         }
     }
+}
+
+/// Recognizes a ` ``` `/`~~~` fenced code block's structure: which lines are
+/// its opening/closing fence (each independently hidden behind a full-width
+/// border+chip via `apply_code_fence_borders` in glass_md.rs, unless the
+/// cursor is touching that specific line) and its content range (always
+/// exposed via `code_fence_content`, regardless of the cursor, since content
+/// highlighting never toggles off per spec).
+///
+/// Bails out (the whole block is left completely unhandled, i.e. fully raw)
+/// if the grammar didn't produce a `code_fence_content` child at all -- an
+/// unterminated fence at end-of-file is the one realistic way that happens,
+/// and it's not worth guessing at where the "content" would have ended.
+fn plan_fenced_code_block(node: Node, text: &str, selections: &[Range<usize>], plan: &mut Plan) {
+    let mut opening_delimiter: Option<Range<usize>> = None;
+    let mut closing_delimiter: Option<Range<usize>> = None;
+    let mut info_string: Option<Range<usize>> = None;
+    let mut content: Option<Range<usize>> = None;
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "fenced_code_block_delimiter" => {
+                if opening_delimiter.is_none() {
+                    opening_delimiter = Some(child.byte_range());
+                } else {
+                    closing_delimiter = Some(child.byte_range());
+                }
+            }
+            "info_string" => info_string = Some(child.byte_range()),
+            "code_fence_content" => content = Some(child.byte_range()),
+            _ => {}
+        }
+    }
+
+    let Some(opening_delimiter) = opening_delimiter else {
+        return;
+    };
+    let Some(content) = content else {
+        return;
+    };
+
+    // The language name is the info string's first whitespace-delimited
+    // word: CommonMark allows arbitrary trailing content after it (e.g.
+    // `` ```rust {.line-numbers} ``), and only the language itself matters
+    // here.
+    let language = info_string
+        .as_ref()
+        .and_then(|range| text.get(range.clone()))
+        .and_then(|s| s.split_whitespace().next())
+        .map(str::to_string);
+
+    // The opening delimiter (plus info string, if any) already spans the
+    // entire first line including its trailing newline -- `info_string`
+    // (when present) or `fenced_code_block_delimiter` otherwise ends exactly
+    // where `code_fence_content` begins, confirmed by inspecting the
+    // grammar's own output directly, so no separate line-boundary scan is
+    // needed.
+    let opening_line = opening_delimiter.start..content.start;
+    if !touches_selection(&opening_line, selections) {
+        plan.code_fence_borders.push((opening_line, language.clone()));
+    }
+
+    if let Some(closing_delimiter) = closing_delimiter {
+        // Extend by the trailing newline, if any, the same way the opening
+        // line's range includes its own -- the closing delimiter node's own
+        // range stops right at the last `` ` ``/`~`.
+        let closing_line_end = if text.as_bytes().get(closing_delimiter.end) == Some(&b'\n') {
+            closing_delimiter.end + 1
+        } else {
+            closing_delimiter.end
+        };
+        let closing_line = closing_delimiter.start..closing_line_end;
+        if !touches_selection(&closing_line, selections) {
+            plan.code_fence_borders.push((closing_line, None));
+        }
+    }
+
+    plan.code_fence_content.push((content, language));
 }
 
 /// Looks for `[!type]` immediately after the marker on a blockquote's first
@@ -1251,6 +1351,7 @@ mod tests {
             "[a link](https://example.com)\n",
             "<https://example.com>\n",
             "---\n",
+            "```rust\nfn main() {}\n```\n",
             "\n",
         ];
         let mut text = String::new();
@@ -1488,5 +1589,76 @@ mod tests {
         assert!(result.horizontal_rules.is_empty());
         assert!(result.hidden_markers.is_empty());
         assert!(result.dimmed_markers.is_empty());
+    }
+
+    #[test]
+    fn fenced_code_block_captures_language_and_borders() {
+        let text = "```rust\nfn main() {}\n```\n";
+        let result = plan(text, &[]);
+        assert_eq!(
+            result.code_fence_borders,
+            vec![(0..8, Some("rust".to_string())), (21..25, None)]
+        );
+        assert_eq!(result.code_fence_content, vec![(8..21, Some("rust".to_string()))]);
+    }
+
+    #[test]
+    fn fenced_code_block_with_tilde_fence() {
+        let text = "~~~python\nprint(1)\n~~~\n";
+        let result = plan(text, &[]);
+        assert_eq!(
+            result.code_fence_borders,
+            vec![(0..10, Some("python".to_string())), (19..23, None)]
+        );
+        assert_eq!(result.code_fence_content, vec![(10..19, Some("python".to_string()))]);
+    }
+
+    #[test]
+    fn fenced_code_block_indentation_is_kept_in_border_range() {
+        let text = "  ```js\n  indented\n  ```\n";
+        let result = plan(text, &[]);
+        assert_eq!(
+            result.code_fence_borders,
+            vec![(0..8, Some("js".to_string())), (19..25, None)]
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_with_no_language_still_produces_content_entry() {
+        let text = "```\nno language\n```\n";
+        let result = plan(text, &[]);
+        assert_eq!(result.code_fence_borders, vec![(0..4, None), (16..20, None)]);
+        assert_eq!(result.code_fence_content, vec![(4..16, None)]);
+    }
+
+    #[test]
+    fn touched_opening_fence_line_is_excluded_but_content_stays() {
+        let text = "```rust\nfn main() {}\n```\n";
+        let result = plan(text, &[1..1]); // cursor on the opening fence line
+        assert_eq!(result.code_fence_borders, vec![(21..25, None)], "closing line still not touched");
+        assert_eq!(
+            result.code_fence_content,
+            vec![(8..21, Some("rust".to_string()))],
+            "content stays present regardless of cursor position, per spec"
+        );
+    }
+
+    #[test]
+    fn touched_closing_fence_line_is_excluded_but_content_stays() {
+        let text = "```rust\nfn main() {}\n```\n";
+        let result = plan(text, &[22..22]); // cursor on the closing fence line
+        assert_eq!(result.code_fence_borders, vec![(0..8, Some("rust".to_string()))]);
+        assert_eq!(result.code_fence_content, vec![(8..21, Some("rust".to_string()))]);
+    }
+
+    #[test]
+    fn touched_content_line_leaves_both_fence_borders_alone() {
+        let text = "```rust\nfn main() {}\n```\n";
+        let result = plan(text, &[10..10]); // cursor inside the code content
+        assert_eq!(
+            result.code_fence_borders,
+            vec![(0..8, Some("rust".to_string())), (21..25, None)],
+            "cursor being in the content shouldn't reveal either fence line"
+        );
     }
 }
