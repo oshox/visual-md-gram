@@ -71,6 +71,11 @@ pub enum GlyphKind {
     /// A blockquote or callout's `>` marker, one per nesting level and one
     /// per continuation line.
     BlockquoteBar,
+    /// A GFM pipe table's `|` column separator, in a header or data row
+    /// (never the delimiter row, which is handled entirely differently --
+    /// see `TableInfo`'s own doc comment). Always folded regardless of
+    /// selection, the same as `BlockquoteBar`.
+    TablePipe,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -128,6 +133,62 @@ pub struct Plan {
     /// necessarily computed in glass_md.rs (this module has no GPUI/
     /// `Language` dependency by design), see `apply_code_syntax_highlights`.
     pub code_fence_content: Vec<(Range<usize>, Option<String>)>,
+    /// GFM pipe tables. Unlike every other category here, table cells are
+    /// never hidden or block-replaced -- every cell stays normal, always-
+    /// editable inline text (see `TableInfo`'s own doc comment for why).
+    pub tables: Vec<TableInfo>,
+}
+
+/// A column's alignment, from its `pipe_table_delimiter_cell`
+/// (`pipe_table_align_left`/`_right`, both present = center, neither =
+/// default/unspecified).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAlignment {
+    Default,
+    Left,
+    Center,
+    Right,
+}
+
+/// One `pipe_table_cell`'s byte ranges. `content` is the cell's own node
+/// range with its captured trailing whitespace trimmed back off; `leading_gap`
+/// (between the previous `|` and this cell's first byte) and `trailing_gap`
+/// (the whitespace this trimming just removed, or empty if there was none)
+/// are the two places glass_md.rs can widen into a computed-width spacer to
+/// align this column -- either may be empty, meaning there's no existing
+/// whitespace there to widen (that side just doesn't get padding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableCell {
+    pub leading_gap: Range<usize>,
+    pub content: Range<usize>,
+    pub trailing_gap: Range<usize>,
+}
+
+/// A `pipe_table`. Every `|` in a header/data row always folds to a bar
+/// glyph regardless of selection -- pushed straight into `Plan::glyph_markers`
+/// as `GlyphKind::TablePipe`, the same unconditional treatment
+/// `plan_block_quote` already gives `>` (see `GlyphKind::BlockquoteBar`'s own
+/// doc comment: "there's nothing to reveal by touching them"), rather than
+/// duplicated here. Cell text itself is never in `hidden_markers`/
+/// `dimmed_markers` at all: it was never hidden, so there's nothing to
+/// toggle when the cursor enters a cell -- that's what gives this design
+/// genuine per-cell editing without a rendered/raw mode switch. Column width
+/// alignment and the header/body divider are computed by glass_md.rs
+/// (`apply_table_alignment`/`apply_table_dividers`), which needs real text
+/// measurement and the block-decoration API this module deliberately has no
+/// dependency on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableInfo {
+    /// One entry per column, from the delimiter row.
+    pub alignments: Vec<TableAlignment>,
+    /// The delimiter row's own line range, only if it isn't touched by a
+    /// selection (same convention as `horizontal_rules`) -- a touched
+    /// delimiter line is left out entirely so its raw `|---|---:|` shows
+    /// through for editing (e.g. to add a column or change alignment).
+    pub delimiter_line: Option<Range<usize>>,
+    /// One entry per row (header first, then each data row in order), each
+    /// with one `TableCell` per column.
+    pub rows: Vec<Vec<TableCell>>,
 }
 
 /// Computes the live-preview decoration plan for `text`, given the current
@@ -305,6 +366,10 @@ fn walk_block(
         }
         "fenced_code_block" => {
             plan_fenced_code_block(node, text, selections, plan);
+            return;
+        }
+        "pipe_table" => {
+            plan_pipe_table(node, text, selections, inline_parser, visible_range, plan);
             return;
         }
         _ => {}
@@ -551,6 +616,145 @@ fn plan_fenced_code_block(node: Node, text: &str, selections: &[Range<usize>], p
     }
 
     plan.code_fence_content.push((content, language));
+}
+
+/// Recognizes a `pipe_table`'s structure -- see `TableInfo`'s own doc
+/// comment for why this only ever produces structural byte ranges (pipes,
+/// per-cell content/gap ranges, alignments), never hides or block-replaces
+/// any cell content itself.
+///
+/// Bails out (the whole table left unhandled, i.e. fully raw) if either the
+/// header or delimiter row is missing -- shouldn't happen for a real
+/// `pipe_table` node, but not worth guessing at if the grammar ever produces
+/// one some other way.
+fn plan_pipe_table(
+    node: Node,
+    text: &str,
+    selections: &[Range<usize>],
+    inline_parser: &mut Parser,
+    visible_range: &Range<usize>,
+    plan: &mut Plan,
+) {
+    let mut cursor = node.walk();
+    let mut header = None;
+    let mut delimiter_row = None;
+    let mut data_rows = Vec::new();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "pipe_table_header" => header = Some(child),
+            "pipe_table_delimiter_row" => delimiter_row = Some(child),
+            "pipe_table_row" => data_rows.push(child),
+            _ => {}
+        }
+    }
+    let Some(header) = header else {
+        return;
+    };
+    let Some(delimiter_row) = delimiter_row else {
+        return;
+    };
+
+    let alignments = table_alignments(delimiter_row);
+
+    let mut rows = vec![table_row_cells(header, text, plan)];
+    for row in &data_rows {
+        rows.push(table_row_cells(*row, text, plan));
+    }
+
+    // Recurse into every cell's own content for inline formatting (bold,
+    // links, etc. inside a cell) -- this is the *only* place viewport
+    // pruning applies for a table: `walk_block`'s own entry already skips a
+    // cell whose range doesn't overlap `visible_range`. The structural data
+    // above is collected for every row unconditionally, regardless of
+    // visibility, since glass_md.rs needs every cell in a column measured to
+    // keep that column's width (and therefore every row's spacer) visually
+    // consistent as the table scrolls in and out of view.
+    for row_node in std::iter::once(header).chain(data_rows.iter().copied()) {
+        let mut cell_cursor = row_node.walk();
+        for cell in row_node.children(&mut cell_cursor) {
+            if cell.kind() == "pipe_table_cell" {
+                walk_block(cell, text, selections, inline_parser, visible_range, plan);
+            }
+        }
+    }
+
+    let delimiter_range = delimiter_row.byte_range();
+    let delimiter_line = (!touches_selection(&delimiter_range, selections)).then_some(delimiter_range);
+
+    plan.tables.push(TableInfo {
+        alignments,
+        delimiter_line,
+        rows,
+    });
+}
+
+/// One [`TableAlignment`] per `pipe_table_delimiter_cell` in a
+/// `pipe_table_delimiter_row`.
+fn table_alignments(delimiter_row: Node) -> Vec<TableAlignment> {
+    let mut cursor = delimiter_row.walk();
+    delimiter_row
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "pipe_table_delimiter_cell")
+        .map(|cell| {
+            let mut has_left = false;
+            let mut has_right = false;
+            let mut inner_cursor = cell.walk();
+            for part in cell.children(&mut inner_cursor) {
+                match part.kind() {
+                    "pipe_table_align_left" => has_left = true,
+                    "pipe_table_align_right" => has_right = true,
+                    _ => {}
+                }
+            }
+            match (has_left, has_right) {
+                (true, true) => TableAlignment::Center,
+                (true, false) => TableAlignment::Left,
+                (false, true) => TableAlignment::Right,
+                (false, false) => TableAlignment::Default,
+            }
+        })
+        .collect()
+}
+
+/// Walks one `pipe_table_header`/`pipe_table_row`'s direct children (`|`
+/// tokens alternating with `pipe_table_cell`s), pushing every `|`'s range
+/// into `plan.glyph_markers` as `GlyphKind::TablePipe` and returning one
+/// [`TableCell`] per cell in column order.
+fn table_row_cells(row: Node, text: &str, plan: &mut Plan) -> Vec<TableCell> {
+    let mut cells = Vec::new();
+    let mut prev_pipe_end = None;
+    let mut cursor = row.walk();
+    for child in row.children(&mut cursor) {
+        match child.kind() {
+            "|" => {
+                let range = child.byte_range();
+                prev_pipe_end = Some(range.end);
+                plan.glyph_markers.push((range, GlyphKind::TablePipe));
+            }
+            "pipe_table_cell" => {
+                let cell_range = child.byte_range();
+                let leading_gap = match prev_pipe_end {
+                    Some(end) => end..cell_range.start,
+                    None => cell_range.start..cell_range.start,
+                };
+                // The cell's own node range already includes any trailing
+                // whitespace before the next `|` (confirmed by inspection);
+                // trimming it back off here is what leaves it available as
+                // `trailing_gap` for glass_md.rs to widen into a spacer.
+                let cell_text = text.get(cell_range.clone()).unwrap_or("");
+                let trimmed_len = cell_text.trim_end().len();
+                let content = cell_range.start..cell_range.start + trimmed_len;
+                let trailing_gap = content.end..cell_range.end;
+                cells.push(TableCell {
+                    leading_gap,
+                    content,
+                    trailing_gap,
+                });
+            }
+            _ => {}
+        }
+    }
+    cells
 }
 
 /// Looks for `[!type]` immediately after the marker on a blockquote's first
@@ -1358,6 +1562,7 @@ mod tests {
             "<https://example.com>\n",
             "---\n",
             "```rust\nfn main() {}\n```\n",
+            "| A | B |\n|--|--:|\n| 1 | 2 |\n",
             "\n",
         ];
         let mut text = String::new();
@@ -1665,6 +1870,120 @@ mod tests {
             result.code_fence_borders,
             vec![(0..8, Some("rust".to_string())), (21..25, None)],
             "cursor being in the content shouldn't reveal either fence line"
+        );
+    }
+
+    #[test]
+    fn table_structure_and_alignment_evenly_spaced() {
+        let text = "| Name | Role |\n|------|-----:|\n| Ada  | Dev  |\n";
+        let result = plan(text, &[]);
+        assert_eq!(result.tables.len(), 1);
+        let table = &result.tables[0];
+        assert_eq!(table.alignments, vec![TableAlignment::Default, TableAlignment::Right]);
+        assert_eq!(table.delimiter_line, Some(16..31));
+        let pipes: Vec<Range<usize>> = result
+            .glyph_markers
+            .iter()
+            .filter(|(_, kind)| *kind == GlyphKind::TablePipe)
+            .map(|(range, _)| range.clone())
+            .collect();
+        assert_eq!(pipes, vec![0..1, 7..8, 14..15, 32..33, 39..40, 46..47]);
+        assert_eq!(table.rows.len(), 2, "one header row + one data row");
+        assert_eq!(
+            table.rows[0],
+            vec![
+                TableCell {
+                    leading_gap: 1..2,
+                    content: 2..6,
+                    trailing_gap: 6..7
+                },
+                TableCell {
+                    leading_gap: 8..9,
+                    content: 9..13,
+                    trailing_gap: 13..14
+                },
+            ]
+        );
+        assert_eq!(
+            table.rows[1],
+            vec![
+                TableCell {
+                    leading_gap: 33..34,
+                    content: 34..37,
+                    trailing_gap: 37..39
+                },
+                TableCell {
+                    leading_gap: 40..41,
+                    content: 41..44,
+                    trailing_gap: 44..46
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn table_all_four_alignments() {
+        let text = "| A | B | C | D |\n|--|:--|--:|:-:|\n| 1 | 2 | 3 | 4 |\n";
+        let result = plan(text, &[]);
+        assert_eq!(
+            result.tables[0].alignments,
+            vec![
+                TableAlignment::Default,
+                TableAlignment::Left,
+                TableAlignment::Right,
+                TableAlignment::Center,
+            ]
+        );
+    }
+
+    #[test]
+    fn table_with_no_spacing_has_empty_gaps() {
+        let text = "|A|B|\n|-|-|\n|1|2|\n";
+        let result = plan(text, &[]);
+        let table = &result.tables[0];
+        for row in &table.rows {
+            for cell in row {
+                assert!(cell.leading_gap.is_empty(), "no source whitespace to widen: {cell:?}");
+                assert!(cell.trailing_gap.is_empty(), "no source whitespace to widen: {cell:?}");
+            }
+        }
+        // Content itself is still captured correctly despite no padding.
+        assert_eq!(table.rows[0][0].content, 1..2);
+        assert_eq!(table.rows[1][1].content, 15..16);
+    }
+
+    #[test]
+    fn table_multi_row_groups_cells_by_column() {
+        let text = "| A | B |\n|--|--|\n| 1 | 2 |\n| 3 | 4 |\n";
+        let result = plan(text, &[]);
+        let table = &result.tables[0];
+        assert_eq!(table.rows.len(), 3, "header + two data rows");
+        assert_eq!(table.rows[1].len(), 2);
+        assert_eq!(table.rows[2].len(), 2);
+    }
+
+    #[test]
+    fn touched_delimiter_line_is_excluded() {
+        let text = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let result = plan(text, &[11..11]); // cursor on the delimiter row
+        assert_eq!(result.tables[0].delimiter_line, None);
+    }
+
+    #[test]
+    fn untouched_delimiter_line_is_present() {
+        let text = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let result = plan(text, &[0..0]); // cursor elsewhere in the table
+        assert!(result.tables[0].delimiter_line.is_some());
+    }
+
+    #[test]
+    fn table_cell_with_bold_gets_both_decorations() {
+        let text = "| A |\n|--|\n| **bold** |\n";
+        let result = plan(text, &[]);
+        assert_eq!(result.tables.len(), 1, "table structure is still recognized");
+        assert!(
+            result.styled_spans.iter().any(|(_, style)| *style == SpanStyle::Bold),
+            "bold inside a cell should still be styled"
         );
     }
 }

@@ -108,6 +108,36 @@
 //! registry available at all, or an unrecognized language name, a fence's
 //! content simply stays plain (monospace, uncolored) rather than erroring.
 //!
+//! **M9** adds GFM pipe tables, with a genuinely different editing model
+//! from every other block-level construct here: table cells are never
+//! hidden, folded, or block-replaced -- every cell stays normal,
+//! always-visible, always-editable inline text, so there's no rendered/raw
+//! mode switch to toggle when the cursor enters one (true per-cell editing,
+//! per explicit product direction). The table *look* (vertical column
+//! borders, column-width alignment) is still built entirely out of the
+//! `Crease`/`FoldPlaceholder` mechanism every other decoration here uses,
+//! just applied to bytes that already exist in the raw table syntax rather
+//! than to the cell content itself:
+//! - Every `|` in a header/data row folds to a bar glyph unconditionally
+//!   (`GlyphKind::TablePipe`), the same treatment blockquote's `>` already
+//!   gets — see its own doc comment for why there's nothing to reveal by
+//!   touching a typographic marker like this.
+//! - Column alignment widens a cell's own *existing* whitespace (its
+//!   trailing padding, or the ambient gap after the previous `|` — both real
+//!   source bytes, confirmed by inspecting the grammar's own output) into a
+//!   spacer sized by real text measurement (`window.text_system().shape_line`,
+//!   the first use of runtime text shaping to size a decoration in this
+//!   crate) — see `table_alignment_spacer_folds`. A cell with no existing
+//!   whitespace on a given side (e.g. a minimally-spaced `|A|B|` table) just
+//!   doesn't get padding there, rather than erroring.
+//! - The delimiter row (`|------|-----:|`) has no displayable content of its
+//!   own, so it's the one part of a table that *does* use the M6/M8
+//!   whole-line block-toggle pattern (`apply_table_dividers`, structurally
+//!   identical to `apply_horizontal_rules`).
+//! - Disclosed scope trim: only a header/body divider and per-column
+//!   vertical bars are rendered, not a horizontal line between every data
+//!   row.
+//!
 //! The parsing and decision logic lives in [`plan`], a pure function with no
 //! GPUI or `Editor` dependency. This module's job is only to drive it off
 //! editor events and translate its plain byte ranges into creases and
@@ -130,12 +160,12 @@ use editor::display_map::{
 use editor::{Addon, Anchor, Bias, Editor, EditorEvent, MultiBufferOffset, MultiBufferSnapshot, SelectionEffects};
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FontStyle, FontWeight, HighlightStyle, Hsla,
-    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, StrikethroughStyle,
-    Styled, Subscription, Task, WeakEntity, Window, div, px, rgb, svg,
+    InteractiveElement, IntoElement, ParentElement, Pixels, SharedString, StatefulInteractiveElement,
+    StrikethroughStyle, Styled, Subscription, Task, TextRun, WeakEntity, Window, black, div, px, rgb, svg,
 };
 use gpui::prelude::FluentBuilder;
 use language::{HighlightId, Language, Rope};
-use plan::{GlyphKind, Plan, SpanStyle};
+use plan::{GlyphKind, Plan, SpanStyle, TableAlignment};
 use settings::{RegisterSetting, Settings, SettingsContent};
 use util::ResultExt;
 
@@ -191,6 +221,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         code_languages: HashMap::new(),
         pending_language_tasks: HashMap::new(),
         active_syntax_ids: HashSet::new(),
+        table_dividers: Vec::new(),
     });
     refresh(editor, window, cx);
 
@@ -318,6 +349,10 @@ struct GlassMdAddon {
     /// that are no longer wanted rather than iterating every highlight
     /// category the current theme happens to define.
     active_syntax_ids: HashSet<u32>,
+    /// Table delimiter-row divider blocks currently inserted (see
+    /// `apply_table_dividers`) -- structurally identical to `hr_blocks`,
+    /// since a divider line's rendering never varies either.
+    table_dividers: Vec<(Range<usize>, CustomBlockId)>,
 }
 
 impl Addon for GlassMdAddon {
@@ -585,6 +620,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 "blockquote_bar".to_string(),
                 blockquote_bar_placeholder(),
             ),
+            GlyphKind::TablePipe => (range.clone(), "table_pipe".to_string(), table_pipe_placeholder()),
         }))
         .collect();
     folds.extend(computed.checkboxes.iter().map(|(range, checked)| {
@@ -594,10 +630,12 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
             checkbox_placeholder(editor_handle.clone(), *checked),
         )
     }));
+    folds.extend(table_alignment_spacer_folds(&computed, &snapshot, window, cx));
 
     apply_folds(editor, &snapshot, folds, window, cx);
     apply_style_highlights(editor, &snapshot, &computed, enabled, cx);
     apply_horizontal_rules(editor, &snapshot, &computed, cx);
+    apply_table_dividers(editor, &snapshot, &computed, cx);
     apply_code_fence_borders(editor, &snapshot, &computed, cx);
     let code_languages: HashSet<String> =
         computed.code_fence_content.iter().filter_map(|(_, name)| name.clone()).collect();
@@ -696,6 +734,31 @@ fn blockquote_bar_placeholder() -> editor::FoldPlaceholder {
                 .into_any_element()
         }),
         collapsed_text: Some(SharedString::from("▎ ")),
+        ..base_placeholder()
+    }
+}
+
+/// A GFM table's `|` column separator, folded to a thin centered vertical
+/// bar -- same technique as `blockquote_bar_placeholder`, just centered in
+/// its own narrow width rather than left-anchored, since it sits *between*
+/// two cells' text instead of at the start of an indented line.
+fn table_pipe_placeholder() -> editor::FoldPlaceholder {
+    editor::FoldPlaceholder {
+        render: std::sync::Arc::new(|_, _, cx| {
+            let color = {
+                use theme::ActiveTheme;
+                cx.theme().colors().border
+            };
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(9.))
+                .h_full()
+                .child(div().w(px(1.)).h_full().bg(color))
+                .into_any_element()
+        }),
+        collapsed_text: Some(SharedString::from("│")),
         ..base_placeholder()
     }
 }
@@ -963,6 +1026,178 @@ fn render_horizontal_rule(cx: &mut BlockContext) -> AnyElement {
         .items_center()
         .child(div().w_full().h(px(1.)).bg(color))
         .into_any_element()
+}
+
+/// Diffs each table's `delimiter_line` against the divider blocks inserted
+/// by the previous refresh -- structurally identical to
+/// `apply_horizontal_rules` (same reasoning: a divider line can't stretch to
+/// the real editor width via a `FoldPlaceholder`), just sourced from
+/// `computed.tables` instead of `computed.horizontal_rules`.
+fn apply_table_dividers(editor: &mut Editor, snapshot: &MultiBufferSnapshot, computed: &Plan, cx: &mut Context<Editor>) {
+    let wanted_ranges: Vec<Range<usize>> = computed.tables.iter().filter_map(|table| table.delimiter_line.clone()).collect();
+
+    let previous = editor
+        .addon_mut::<GlassMdAddon>()
+        .map(|addon| std::mem::take(&mut addon.table_dividers))
+        .unwrap_or_default();
+
+    let wanted: HashSet<Range<usize>> = wanted_ranges.iter().cloned().collect();
+    let mut kept = Vec::new();
+    let mut stale_ids: collections::HashSet<CustomBlockId> = collections::HashSet::default();
+    for (range, id) in previous {
+        if wanted.contains(&range) {
+            kept.push((range, id));
+        } else {
+            stale_ids.insert(id);
+        }
+    }
+    if !stale_ids.is_empty() {
+        editor.remove_blocks(stale_ids, None, cx);
+    }
+
+    let already_kept: HashSet<Range<usize>> = kept.iter().map(|(range, _)| range.clone()).collect();
+    let new_ranges: Vec<Range<usize>> = wanted_ranges.into_iter().filter(|range| !already_kept.contains(range)).collect();
+
+    if !new_ranges.is_empty() {
+        let new_blocks: Vec<BlockProperties<Anchor>> = new_ranges
+            .iter()
+            .map(|range| {
+                let anchor_range = to_anchor_range(snapshot, range);
+                BlockProperties {
+                    placement: BlockPlacement::Replace(anchor_range.start..=anchor_range.end),
+                    height: Some(1),
+                    style: BlockStyle::Fixed,
+                    render: std::sync::Arc::new(render_horizontal_rule),
+                    priority: 0,
+                }
+            })
+            .collect();
+        let ids = editor.insert_blocks(new_blocks, None, cx);
+        kept.extend(new_ranges.into_iter().zip(ids));
+    }
+
+    if let Some(addon) = editor.addon_mut::<GlassMdAddon>() {
+        addon.table_dividers = kept;
+    }
+}
+
+/// Computes the column-alignment spacer folds for every table in `computed`.
+/// Not an `apply_*` function like its siblings -- it just returns fold
+/// entries to fold into `refresh`'s own `folds` list, so they go through
+/// `apply_folds`'s existing diffing (`GlassMdAddon::folded_markers`) instead
+/// of needing a dedicated addon field of their own.
+///
+/// For each column, every cell's *trimmed* content (`TableCell::content`) is
+/// shaped at the prose font (`ThemeSettings::ui_font`/`ui_font_size` -- the
+/// same font M7's `KEY_PROSE_FONT` gives table text, since cells are prose,
+/// not code) to find its rendered pixel width; the column's widest cell sets
+/// the target every other cell in that column pads out to. A cell that's
+/// already the widest (or the only one) gets no spacer at all. Which side
+/// gets widened follows the column's alignment: trailing (left-align,
+/// default), leading (right-align), or both, split evenly (center). A gap
+/// that's empty -- no existing whitespace there in the source to widen --
+/// is skipped for that side rather than guessed at; see `TableCell`'s own
+/// doc comment.
+fn table_alignment_spacer_folds(
+    computed: &Plan,
+    snapshot: &MultiBufferSnapshot,
+    window: &Window,
+    cx: &mut Context<Editor>,
+) -> Vec<(Range<usize>, String, editor::FoldPlaceholder)> {
+    if computed.tables.is_empty() {
+        return Vec::new();
+    }
+
+    let text = snapshot.text();
+    let (font, font_size) = {
+        let settings = theme::ThemeSettings::get_global(cx);
+        (settings.ui_font.clone(), settings.ui_font_size(cx))
+    };
+    let measure = |range: &Range<usize>| -> f32 {
+        let Some(cell_text) = text.get(range.clone()) else {
+            return 0.0;
+        };
+        if cell_text.is_empty() {
+            return 0.0;
+        }
+        let run = TextRun {
+            len: cell_text.len(),
+            font: font.clone(),
+            color: black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window.text_system().shape_line(SharedString::from(cell_text.to_string()), font_size, &[run], None);
+        f32::from(shaped.width)
+    };
+
+    let mut folds = Vec::new();
+    for table in &computed.tables {
+        let num_cols = table.alignments.len();
+        if num_cols == 0 {
+            continue;
+        }
+        let mut widths: Vec<Vec<f32>> = Vec::with_capacity(table.rows.len());
+        let mut col_max = vec![0.0f32; num_cols];
+        for row in &table.rows {
+            let row_widths: Vec<f32> = row.iter().map(|cell| measure(&cell.content)).collect();
+            for (col, &w) in row_widths.iter().enumerate() {
+                if let Some(max) = col_max.get_mut(col) {
+                    *max = max.max(w);
+                }
+            }
+            widths.push(row_widths);
+        }
+
+        for (row, row_widths) in table.rows.iter().zip(widths.iter()) {
+            for (col, (cell, &width)) in row.iter().zip(row_widths.iter()).enumerate() {
+                let Some(&max_width) = col_max.get(col) else {
+                    continue;
+                };
+                let deficit = max_width - width;
+                // Sub-pixel deficits aren't worth a fold (and would just
+                // churn the diff every refresh from float jitter).
+                if deficit < 1.0 {
+                    continue;
+                }
+                let alignment = table.alignments.get(col).copied().unwrap_or(TableAlignment::Default);
+                let mut push_spacer = |gap: &Range<usize>, width: f32| {
+                    if gap.is_empty() || width < 1.0 {
+                        return;
+                    }
+                    folds.push((
+                        gap.clone(),
+                        format!("table_spacer:{:.1}", width),
+                        table_spacer_placeholder(px(width)),
+                    ));
+                };
+                match alignment {
+                    TableAlignment::Right => push_spacer(&cell.leading_gap, deficit),
+                    TableAlignment::Center => {
+                        let half = deficit / 2.0;
+                        push_spacer(&cell.leading_gap, half);
+                        push_spacer(&cell.trailing_gap, deficit - half);
+                    }
+                    TableAlignment::Left | TableAlignment::Default => push_spacer(&cell.trailing_gap, deficit),
+                }
+            }
+        }
+    }
+    folds
+}
+
+/// An invisible fixed-width spacer, used to pad a table cell's existing
+/// whitespace out to its column's width -- same "arbitrary computed-width
+/// `div()` in a fold's render closure" technique `bullet_placeholder`/
+/// `blockquote_bar_placeholder` already use for a fixed constant, just with
+/// a width computed per-instance from real text measurement instead.
+fn table_spacer_placeholder(width: Pixels) -> editor::FoldPlaceholder {
+    editor::FoldPlaceholder {
+        render: std::sync::Arc::new(move |_, _, _| div().w(width).h_full().into_any_element()),
+        collapsed_text: Some(SharedString::from(" ")),
+        ..base_placeholder()
+    }
 }
 
 /// Diffs `computed.code_fence_borders` against the blocks inserted by the
@@ -1728,6 +1963,89 @@ mod integration_tests {
             let borders = &editor.addon::<GlassMdAddon>().unwrap().code_fence_borders;
             assert_eq!(borders.len(), 1, "only the untouched closing line should be blocked, got {borders:?}");
             assert!(borders[0].1.is_none(), "the closing border never carries a language, got {borders:?}");
+        });
+    }
+
+    /// Exercises the table decoration path (M9) end to end: confirms pipes
+    /// fold to bars (through the ordinary `folded_markers`/`apply_folds`
+    /// pipeline, via `GlyphKind::TablePipe`) and the delimiter row becomes a
+    /// divider block (`apply_table_dividers`, mirroring the horizontal-rule
+    /// test above), through a real `refresh()`.
+    #[gpui::test]
+    async fn table_pipes_fold_and_delimiter_becomes_a_block(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇ| Name | Role |\n|------|-----:|\n| Ada  | Dev  |\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+            let addon = editor.addon::<GlassMdAddon>().unwrap();
+            let pipe_count = addon.folded_markers.iter().filter(|(_, key, _)| key == "table_pipe").count();
+            assert_eq!(pipe_count, 6, "3 pipes per row * 2 rows, got {:?}", addon.folded_markers);
+            assert_eq!(addon.table_dividers.len(), 1, "expected one delimiter-row divider block");
+        });
+    }
+
+    /// A delimiter row the cursor is touching should not become a block
+    /// (its raw `|---|---:|` shows through instead), matching the same
+    /// untouched-vs-touched convention the horizontal rule and fence borders
+    /// follow.
+    #[gpui::test]
+    async fn touched_delimiter_row_drops_its_divider_block(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("| Name | Role |\nˇ|------|-----:|\n| Ada  | Dev  |\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+            let table_dividers = &editor.addon::<GlassMdAddon>().unwrap().table_dividers;
+            assert!(table_dividers.is_empty(), "a touched delimiter row should not be blocked, got {table_dividers:?}");
+        });
+    }
+
+    /// The core alignment mechanism: a column whose cells differ in width
+    /// should fold a spacer into every *shorter* cell's existing whitespace
+    /// (proving real text measurement drives this, not a fixed guess), and
+    /// leave the widest cell in that column alone.
+    #[gpui::test]
+    async fn shorter_cell_in_a_column_gets_an_alignment_spacer(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        // "Alexandria" is the widest cell in the column, including the
+        // header -- it alone should get no spacer; "Name" and "A" both
+        // should.
+        cx.set_state("ˇ| Name |\n|------|\n| A    |\n| Alexandria |\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+            let addon = editor.addon::<GlassMdAddon>().unwrap();
+            let spacer_count = addon.folded_markers.iter().filter(|(_, key, _)| key.starts_with("table_spacer:")).count();
+            assert_eq!(
+                spacer_count, 2,
+                "'Name' and 'A' should each get a spacer, 'Alexandria' (the widest) should not, got {:?}",
+                addon.folded_markers
+            );
+        });
+    }
+
+    /// A minimally-spaced table (no whitespace around any cell's content at
+    /// all) has no existing gap bytes to widen -- this should degrade
+    /// gracefully (no spacers, no panic) rather than error.
+    #[gpui::test]
+    async fn minimally_spaced_table_skips_padding_without_panicking(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇ|A|B|\n|-|-|\n|1|22|\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+            let addon = editor.addon::<GlassMdAddon>().unwrap();
+            let spacer_count = addon.folded_markers.iter().filter(|(_, key, _)| key.starts_with("table_spacer:")).count();
+            assert_eq!(spacer_count, 0, "no source whitespace anywhere to widen, got {:?}", addon.folded_markers);
         });
     }
 
