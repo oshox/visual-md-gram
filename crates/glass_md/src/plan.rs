@@ -135,7 +135,13 @@ pub struct Plan {
 ///
 /// Equivalent to [`plan_viewport`] with a visible range spanning the whole
 /// document — see that function's doc comment for why a caller with an
-/// actual viewport should prefer it instead.
+/// actual viewport should prefer it instead. `glass_md.rs` never calls this
+/// (it always has a real viewport), so it's only exercised by this module's
+/// own tests below -- kept `pub` as a convenience non-viewport-scoped entry
+/// point for exactly that, rather than making every one of those dozens of
+/// `plan(text, &[])` calls spell out `plan_viewport(text, selections,
+/// 0..text.len())` instead.
+#[allow(dead_code)]
 pub fn plan(text: &str, selections: &[Range<usize>]) -> Plan {
     plan_viewport(text, selections, 0..text.len())
 }
