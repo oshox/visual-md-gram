@@ -147,9 +147,11 @@ Rules:
 - **Selection formatting shortcuts**: `Ctrl/Cmd+B`/`I` wrap selection in
   `**`/`*`; toggling again on an already-formatted selection unwraps it, even
   if the cursor is just inside the markers without a selection.
-- **Smart list continuation**: Enter on a list/checkbox/blockquote line
-  continues the same marker on the next line; Enter on an empty list item
-  outdents/removes the marker instead.
+- **Smart list continuation**: Enter on a list/checkbox line continues the
+  same marker on the next line; Enter on an empty list item outdents it one
+  level, or removes the marker entirely at the top level. (Bare blockquote
+  lines with no list marker are not auto-continued -- only list/checkbox
+  items are, whether or not they're inside a blockquote.)
 - **Line-height / caret stability**: because decorations are inline and
   viewport-scoped (see Core mechanic), typing at the end of a long,
   heavily-formatted document does not cause visible re-layout jank of lines

@@ -43,24 +43,67 @@
 //! assume uniform row height, a rare/secondary-feature cosmetic
 //! misalignment rather than a functional one.
 //!
+//! **M5** adds the one editing behavior this crate has beyond pure
+//! decoration: "smart list continuation" (see [`list_continuation`]).
+//! Pressing Enter on a bullet/ordinal/checkbox item's own marker line
+//! continues that marker onto the new line instead of inserting a plain
+//! newline; Enter on an empty item outdents it (or exits the list at the top
+//! level) instead. Wired in ahead of `Editor::newline` via
+//! `editor.register_action`, so it only ever changes behavior for the exact
+//! cases the spec calls out and falls through to the normal handler (via
+//! `cx.propagate()`) for everything else.
+//!
+//! **M6** adds markdown links (`[text](url)`), autolinks (`<https://...>` /
+//! `<user@example.com>`), and horizontal rules (`---`/`***`/`___`).
+//! Reference-style links (`[text][1]`, `[shortcut]`) are deliberately not
+//! handled — see `plan::plan_link`'s doc comment for why the per-paragraph
+//! inline grammar can't tell those apart from ordinary bracketed prose
+//! without a document-wide reference-definition lookup this crate doesn't
+//! do. Two more scope lines, both disclosed the same way the callout-box gap
+//! above already is:
+//! - Link text gets a real color (`theme::colors().link_text_hover`) even
+//!   though every other construct in this crate deliberately renders in the
+//!   same color as prose — color is a link's only non-structural cue, so
+//!   this is a narrow, intentional exception (see `apply_style_highlights`).
+//! - Only autolinks are actually clickable to navigate: Zed's generic
+//!   cmd+click URL detection (`find_url` in
+//!   `crates/editor/src/hover_links.rs`) scans the *raw buffer text* around
+//!   the click for a URL-shaped substring, which still works once only the
+//!   `<`/`>` chars are hidden (the visible text remains the literal URL at
+//!   its real offset). A `[text](url)` link's visible glyph is the link
+//!   *text*, not the URL, so that same generic mechanism can't find the URL
+//!   from a click there — making it clickable would need a custom widget
+//!   (like the checkbox's) or extending `hover_links`, deferred here.
+//!
+//! The horizontal rule uses a genuinely different mechanism from every other
+//! decoration in this file: `insert_blocks`/`BlockProperties` (see
+//! `apply_horizontal_rules`) instead of a `FoldPlaceholder`, since a fold can
+//! only size itself to its own content and there's no way to make one
+//! stretch to the editor's actual visible width for a full-width `<hr>`.
+//!
 //! The parsing and decision logic lives in [`plan`], a pure function with no
 //! GPUI or `Editor` dependency. This module's job is only to drive it off
 //! editor events and translate its plain byte ranges into creases and
 //! `highlight_text` calls, diffing against what was previously applied so a
 //! single keystroke or cursor move touches only what changed.
 
+mod list_continuation;
 mod plan;
 
 use std::any::Any;
 use std::collections::HashSet;
 use std::ops::Range;
 
-use editor::display_map::{Crease, CreaseId, DisplayPoint, DisplayRow, DisplaySnapshot, ToDisplayPoint};
-use editor::{Addon, Anchor, Bias, Editor, EditorEvent, MultiBufferOffset, MultiBufferSnapshot};
+use editor::actions::Newline;
+use editor::display_map::{
+    BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CreaseId, CustomBlockId, DisplayPoint,
+    DisplayRow, DisplaySnapshot, ToDisplayPoint,
+};
+use editor::{Addon, Anchor, Bias, Editor, EditorEvent, MultiBufferOffset, MultiBufferSnapshot, SelectionEffects};
 use gpui::{
-    App, AppContext, Context, Entity, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveElement,
-    IntoElement, ParentElement, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled,
-    Subscription, WeakEntity, Window, div, px, rgb, svg,
+    AnyElement, App, AppContext, Context, Entity, FontStyle, FontWeight, HighlightStyle, Hsla,
+    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, StrikethroughStyle,
+    Styled, Subscription, WeakEntity, Window, div, px, rgb, svg,
 };
 use gpui::prelude::FluentBuilder;
 use plan::{GlyphKind, Plan, SpanStyle};
@@ -109,9 +152,12 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
 
     let buffer = editor.buffer().clone();
     let state = GlassMdState::new(buffer, window, cx);
+    let newline_action = editor.register_action(cx.listener(intercept_newline));
     editor.register_addon(GlassMdAddon {
         _state: state,
+        _newline_action: newline_action,
         folded_markers: Vec::new(),
+        hr_blocks: Vec::new(),
     });
     refresh(editor, window, cx);
 
@@ -133,6 +179,67 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     });
 }
 
+/// Intercepts a plain `Enter` keypress on a glass_md-managed Markdown editor
+/// and, when every cursor sits on a list item's own marker line, replaces it
+/// with "smart list continuation" (see `docs/live-preview-spec.md`) instead
+/// of a plain newline: the same bullet/ordinal/checkbox is carried onto the
+/// new line, and Enter on an empty item outdents (or exits the list) rather
+/// than adding another empty bullet.
+///
+/// Registered on the editor before `Editor::newline` itself (see
+/// `register_editor`), so it runs first on every `Newline` dispatch;
+/// `cx.propagate()` falls through to the normal handler for every case this
+/// doesn't apply to -- a disabled/non-Markdown buffer, a non-empty selection
+/// anywhere, or any cursor not on a list marker line.
+fn intercept_newline(editor: &mut Editor, _: &Newline, window: &mut Window, cx: &mut Context<Editor>) {
+    if !is_markdown_editor(editor, cx) || !GlassMdSettings::try_get(cx).is_some_and(|settings| settings.enabled) {
+        cx.propagate();
+        return;
+    }
+
+    let display_snapshot = editor.display_snapshot(cx);
+    let selections = editor.selections.all::<MultiBufferOffset>(&display_snapshot);
+    if selections.is_empty() || selections.iter().any(|selection| !selection.is_empty()) {
+        cx.propagate();
+        return;
+    }
+
+    let text = editor.buffer().read(cx).snapshot(cx).text();
+    let Some(edits) = selections
+        .iter()
+        .map(|selection| list_continuation::newline_edit(&text, selection.head().0))
+        .collect::<Option<Vec<_>>>()
+    else {
+        cx.propagate();
+        return;
+    };
+
+    // Multiple cursors can each produce their own edit; apply them together
+    // in one buffer edit (in ascending order, since selections are already
+    // reported in document order) and track the running length delta so
+    // each cursor's `cursor_after` -- computed independently against the
+    // *original* text -- lands at the right offset once every earlier
+    // edit's own length change has shifted things.
+    let mut buffer_edits = Vec::with_capacity(edits.len());
+    let mut new_cursors = Vec::with_capacity(edits.len());
+    let mut delta: isize = 0;
+    for edit in &edits {
+        let start = (edit.replace.start as isize + delta) as usize;
+        let end = (edit.replace.end as isize + delta) as usize;
+        buffer_edits.push((MultiBufferOffset(start)..MultiBufferOffset(end), edit.insert.clone()));
+        let cursor_after = (edit.cursor_after as isize + delta) as usize;
+        new_cursors.push(MultiBufferOffset(cursor_after)..MultiBufferOffset(cursor_after));
+        delta += edit.insert.len() as isize - edit.replace.len() as isize;
+    }
+
+    editor.transact(window, cx, |editor, window, cx| {
+        editor.edit(buffer_edits, cx);
+        editor.change_selections(SelectionEffects::default(), window, cx, |s| {
+            s.select_ranges(new_cursors);
+        });
+    });
+}
+
 fn is_markdown_editor(editor: &Editor, cx: &App) -> bool {
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     snapshot
@@ -146,7 +253,16 @@ fn is_markdown_editor(editor: &Editor, cx: &App) -> bool {
 /// diff against them instead of re-folding everything from scratch.
 struct GlassMdAddon {
     _state: Entity<GlassMdState>,
+    /// Keeps the `Newline` interceptor (see [`intercept_newline`]) alive for
+    /// as long as this editor is glass_md-managed; dropping it would let
+    /// `Editor::newline` handle every Enter keypress unconditionally again.
+    _newline_action: Subscription,
     folded_markers: Vec<(Range<usize>, String, CreaseId)>,
+    /// Horizontal-rule block decorations currently inserted (see
+    /// `apply_horizontal_rules`). Unlike `folded_markers`, no content-key
+    /// string travels alongside the range: a horizontal rule's rendering
+    /// never varies, so range equality alone is enough to diff old vs. new.
+    hr_blocks: Vec<(Range<usize>, CustomBlockId)>,
 }
 
 impl Addon for GlassMdAddon {
@@ -249,6 +365,7 @@ const KEY_HEADING_6: usize = 6;
 const KEY_BOLD: usize = 7;
 const KEY_ITALIC: usize = 8;
 const KEY_STRIKETHROUGH: usize = 9;
+const KEY_LINK: usize = 10;
 
 fn heading_key(level: u8) -> usize {
     match level {
@@ -416,6 +533,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 
     apply_folds(editor, &snapshot, folds, window, cx);
     apply_style_highlights(editor, &snapshot, &computed, cx);
+    apply_horizontal_rules(editor, &snapshot, &computed, cx);
 }
 
 fn to_anchor_range(snapshot: &MultiBufferSnapshot, range: &Range<usize>) -> Range<Anchor> {
@@ -688,6 +806,96 @@ fn apply_folds(
     }
 }
 
+/// Diffs `computed.horizontal_rules` against the blocks inserted by the
+/// previous refresh, same shape as `apply_folds`'s diff (`std::mem::take`
+/// the addon's previous list, split into kept vs. stale by whether the range
+/// is still wanted, remove the stale ones, insert the newly wanted ones).
+///
+/// This is a real, separate mechanism from every other decoration in this
+/// file, not a stylistic choice: a `FoldPlaceholder` (used everywhere else —
+/// bullets, blockquote bars, checkboxes) can only size itself to its own
+/// content (`AvailableSpace::MinContent` unless `constrain_width` asks it to
+/// match a specific *collapsed text* width — see
+/// `crates/editor/src/element.rs`'s `ChunkReplacement::Renderer` handling),
+/// so there is no way to make one stretch to the editor's actual visible
+/// width for a full-width `<hr>`. The editor's block-decoration API
+/// (`insert_blocks`/`BlockProperties`) is built for exactly this — its
+/// render callback receives a real `max_width: Pixels` to draw against (see
+/// `render_horizontal_rule`), and a `BlockPlacement::Replace` swaps out the
+/// entire visual row rather than decorating text within it.
+fn apply_horizontal_rules(editor: &mut Editor, snapshot: &MultiBufferSnapshot, computed: &Plan, cx: &mut Context<Editor>) {
+    let previous = editor
+        .addon_mut::<GlassMdAddon>()
+        .map(|addon| std::mem::take(&mut addon.hr_blocks))
+        .unwrap_or_default();
+
+    let wanted: HashSet<Range<usize>> = computed.horizontal_rules.iter().cloned().collect();
+    let mut kept = Vec::new();
+    // `remove_blocks` specifically wants `collections::HashSet` (an
+    // `FxHashSet`), not `std::collections::HashSet` -- the type this file
+    // otherwise uses everywhere else (e.g. `apply_folds`'s own `wanted` set).
+    let mut stale_ids: collections::HashSet<CustomBlockId> = collections::HashSet::default();
+    for (range, id) in previous {
+        if wanted.contains(&range) {
+            kept.push((range, id));
+        } else {
+            stale_ids.insert(id);
+        }
+    }
+    if !stale_ids.is_empty() {
+        editor.remove_blocks(stale_ids, None, cx);
+    }
+
+    let already_kept: HashSet<Range<usize>> = kept.iter().map(|(range, _)| range.clone()).collect();
+    let new_ranges: Vec<Range<usize>> = computed
+        .horizontal_rules
+        .iter()
+        .filter(|range| !already_kept.contains(*range))
+        .cloned()
+        .collect();
+
+    if !new_ranges.is_empty() {
+        let new_blocks: Vec<BlockProperties<Anchor>> = new_ranges
+            .iter()
+            .map(|range| {
+                let anchor_range = to_anchor_range(snapshot, range);
+                BlockProperties {
+                    placement: BlockPlacement::Replace(anchor_range.start..=anchor_range.end),
+                    height: Some(1),
+                    style: BlockStyle::Fixed,
+                    render: std::sync::Arc::new(render_horizontal_rule),
+                    priority: 0,
+                }
+            })
+            .collect();
+        let ids = editor.insert_blocks(new_blocks, None, cx);
+        kept.extend(new_ranges.into_iter().zip(ids));
+    }
+
+    if let Some(addon) = editor.addon_mut::<GlassMdAddon>() {
+        addon.hr_blocks = kept;
+    }
+}
+
+/// Renders a `---`/`***`/`___` line as a full-width thin rule, using
+/// `BlockContext::max_width` (the real remaining editor width, given to this
+/// callback directly by the block-decoration layer) rather than a fixed
+/// pixel guess or a flex `w_full()` that can't resolve against the
+/// indeterminate width a fold placeholder would otherwise be laid out in.
+fn render_horizontal_rule(cx: &mut BlockContext) -> AnyElement {
+    let color = {
+        use theme::ActiveTheme;
+        cx.theme().colors().border
+    };
+    div()
+        .w(cx.max_width)
+        .h(cx.line_height)
+        .flex()
+        .items_center()
+        .child(div().w_full().h(px(1.)).bg(color))
+        .into_any_element()
+}
+
 fn apply_style_highlights(
     editor: &mut Editor,
     snapshot: &MultiBufferSnapshot,
@@ -774,6 +982,26 @@ fn apply_style_highlights(
     // that's handled entirely by `apply_folds`, untouched by this. Unlike
     // headings/bold/italic, Zed's own syntax theme doesn't tint these
     // distinctly enough to need a counteracting color override here.
+    //
+    // Links are the one deliberate, narrow exception to "no added color"
+    // above: color is a link's only non-structural cue (no weight/slant
+    // distinguishes it the way bold/italic have their own), so per explicit
+    // product direction a real link gets colored using
+    // `link_text_hover` — the same theme token Zed's own generic cmd+hover
+    // link highlight already uses (`crates/editor/src/hover_links.rs`), so
+    // it reads as "this is a link" the same way everywhere else in the app
+    // rather than inventing a new color for the same affordance.
+    let link_color = {
+        use theme::ActiveTheme;
+        cx.theme().colors().link_text_hover
+    };
+    editor.highlight_text_key::<GlassMdMarkdown>(
+        KEY_LINK,
+        anchor_ranges(&spans_of(SpanStyle::Link)),
+        link_style(link_color),
+        false,
+        cx,
+    );
 }
 
 fn dim_marker_style() -> HighlightStyle {
@@ -831,6 +1059,15 @@ fn strikethrough_style(normal_color: Hsla) -> HighlightStyle {
             thickness: px(1.),
             color: None,
         }),
+        ..HighlightStyle::default()
+    }
+}
+
+/// Color only — no weight/slant/underline — per the spec's "styled as a
+/// link (color, no underline by default)".
+fn link_style(color: Hsla) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(color),
         ..HighlightStyle::default()
     }
 }
@@ -1015,6 +1252,68 @@ mod integration_tests {
         assert!(!displayed.contains('⋯'), "found Zed's default fold ellipsis in {displayed:?}");
     }
 
+    /// Exercises links/autolinks (M6) through a real `refresh()`, not just
+    /// the pure planner directly -- confirms `apply_style_highlights`
+    /// actually applies `KEY_LINK` and that the fold-based hiding of the
+    /// bracket/paren/angle-bracket syntax reaches the real display text.
+    #[gpui::test]
+    async fn link_and_autolink_hide_syntax_but_keep_text_visible(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇSee [Zed](https://zed.dev) or <https://zed.dev> for more.\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+        });
+
+        let displayed = cx.display_text();
+        assert!(displayed.contains("Zed"), "link text should stay visible in {displayed:?}");
+        assert!(displayed.contains("https://zed.dev"), "the bare autolink URL should stay visible in {displayed:?}");
+        assert!(!displayed.contains('['), "markdown link brackets should be hidden in {displayed:?}");
+        assert!(!displayed.contains('<'), "autolink angle brackets should be hidden in {displayed:?}");
+        assert!(
+            !displayed.contains("(https://zed.dev)"),
+            "the markdown link's own URL should be hidden, only its text kept, in {displayed:?}"
+        );
+    }
+
+    /// Exercises the horizontal-rule block-decoration path (M6) end to end:
+    /// confirms `apply_horizontal_rules` actually reaches
+    /// `Editor::insert_blocks` through a real `refresh()`, reading
+    /// `GlassMdAddon::hr_blocks` directly the same way the M3 fold tests
+    /// already read `folded_markers`.
+    #[gpui::test]
+    async fn horizontal_rule_inserts_exactly_one_block(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇtext above\n\n---\n\ntext below\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+            let hr_blocks = &editor.addon::<GlassMdAddon>().unwrap().hr_blocks;
+            assert_eq!(hr_blocks.len(), 1, "expected exactly one horizontal-rule block, got {hr_blocks:?}");
+        });
+    }
+
+    /// A thematic break the cursor is touching should not become a block at
+    /// all (its raw `---` shows through instead, matching the untouched-vs-
+    /// touched convention every other construct follows).
+    #[gpui::test]
+    async fn touched_horizontal_rule_is_not_blocked(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇ---\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| {
+            refresh(editor, window, cx);
+            let hr_blocks = &editor.addon::<GlassMdAddon>().unwrap().hr_blocks;
+            assert!(hr_blocks.is_empty(), "a touched thematic break should not be blocked, got {hr_blocks:?}");
+        });
+    }
+
     /// Combines every construct into one document, unlike the other tests
     /// which each exercise one construct in isolation. Added while chasing a
     /// real user report of every fold rendering as Zed's default ellipsis —
@@ -1173,5 +1472,96 @@ mod integration_tests {
              lines), got {copied:?}"
         );
         assert_eq!(copied, "bold** text\n- [ ] ta");
+    }
+
+    /// Exercises "smart list continuation" (see `list_continuation`) through
+    /// the real `Newline` action dispatch, not just the pure planner
+    /// function directly -- confirming `intercept_newline` is actually wired
+    /// up ahead of `Editor::newline` via `editor.register_action`.
+    #[gpui::test]
+    async fn newline_continues_a_bullet_list(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("- oneˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(editor::actions::Newline);
+        cx.assert_editor_state("- one\n- ˇ\n");
+    }
+
+    #[gpui::test]
+    async fn newline_continues_an_ordered_list(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("1. oneˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(editor::actions::Newline);
+        cx.assert_editor_state("1. one\n2. ˇ\n");
+    }
+
+    #[gpui::test]
+    async fn newline_continues_a_task_item_unchecked(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("- [x] oneˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(editor::actions::Newline);
+        cx.assert_editor_state("- [x] one\n- [ ] ˇ\n");
+    }
+
+    #[gpui::test]
+    async fn newline_on_empty_item_exits_the_list(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("- one\n- ˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(editor::actions::Newline);
+        cx.assert_editor_state("- one\nˇ\n");
+    }
+
+    #[gpui::test]
+    async fn newline_on_empty_nested_item_outdents(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("- one\n  - nested\n  - ˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(editor::actions::Newline);
+        cx.assert_editor_state("- one\n  - nested\n- ˇ\n");
+    }
+
+    /// Outside a list -- and in a non-Markdown buffer -- a plain `Enter`
+    /// keeps behaving exactly like `Editor::newline` on its own: confirms
+    /// `intercept_newline` genuinely falls through (`cx.propagate()`) rather
+    /// than swallowing the action whenever it doesn't apply.
+    #[gpui::test]
+    async fn newline_is_unaffected_outside_lists(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("just a paragraphˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(editor::actions::Newline);
+        cx.assert_editor_state("just a paragraph\nˇ\n");
+    }
+
+    #[gpui::test]
+    async fn newline_is_unaffected_in_a_non_markdown_buffer(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("- oneˇ\n");
+        cx.run_until_parked();
+
+        cx.dispatch_action(editor::actions::Newline);
+        cx.assert_editor_state("- one\nˇ\n");
     }
 }

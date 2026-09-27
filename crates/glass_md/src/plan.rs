@@ -25,6 +25,11 @@ pub enum SpanStyle {
     Highlight,
     /// Background tint for a callout's body, keyed by its `[!type]`.
     Callout(CalloutKind),
+    /// A markdown link's visible text (`[text](url)`) or an autolink's URL
+    /// text (`<https://...>`) — never the hidden brackets/parens/angle
+    /// brackets around it. See `glass_md.rs`'s `link_style` for why this is
+    /// the one span style still allowed a distinct color.
+    Link,
 }
 
 /// The callout types the spec calls out by name; anything else still renders
@@ -96,6 +101,16 @@ pub struct Plan {
     /// hypothetical one — confirmed the hard way (see `checkbox_placeholder`
     /// in glass_md.rs for the fix this drives on the applying side).
     pub checkboxes: Vec<(Range<usize>, bool)>,
+    /// Byte ranges of `thematic_break` nodes (`---`, `***`, `___`) that
+    /// aren't touched by a selection. Unlike every other category above,
+    /// these don't become a fold at all — a full-width `<hr>` needs the
+    /// editor's block-decoration API (`insert_blocks`), not an inline
+    /// `FoldPlaceholder`, since a fold can only size itself to its own
+    /// content, never to the line's actual available width. See
+    /// `apply_horizontal_rules` in glass_md.rs. A touched thematic_break is
+    /// simply left out of this list, so its raw `---` shows through exactly
+    /// like an untouched-vs-touched heading marker.
+    pub horizontal_rules: Vec<Range<usize>>,
 }
 
 /// Computes the live-preview decoration plan for `text`, given the current
@@ -259,6 +274,12 @@ fn walk_block(
             plan_block_quote(node, text, selections, inline_parser, visible_range, plan);
             return;
         }
+        "thematic_break" => {
+            if !touches_selection(&node.byte_range(), selections) {
+                plan.horizontal_rules.push(node.byte_range());
+            }
+            return;
+        }
         _ => {}
     }
     let mut cursor = node.walk();
@@ -313,8 +334,9 @@ fn plan_heading(
     }
 }
 
-const UNORDERED_MARKERS: [&str; 3] = ["list_marker_minus", "list_marker_plus", "list_marker_star"];
-const ORDERED_MARKERS: [&str; 2] = ["list_marker_dot", "list_marker_parenthesis"];
+pub(crate) const UNORDERED_MARKERS: [&str; 3] =
+    ["list_marker_minus", "list_marker_plus", "list_marker_star"];
+pub(crate) const ORDERED_MARKERS: [&str; 2] = ["list_marker_dot", "list_marker_parenthesis"];
 
 /// Renders bullets as "• " and renumbers ordered lists visually (1, 2, 3...
 /// regardless of the source's own digits, per spec), recursing into each
@@ -529,6 +551,22 @@ fn walk_inline(
     plan: &mut Plan,
     code_ranges: &mut Vec<Range<usize>>,
 ) {
+    match node.kind() {
+        "inline_link" => {
+            plan_link(node, offset, selections, plan);
+            // A link's children are structural tokens (brackets/parens) plus
+            // `link_text`/`link_destination`, none of which are themselves
+            // emphasis/link/code_span nodes in practice — like `code_span`,
+            // there's no nested markup worth recursing into here.
+            return;
+        }
+        "uri_autolink" | "email_autolink" => {
+            plan_autolink(node, offset, selections, plan);
+            return;
+        }
+        _ => {}
+    }
+
     let style = match node.kind() {
         "strong_emphasis" => Some((SpanStyle::Bold, "emphasis_delimiter")),
         "emphasis" => Some((SpanStyle::Italic, "emphasis_delimiter")),
@@ -563,6 +601,87 @@ fn walk_inline(
 
 fn shift(range: Range<usize>, offset: usize) -> Range<usize> {
     (range.start + offset)..(range.end + offset)
+}
+
+/// The first direct child of `node` with the given grammar kind, if any.
+fn find_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).find(|child| child.kind() == kind)
+}
+
+/// Hides an `inline_link`'s (`[text](url)`) brackets/parens/destination,
+/// leaving only `text` visible and styled as a link; reveals them (dimmed)
+/// instead if the cursor is anywhere on the link. Bails out (leaves the node
+/// entirely unhandled, i.e. fully raw) if any expected child is missing --
+/// malformed/unusual grammar output isn't worth guessing at.
+///
+/// Only the direct `[text](url)` shape is handled. Reference-style links
+/// (`[text][1]`, `[text][]`, `[shortcut]`) are deliberately left alone: this
+/// function is only ever reached for the `inline_link` node kind, which the
+/// grammar produces exclusively for the immediate, self-contained
+/// `[..](..)`  shape -- `full_reference_link`/`collapsed_reference_link`/
+/// `shortcut_link` are different node kinds `walk_inline` never dispatches
+/// here, since resolving those needs a `link_reference_definition` that may
+/// live in a completely different part of the document (out of scope for
+/// this crate's per-paragraph, no-cross-block-lookup inline planner).
+fn plan_link(node: Node, offset: usize, selections: &[Range<usize>], plan: &mut Plan) {
+    let Some(open_bracket) = find_child(node, "[") else {
+        return;
+    };
+    let Some(link_text) = find_child(node, "link_text") else {
+        return;
+    };
+    let Some(close_bracket) = find_child(node, "]") else {
+        return;
+    };
+    let Some(close_paren) = find_child(node, ")") else {
+        return;
+    };
+
+    let node_range = shift(node.byte_range(), offset);
+    let prefix = shift(open_bracket.byte_range(), offset);
+    // `]`, `(`, `link_destination`, `)` sit back-to-back with no gaps, so
+    // this is a single contiguous span, not several -- same "merge the
+    // contiguous run" idea as `plan_delimited_span`'s prefix/suffix, just
+    // computed directly since a link's trailing cluster isn't a repeated
+    // delimiter of one kind.
+    let suffix = shift(close_bracket.byte_range().start..close_paren.byte_range().end, offset);
+    let link_text = shift(link_text.byte_range(), offset);
+
+    if touches_selection(&node_range, selections) {
+        plan.dimmed_markers.push(prefix);
+        plan.dimmed_markers.push(suffix);
+    } else {
+        plan.hidden_markers.push(prefix);
+        plan.hidden_markers.push(suffix);
+    }
+    plan.styled_spans.push((link_text, SpanStyle::Link));
+}
+
+/// Hides a `uri_autolink`/`email_autolink`'s (`<https://...>`) angle
+/// brackets, styling the URL text between them as a link -- reveals them
+/// (dimmed) instead if the cursor is anywhere on it. Unlike `plan_link` this
+/// is a leaf node (no children at all per the grammar), so the brackets are
+/// just its first and last byte.
+fn plan_autolink(node: Node, offset: usize, selections: &[Range<usize>], plan: &mut Plan) {
+    let node_range = shift(node.byte_range(), offset);
+    if node_range.len() < 2 {
+        return;
+    }
+    let prefix = node_range.start..node_range.start + 1;
+    let suffix = node_range.end - 1..node_range.end;
+    let inner = prefix.end..suffix.start;
+
+    if touches_selection(&node_range, selections) {
+        plan.dimmed_markers.push(prefix);
+        plan.dimmed_markers.push(suffix);
+    } else {
+        plan.hidden_markers.push(prefix);
+        plan.hidden_markers.push(suffix);
+    }
+    if !inner.is_empty() {
+        plan.styled_spans.push((inner, SpanStyle::Link));
+    }
 }
 
 /// Finds every descendant delimiter node of `kind`, merges the contiguous run
@@ -1129,6 +1248,9 @@ mod tests {
             "> plain quote\n",
             "> [!warning] callout title\n",
             "> continuation of a quote\n",
+            "[a link](https://example.com)\n",
+            "<https://example.com>\n",
+            "---\n",
             "\n",
         ];
         let mut text = String::new();
@@ -1263,5 +1385,108 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn link_hidden_when_not_touched() {
+        let text = "[Zed](https://zed.dev)\n";
+        let result = plan(text, &[]);
+        assert_eq!(result.hidden_markers, vec![0..1, 4..22]);
+        assert!(result.dimmed_markers.is_empty());
+        assert_eq!(result.styled_spans, vec![(1..4, SpanStyle::Link)]);
+    }
+
+    #[test]
+    fn link_dimmed_when_cursor_touches() {
+        let text = "[Zed](https://zed.dev)\n";
+        let result = plan(text, &[2..2]); // cursor inside "Zed"
+        assert!(result.hidden_markers.is_empty());
+        assert_eq!(result.dimmed_markers, vec![0..1, 4..22]);
+        // The link text stays styled regardless of raw/rendered state, same
+        // as bold/italic.
+        assert_eq!(result.styled_spans, vec![(1..4, SpanStyle::Link)]);
+    }
+
+    #[test]
+    fn autolink_hidden_when_not_touched() {
+        let text = "<https://zed.dev>\n";
+        let result = plan(text, &[]);
+        assert_eq!(result.hidden_markers, vec![0..1, 16..17]);
+        assert!(result.dimmed_markers.is_empty());
+        assert_eq!(result.styled_spans, vec![(1..16, SpanStyle::Link)]);
+    }
+
+    #[test]
+    fn autolink_dimmed_when_cursor_touches() {
+        let text = "<https://zed.dev>\n";
+        let result = plan(text, &[5..5]);
+        assert!(result.hidden_markers.is_empty());
+        assert_eq!(result.dimmed_markers, vec![0..1, 16..17]);
+    }
+
+    #[test]
+    fn reference_style_links_are_left_completely_raw() {
+        // No `[1]: url` definition backs either of these, and tree-sitter-md
+        // can't tell the difference from the per-paragraph inline text alone
+        // (see `plan_link`'s doc comment) -- so `shortcut_link`/
+        // `full_reference_link` are never dispatched to `plan_link` at all,
+        // and nothing about the line should be touched.
+        for text in ["[shortcut]\n", "[ref link][1]\n", "[collapsed][]\n"] {
+            let result = plan(text, &[]);
+            assert!(spans(text, SpanStyle::Link).is_empty(), "unexpected link styling for {text:?}");
+            assert!(result.hidden_markers.is_empty(), "unexpected hidden markers for {text:?}");
+            assert!(result.dimmed_markers.is_empty(), "unexpected dimmed markers for {text:?}");
+        }
+    }
+
+    #[test]
+    fn link_nested_inside_bold_still_gets_styled() {
+        let text = "**[Zed](https://zed.dev)**\n";
+        let link_spans = spans(text, SpanStyle::Link);
+        let bold_spans = spans(text, SpanStyle::Bold);
+        assert_eq!(link_spans.len(), 1);
+        assert_eq!(bold_spans.len(), 1);
+        assert!(
+            bold_spans[0].start <= link_spans[0].start && link_spans[0].end <= bold_spans[0].end,
+            "link span {:?} should sit inside bold span {:?}",
+            link_spans[0],
+            bold_spans[0]
+        );
+    }
+
+    #[test]
+    fn image_and_email_are_not_mistaken_for_a_markdown_link() {
+        // `image` is a distinct node kind from `inline_link` (embeds are a
+        // separate, not-yet-implemented milestone) -- confirm it never picks
+        // up link styling by accident.
+        let text = "![alt text](image.png)\n";
+        assert!(spans(text, SpanStyle::Link).is_empty());
+    }
+
+    #[test]
+    fn email_autolink_is_styled_like_a_uri_autolink() {
+        let text = "<user@example.com>\n";
+        let result = plan(text, &[]);
+        assert_eq!(result.hidden_markers, vec![0..1, 17..18]);
+        assert_eq!(result.styled_spans, vec![(1..17, SpanStyle::Link)]);
+    }
+
+    #[test]
+    fn thematic_break_variants_populate_horizontal_rules() {
+        for text in ["---\n", "***\n", "___\n", "- - -\n"] {
+            let result = plan(text, &[]);
+            assert_eq!(result.horizontal_rules, vec![0..text.len()], "for {text:?}");
+            assert!(result.hidden_markers.is_empty());
+            assert!(result.glyph_markers.is_empty(), "a `- - -` rule must not be mistaken for a list, for {text:?}");
+        }
+    }
+
+    #[test]
+    fn touched_thematic_break_is_left_alone() {
+        let text = "---\n";
+        let result = plan(text, &[1..1]);
+        assert!(result.horizontal_rules.is_empty());
+        assert!(result.hidden_markers.is_empty());
+        assert!(result.dimmed_markers.is_empty());
     }
 }
