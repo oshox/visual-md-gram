@@ -22,7 +22,7 @@ pub struct CustomHighlightsChunks<'a> {
     text_highlights: Option<&'a TextHighlights>,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct HighlightEndpoint {
     offset: MultiBufferOffset,
     tag: HighlightKey,
@@ -67,7 +67,7 @@ fn create_highlight_endpoints(
         let start = buffer.anchor_after(range.start);
         let end = buffer.anchor_after(range.end);
         for (&tag, text_highlights) in text_highlights.iter() {
-            let style = text_highlights.0;
+            let style = &text_highlights.0;
             let ranges = &text_highlights.1;
 
             let start_ix = ranges
@@ -88,7 +88,7 @@ fn create_highlight_endpoints(
                 highlight_endpoints.push(HighlightEndpoint {
                     offset: start,
                     tag,
-                    style: Some(style),
+                    style: Some(style.clone()),
                 });
                 highlight_endpoints.push(HighlightEndpoint {
                     offset: end,
@@ -107,7 +107,7 @@ impl<'a> Iterator for CustomHighlightsChunks<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut next_highlight_endpoint = MultiBufferOffset(usize::MAX);
-        while let Some(endpoint) = self.highlight_endpoints.peek().copied() {
+        while let Some(endpoint) = self.highlight_endpoints.peek().cloned() {
             if endpoint.offset <= self.offset {
                 if let Some(style) = endpoint.style {
                     self.active_highlights.insert(endpoint.tag, style);
@@ -150,7 +150,7 @@ impl<'a> Iterator for CustomHighlightsChunks<'a> {
             prefix.highlight_style = self
                 .active_highlights
                 .values()
-                .copied()
+                .cloned()
                 .reduce(|acc, active_highlight| acc.highlight(active_highlight));
         }
         Some(prefix)

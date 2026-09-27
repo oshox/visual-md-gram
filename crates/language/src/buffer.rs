@@ -727,12 +727,13 @@ impl HighlightedTextBuilder {
             let end = self.text.len();
 
             if let Some(highlight_style) = chunk.syntax_highlight_id.and_then(|id| id.style(syntax_theme)) {
-                let highlight_style = override_style.map_or(highlight_style, |override_style| {
-                    highlight_style.highlight(override_style)
-                });
+                let highlight_style = match &override_style {
+                    Some(override_style) => highlight_style.highlight(override_style.clone()),
+                    None => highlight_style,
+                };
                 self.highlights.push((start..end, highlight_style));
-            } else if let Some(override_style) = override_style {
-                self.highlights.push((start..end, override_style));
+            } else if let Some(override_style) = &override_style {
+                self.highlights.push((start..end, override_style.clone()));
             }
         }
     }
@@ -839,7 +840,7 @@ impl EditPreview {
                     range_in_current_snapshot,
                     &current_snapshot.text,
                     &current_snapshot.syntax,
-                    Some(deletion_highlight_style),
+                    Some(deletion_highlight_style.clone()),
                     syntax_theme,
                 );
             }
@@ -849,7 +850,7 @@ impl EditPreview {
                     edit_start_in_preview_snapshot..edit_new_end_in_preview_snapshot,
                     &self.applied_edits_snapshot,
                     &self.syntax_snapshot,
-                    Some(insertion_highlight_style),
+                    Some(insertion_highlight_style.clone()),
                     syntax_theme,
                 );
             }

@@ -448,6 +448,9 @@ impl TextStyle {
     /// Create a new text style with the given highlighting applied.
     pub fn highlight(mut self, style: impl Into<HighlightStyle>) -> Self {
         let style = style.into();
+        if let Some(family) = style.font_family.clone() {
+            self.font_family = family;
+        }
         if let Some(weight) = style.font_weight {
             self.font_weight = weight;
         }
@@ -515,10 +518,18 @@ impl TextStyle {
 
 /// A highlight style to apply, similar to a `TextStyle` except
 /// for a single font, uniformly sized and spaced text.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct HighlightStyle {
     /// The color of the text
     pub color: Option<Hsla>,
+
+    /// Overrides the text's font family (e.g. switching a code span from a
+    /// prose font back to the buffer's monospace font). Unlike every other
+    /// field here this makes `HighlightStyle` no longer `Copy` (a
+    /// `SharedString` is an `Arc`-backed clone, not a bitwise one) -- see
+    /// `crates/glass_md/src/glass_md.rs`'s `KEY_PROSE_FONT`/`KEY_CODE_FONT`
+    /// for the motivating use.
+    pub font_family: Option<SharedString>,
 
     /// The font weight, e.g. bold
     pub font_weight: Option<FontWeight>,
@@ -556,6 +567,7 @@ impl Eq for HighlightStyle {}
 impl Hash for HighlightStyle {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.color.hash(state);
+        self.font_family.hash(state);
         self.font_weight.hash(state);
         self.font_style.hash(state);
         self.background_color.hash(state);
@@ -869,6 +881,7 @@ impl From<&TextStyle> for HighlightStyle {
     fn from(other: &TextStyle) -> Self {
         Self {
             color: Some(other.color),
+            font_family: Some(other.font_family.clone()),
             font_weight: Some(other.font_weight),
             font_style: Some(other.font_style),
             background_color: other.background_color,
@@ -903,6 +916,7 @@ impl HighlightStyle {
                     }
                 })
                 .or(self.color),
+            font_family: other.font_family.or(self.font_family),
             font_weight: other.font_weight.or(self.font_weight),
             font_style: other.font_style.or(self.font_style),
             background_color: other.background_color.or(self.background_color),
@@ -975,7 +989,7 @@ pub fn combine_highlights(
     endpoints.sort_unstable_by_key(|(position, _, _)| *position);
     let mut endpoints = endpoints.into_iter().peekable();
 
-    let mut active_styles = HashSet::default();
+    let mut active_styles: HashSet<usize> = HashSet::default();
     let mut ix = 0;
     iter::from_fn(move || {
         while let Some((endpoint_ix, highlight_id, is_start)) = endpoints.peek() {
@@ -984,7 +998,7 @@ pub fn combine_highlights(
                 let current_style = active_styles
                     .iter()
                     .fold(HighlightStyle::default(), |acc, highlight_id| {
-                        acc.highlight(highlights[*highlight_id])
+                        acc.highlight(highlights[*highlight_id].clone())
                     });
                 return Some((prev_index..ix, current_style));
             }
@@ -1333,11 +1347,12 @@ mod tests {
                 color: Some(red()),
                 wavy: true,
             }),
+            font_family: None,
             font_size_scale: None,
         };
-        let expected_style = style_b;
+        let expected_style = style_b.clone();
 
-        let style_a = style_a.highlight(style_b);
+        let style_a = style_a.highlight(style_b.clone());
         assert_eq!(
             style_a, expected_style,
             "Blending an empty style with another style should return the other style"
@@ -1366,6 +1381,7 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            font_family: None,
             font_size_scale: None,
         };
 
@@ -1385,6 +1401,7 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            font_family: None,
             font_size_scale: None,
         };
 

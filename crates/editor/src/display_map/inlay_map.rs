@@ -321,8 +321,8 @@ impl<'a> Iterator for InlayChunks<'a> {
 
                 let mut renderer = None;
                 let mut highlight_style = match inlay.id {
-                    InlayId::Hint(_) => self.highlight_styles.inlay_hint,
-                    InlayId::DebuggerValue(_) => self.highlight_styles.inlay_hint,
+                    InlayId::Hint(_) => self.highlight_styles.inlay_hint.clone(),
+                    InlayId::DebuggerValue(_) => self.highlight_styles.inlay_hint.clone(),
                     InlayId::ReplResult(_) => {
                         let text = inlay.text().to_string();
                         renderer = Some(ChunkRenderer {
@@ -348,7 +348,7 @@ impl<'a> Iterator for InlayChunks<'a> {
                             constrain_width: false,
                             measured_width: None,
                         });
-                        self.highlight_styles.inlay_hint
+                        self.highlight_styles.inlay_hint.clone()
                     }
                     InlayId::Color(_) => {
                         if let InlayContent::Color(color) = inlay.content {
@@ -377,7 +377,7 @@ impl<'a> Iterator for InlayChunks<'a> {
                                 measured_width: None,
                             });
                         }
-                        self.highlight_styles.inlay_hint
+                        self.highlight_styles.inlay_hint.clone()
                     }
                 };
                 let next_inlay_highlight_endpoint;
@@ -391,8 +391,8 @@ impl<'a> Iterator for InlayChunks<'a> {
                     } else {
                         next_inlay_highlight_endpoint = range.end - offset_in_inlay;
                         highlight_style = highlight_style
-                            .map(|highlight| highlight.highlight(*style))
-                            .or_else(|| Some(*style));
+                            .map(|highlight| highlight.highlight(style.clone()))
+                            .or_else(|| Some(style.clone()));
                     }
                 } else {
                     next_inlay_highlight_endpoint = usize::MAX;
@@ -1078,7 +1078,7 @@ impl InlaySnapshot {
             buffer_chunk: None,
             output_offset: range.start,
             max_output_offset: range.end,
-            highlight_styles: highlights.styles,
+            highlight_styles: highlights.styles.clone(),
             highlights,
             snapshot: self,
         }

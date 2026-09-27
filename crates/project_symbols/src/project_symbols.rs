@@ -245,7 +245,7 @@ impl PickerDelegate for ProjectSymbolsDelegate {
         let custom_highlights = string_match
             .positions
             .iter()
-            .map(|pos| (*pos..pos + 1, highlight_style));
+            .map(|pos| (*pos..pos + 1, highlight_style.clone()));
 
         let highlights = gpui::combine_highlights(custom_highlights, syntax_runs);
 

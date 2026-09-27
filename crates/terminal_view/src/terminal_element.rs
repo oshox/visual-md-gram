@@ -386,8 +386,15 @@ impl TerminalElement {
                 {
                     if !is_blank(&cell) {
                         cell_count += 1;
-                        let cell_style =
-                            TerminalElement::cell_style(&cell, fg, bg, theme, text_style, hyperlink, minimum_contrast);
+                        let cell_style = TerminalElement::cell_style(
+                            &cell,
+                            fg,
+                            bg,
+                            theme,
+                            text_style,
+                            hyperlink.clone(),
+                            minimum_contrast,
+                        );
 
                         let cell_point = AlacPoint::new(alac_line, cell.point.column.0 as i32);
                         let zero_width_chars = cell.zerowidth();
@@ -861,6 +868,7 @@ impl Element for TerminalElement {
 
                 let link_style = HighlightStyle {
                     color: Some(theme.colors().link_text_hover),
+                    font_family: None,
                     font_weight: Some(font_weight),
                     font_style: None,
                     background_color: None,

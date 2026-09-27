@@ -7417,7 +7417,7 @@ impl LineWithInvisibles {
             is_inlay: false,
             replacement: None,
         }]) {
-            if let Some(scale) = highlighted_chunk.style.and_then(|style| style.font_size_scale) {
+            if let Some(scale) = highlighted_chunk.style.as_ref().and_then(|style| style.font_size_scale) {
                 current_row_font_size = font_size * scale;
             }
             if let Some(replacement) = highlighted_chunk.replacement {
@@ -7548,7 +7548,7 @@ impl LineWithInvisibles {
                     }
 
                     if !line_chunk.is_empty() && !line_exceeded_max_len {
-                        let text_style = if let Some(style) = highlighted_chunk.style {
+                        let text_style = if let Some(style) = highlighted_chunk.style.clone() {
                             Cow::Owned(text_style.clone().highlight(style))
                         } else {
                             Cow::Borrowed(text_style)

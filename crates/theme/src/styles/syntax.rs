@@ -33,7 +33,7 @@ impl SyntaxTheme {
     pub fn get(&self, name: &str) -> HighlightStyle {
         self.highlights
             .iter()
-            .find_map(|entry| if entry.0 == name { Some(entry.1) } else { None })
+            .find_map(|entry| if entry.0 == name { Some(entry.1.clone()) } else { None })
             .unwrap_or_default()
     }
 

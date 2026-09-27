@@ -3078,8 +3078,8 @@ async fn test_preview_edits(cx: &mut TestAppContext) {
             );
 
             assert_eq!(hl.highlights.len(), 2);
-            assert_eq!(hl.highlights[0], ((18..24), insertion_style));
-            assert_eq!(hl.highlights[1], ((67..73), insertion_style));
+            assert_eq!(hl.highlights[0], ((18..24), insertion_style.clone()));
+            assert_eq!(hl.highlights[1], ((67..73), insertion_style.clone()));
         },
     )
     .await;
@@ -3118,12 +3118,12 @@ async fn test_preview_edits(cx: &mut TestAppContext) {
             );
 
             assert_eq!(hl.highlights.len(), 6);
-            assert_eq!(hl.highlights[0], ((4..9), deletion_style));
-            assert_eq!(hl.highlights[1], ((9..13), insertion_style));
-            assert_eq!(hl.highlights[2], ((52..57), deletion_style));
-            assert_eq!(hl.highlights[3], ((57..61), insertion_style));
-            assert_eq!(hl.highlights[4], ((101..106), deletion_style));
-            assert_eq!(hl.highlights[5], ((106..110), insertion_style));
+            assert_eq!(hl.highlights[0], ((4..9), deletion_style.clone()));
+            assert_eq!(hl.highlights[1], ((9..13), insertion_style.clone()));
+            assert_eq!(hl.highlights[2], ((52..57), deletion_style.clone()));
+            assert_eq!(hl.highlights[3], ((57..61), insertion_style.clone()));
+            assert_eq!(hl.highlights[4], ((101..106), deletion_style.clone()));
+            assert_eq!(hl.highlights[5], ((106..110), insertion_style.clone()));
         },
     )
     .await;

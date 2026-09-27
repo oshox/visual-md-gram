@@ -17595,7 +17595,7 @@ impl Editor {
                 .map(|highlight| {
                     let (style, ranges) = highlight.as_ref();
                     (
-                        *style,
+                        style.clone(),
                         ranges
                             .iter()
                             .map(|range| range.clone().to_display_points(&snapshot))
@@ -21113,12 +21113,12 @@ pub fn styled_runs_for_code_label<'a>(
             } else {
                 return Default::default();
             };
-            let muted_style = style.highlight(fade_out);
+            let muted_style = style.clone().highlight(fade_out.clone());
 
             let mut runs = SmallVec::<[(Range<usize>, HighlightStyle); 3]>::new();
             if range.start >= label.filter_range.end {
                 if range.start > prev_end {
-                    runs.push((prev_end..range.start, fade_out));
+                    runs.push((prev_end..range.start, fade_out.clone()));
                 }
                 runs.push((range.clone(), muted_style));
             } else if range.end <= label.filter_range.end {
@@ -21130,7 +21130,7 @@ pub fn styled_runs_for_code_label<'a>(
             prev_end = cmp::max(prev_end, range.end);
 
             if ix + 1 == label.runs.len() && label.text.len() > prev_end {
-                runs.push((prev_end..label.text.len(), fade_out));
+                runs.push((prev_end..label.text.len(), fade_out.clone()));
             }
 
             runs

@@ -321,7 +321,7 @@ pub fn render_item<T>(
         background_color: Some(cx.theme().colors().text_accent.alpha(0.3)),
         ..Default::default()
     };
-    let custom_highlights = match_ranges.into_iter().map(|range| (range, highlight_style));
+    let custom_highlights = match_ranges.into_iter().map(|range| (range, highlight_style.clone()));
 
     let settings = ThemeSettings::get_global(cx);
 

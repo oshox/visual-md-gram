@@ -491,12 +491,12 @@ impl DisplayMap {
     pub(crate) fn highlight_inlays(&mut self, type_id: TypeId, highlights: Vec<InlayHighlight>, style: HighlightStyle) {
         for highlight in highlights {
             let update = self.inlay_highlights.update(&type_id, |highlights| {
-                highlights.insert(highlight.inlay, (style, highlight.clone()))
+                highlights.insert(highlight.inlay, (style.clone(), highlight.clone()))
             });
             if update.is_none() {
                 self.inlay_highlights.insert(
                     type_id,
-                    TreeMap::from_ordered_entries([(highlight.inlay, (style, highlight))]),
+                    TreeMap::from_ordered_entries([(highlight.inlay, (style.clone(), highlight))]),
                 );
             }
         }
@@ -504,7 +504,7 @@ impl DisplayMap {
 
     pub fn text_highlights(&self, type_id: TypeId) -> Option<(HighlightStyle, &[Range<Anchor>])> {
         let highlights = self.text_highlights.get(&HighlightKey::Type(type_id))?;
-        Some((highlights.0, &highlights.1))
+        Some((highlights.0.clone(), &highlights.1))
     }
 
     #[cfg(feature = "test-support")]
@@ -603,7 +603,7 @@ pub(crate) struct Highlights<'a> {
     pub styles: HighlightStyles,
 }
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone)]
 pub struct HighlightStyles {
     pub inlay_hint: Option<HighlightStyle>,
 }
@@ -643,7 +643,7 @@ impl<'a> HighlightedChunk<'a> {
                     text = suffix;
                     return Some(HighlightedChunk {
                         text: prefix,
-                        style,
+                        style: style.clone(),
                         is_tab,
                         is_inlay,
                         replacement: renderer.clone(),
@@ -662,7 +662,7 @@ impl<'a> HighlightedChunk<'a> {
                         }),
                         ..Default::default()
                     };
-                    let invisible_style = if let Some(style) = style {
+                    let invisible_style = if let Some(style) = style.clone() {
                         style.highlight(invisible_highlight)
                     } else {
                         invisible_highlight
@@ -684,7 +684,7 @@ impl<'a> HighlightedChunk<'a> {
                         }),
                         ..Default::default()
                     };
-                    let invisible_style = if let Some(style) = style {
+                    let invisible_style = if let Some(style) = style.clone() {
                         style.highlight(invisible_highlight)
                     } else {
                         invisible_highlight
@@ -705,7 +705,7 @@ impl<'a> HighlightedChunk<'a> {
                 text = "";
                 Some(HighlightedChunk {
                     text: remainder,
-                    style,
+                    style: style.clone(),
                     is_tab,
                     is_inlay,
                     replacement: renderer.clone(),
@@ -923,7 +923,7 @@ impl DisplaySnapshot {
             display_rows,
             language_aware,
             HighlightStyles {
-                inlay_hint: Some(editor_style.inlay_hints_style),
+                inlay_hint: Some(editor_style.inlay_hints_style.clone()),
             },
         )
         .flat_map(|chunk| {

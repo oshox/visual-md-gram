@@ -114,7 +114,7 @@ pub fn highlight_ranges(text: &str, indices: &[usize], style: HighlightStyle) ->
             }
         }
 
-        highlights.push((start_ix..end_ix, style));
+        highlights.push((start_ix..end_ix, style.clone()));
     }
 
     highlights

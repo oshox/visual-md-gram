@@ -1439,7 +1439,7 @@ impl<'a> Iterator for FoldChunks<'a> {
                 tabs: chunk.tabs,
                 chars: chunk.chars,
                 syntax_highlight_id: chunk.syntax_highlight_id,
-                highlight_style: chunk.highlight_style,
+                highlight_style: chunk.highlight_style.clone(),
                 diagnostic_severity: chunk.diagnostic_severity,
                 is_unnecessary: chunk.is_unnecessary,
                 is_tab: chunk.is_tab,

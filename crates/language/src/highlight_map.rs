@@ -59,7 +59,7 @@ impl HighlightId {
     }
 
     pub fn style(&self, theme: &SyntaxTheme) -> Option<HighlightStyle> {
-        theme.highlights.get(self.0 as usize).map(|entry| entry.1)
+        theme.highlights.get(self.0 as usize).map(|entry| entry.1.clone())
     }
 
     pub fn name<'a>(&self, theme: &'a SyntaxTheme) -> Option<&'a str> {
