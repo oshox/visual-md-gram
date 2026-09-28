@@ -1131,6 +1131,7 @@ pub(crate) fn insert_crease_for_mention(
             placeholder,
             render_toggle: None,
             render_trailer: None,
+            hide_gutter_toggle: false,
             metadata: Some(CreaseMetadata {
                 label: crease_label,
                 icon_path: crease_icon,

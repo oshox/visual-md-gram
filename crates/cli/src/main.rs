@@ -908,8 +908,11 @@ mod linux {
 
                 // libexec is the standard, lib/zed is for Arch (and other non-libexec distros),
                 // ./visualmd is for the target directory in development builds.
-                let possible_locations =
-                    ["../libexec/zed-editor", "../lib/zed/zed-editor", "./visualmd"];
+                let possible_locations = [
+                    "../libexec/zed-editor",
+                    "../lib/zed/zed-editor",
+                    "./visualmd",
+                ];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
