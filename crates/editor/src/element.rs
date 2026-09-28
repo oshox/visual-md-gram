@@ -5342,7 +5342,7 @@ impl EditorElement {
                 // Each hitbox's own height, not the editor's uniform
                 // `line_height`: `layout_line_numbers` already sized it to match
                 // its row, so a line number stays vertically centered next to a
-                // taller row (e.g. a Visual MD heading).
+                // taller row (e.g. a Zed MD heading).
                 let row_height = hitbox.size.height;
 
                 let Some(()) = (if !is_singleton && hitbox.is_hovered(window) {
@@ -7417,7 +7417,7 @@ pub(crate) struct LineWithInvisibles {
     font_size: Pixels,
     /// This row's own line height. Ordinarily equal to the editor's uniform
     /// line height, but larger for a row whose highlight carries
-    /// `HighlightStyle::font_size_scale` (e.g. a Visual MD heading).
+    /// `HighlightStyle::font_size_scale` (e.g. a Zed MD heading).
     /// `row_y_offset` sums these to position every row correctly.
     pub(crate) row_height: Pixels,
 }
@@ -7477,7 +7477,7 @@ impl LineWithInvisibles {
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let uniform_line_height = text_style.line_height_in_pixels(window.rem_size());
         // A whole-row font size override for the row currently being
-        // accumulated (e.g. a Visual MD heading), read off any chunk on that
+        // accumulated (e.g. a Zed MD heading), read off any chunk on that
         // row whose highlight carries `font_size_scale`. It has to be per row
         // rather than per run because `shape_line` accepts one font size for
         // the whole line. Reset to `font_size` at every row boundary below.
@@ -7829,7 +7829,7 @@ impl LineWithInvisibles {
     /// Computes the Y offset (relative to where `start_row` would sit at zero
     /// scroll) at which `row` should be painted, generalizing the uniform
     /// `line_height * (row - scroll_position.y)` formula so per-row height
-    /// overrides (see `row_height`, e.g. a Visual MD heading) are accounted
+    /// overrides (see `row_height`, e.g. a Zed MD heading) are accounted
     /// for. It reduces to exactly the uniform formula whenever every row's
     /// `row_height` equals `line_height`.
     ///
@@ -7958,7 +7958,7 @@ impl LineWithInvisibles {
         cx: &mut App,
     ) {
         // This row's own height rather than the editor's uniform line height,
-        // so a resized row (e.g. a Visual MD heading) paints its full height.
+        // so a resized row (e.g. a Zed MD heading) paints its full height.
         let line_height = self.row_height;
         let mut fragment_origin = content_origin
             + point(
@@ -9220,7 +9220,7 @@ impl Element for EditorElement {
                     // Laid out after `line_layouts` rather than alongside the
                     // other gutter elements: it needs each row's actual height
                     // to stay aligned with text rows whose height varies (e.g.
-                    // a Visual MD heading).
+                    // a Zed MD heading).
                     let line_numbers = self.layout_line_numbers(
                         &gutter,
                         &line_layouts,
@@ -11223,7 +11223,7 @@ pub struct HighlightedRange {
 pub struct HighlightedRangeLine {
     pub start_x: Pixels,
     pub end_x: Pixels,
-    /// This line's own height (e.g. taller for a Visual MD heading).
+    /// This line's own height (e.g. taller for a Zed MD heading).
     /// `HighlightedRange::paint` accumulates these rather than assuming every
     /// line is `line_height` tall, so a selection spanning a resized row still
     /// draws over the actual text.
@@ -11287,7 +11287,7 @@ impl HighlightedRange {
 
         // Cumulative Y of each line's bottom edge, from each line's own height
         // rather than a uniform `line_height`, so a selection spanning a resized
-        // row (e.g. a Visual MD heading) covers the row's actual height.
+        // row (e.g. a Zed MD heading) covers the row's actual height.
         let mut line_bottoms = Vec::with_capacity(lines.len());
         let mut y = start_y;
         for line in lines {

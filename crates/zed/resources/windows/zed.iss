@@ -2,7 +2,7 @@
 AppId={#AppId}
 AppName={#AppName}
 AppVerName={#AppDisplayName}
-AppPublisher=Visual MD
+AppPublisher=Zed MD
 AppPublisherURL=https://github.com/oshox/visual-md-zed
 AppSupportURL=https://github.com/oshox/visual-md-zed
 AppUpdatesURL=https://github.com/oshox/visual-md-zed/releases

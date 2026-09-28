@@ -302,7 +302,7 @@ function extract_debug_symbols() {
         return
     fi
     debug_symbols_extracted=true
-    if ! dsymutil --flat "target/${target_triple}/${target_dir}/visualmd" 2> target/dsymutil.log; then
+    if ! dsymutil --flat "target/${target_triple}/${target_dir}/zedmd" 2> target/dsymutil.log; then
         echo "dsymutil failed"
         cat target/dsymutil.log
         exit 1
@@ -324,7 +324,7 @@ function upload_debug_symbols() {
         for attempt in 1 2 3; do
             echo "Sentry upload attempt $attempt..."
             if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-                "target/${target_triple}/${target_dir}/visualmd.dwarf" \
+                "target/${target_triple}/${target_dir}/zedmd.dwarf" \
                 "target/${target_triple}/${target_dir}/remote_server.dwarf"; then
                 break
             else
@@ -347,12 +347,12 @@ upload_debug_symbols
 # also keep symbols recoverable when the sentry upload is skipped.
 if [[ "$target_dir" == "release" && "$local_install" != true ]]; then
     extract_debug_symbols
-    strip -x "target/${target_triple}/${target_dir}/visualmd"
+    strip -x "target/${target_triple}/${target_dir}/zedmd"
     strip -x "target/${target_triple}/${target_dir}/cli"
     strip -x "target/${target_triple}/${target_dir}/remote_server"
 fi
 
-cp target/${target_triple}/${target_dir}/visualmd "${app_path}/Contents/MacOS/zed"
+cp target/${target_triple}/${target_dir}/zedmd "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 

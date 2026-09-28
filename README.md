@@ -3,12 +3,12 @@
 
 > [!WARNING]
 >
-> **Visual MD is a personal fork of [Zed](https://github.com/zed-industries/zed)**,
+> **Zed MD is a personal fork of [Zed](https://github.com/zed-industries/zed)**,
 > hosted at [oshox/visual-md-zed](https://github.com/oshox/visual-md-zed), that adds
 > Obsidian-style live-preview Markdown editing (see
 > [docs/visual-md-spec.md](docs/visual-md-spec.md) and the `visual_md` crate).
 > It is not an official Zed release and is not affiliated with Zed Industries.
-> Visual MD keeps its settings and data separately from Zed and does not
+> Zed MD keeps its settings and data separately from Zed and does not
 > auto-update. The rest of this README is upstream Zed's.
 
 # Zed

@@ -614,7 +614,7 @@ pub struct HighlightStyle {
     /// Unlike every other field here, this applies to the entire display row the
     /// highlighted range falls on, not just the highlighted bytes: `shape_line`
     /// accepts a single font size per line, so a consumer that wants per-row
-    /// sizing (see the editor's Visual MD heading support) reads this off any
+    /// sizing (see the editor's Zed MD heading support) reads this off any
     /// chunk on the row and picks that row's font size itself.
     pub font_size_scale: Option<f32>,
 }

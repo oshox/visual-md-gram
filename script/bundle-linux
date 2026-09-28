@@ -100,7 +100,7 @@ else
         for attempt in 1 2 3; do
             echo "Attempting sentry upload (attempt $attempt/3)..."
             if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-                "${target_dir}/${target_triple}"/release/visualmd \
+                "${target_dir}/${target_triple}"/release/zedmd \
                 "${target_dir}/${remote_server_triple}"/release/remote_server; then
                 echo "Sentry upload successful on attempt $attempt"
                 break
@@ -122,9 +122,9 @@ fi
 # is skipped.
 # We use llvm-objcopy because GNU objcopy on older distros (e.g. Ubuntu 20.04)
 # doesn't understand CREL sections produced by newer LLVM.
-llvm-objcopy --only-keep-debug "${target_dir}/${target_triple}/release/visualmd" "${target_dir}/${target_triple}/release/visualmd.dbg"
+llvm-objcopy --only-keep-debug "${target_dir}/${target_triple}/release/zedmd" "${target_dir}/${target_triple}/release/zedmd.dbg"
 llvm-objcopy --only-keep-debug "${target_dir}/${remote_server_triple}/release/remote_server" "${target_dir}/${remote_server_triple}/release/remote_server.dbg"
-llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/visualmd"
+llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/zedmd"
 llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/cli"
 llvm-objcopy --strip-debug --discard-all "${target_dir}/${remote_server_triple}/release/remote_server"
 
@@ -149,7 +149,7 @@ zed_dir="${temp_dir}/zed$suffix.app"
 
 # Binary
 mkdir -p "${zed_dir}/bin" "${zed_dir}/libexec"
-cp "${target_dir}/${target_triple}/release/visualmd" "${zed_dir}/libexec/zed-editor"
+cp "${target_dir}/${target_triple}/release/zedmd" "${zed_dir}/libexec/zed-editor"
 cp "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/zed"
 
 # Libs
@@ -160,7 +160,7 @@ cp "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/zed"
 # get dlopen'd are built against the system GLib, and resolving them against an
 # older bundled copy fails with missing symbols.
 find_libs() {
-    ldd ${target_dir}/${target_triple}/release/visualmd |\
+    ldd ${target_dir}/${target_triple}/release/zedmd |\
         cut -d' ' -f3 |\
         grep -v '\<\(libc.so\|libgcc_s.so\|libm.so\|libpthread.so\|libdl.so\|libasound.so\)' |\
         grep -v '\<\(libglib-2.0.so\|libgobject-2.0.so\|libgio-2.0.so\|libgmodule-2.0.so\|libpcre.so\|libpcre2-8.so\|libmount.so\|libblkid.so\|libselinux.so\|libffi.so\|libresolv.so\|libz.so\)'
@@ -182,17 +182,17 @@ export APP_CLI="zed"
 export APP_ICON="zed"
 export APP_ARGS="%U"
 if [[ "$channel" == "preview" ]]; then
-  export APP_NAME="Visual MD Preview"
-  APP_ID="dev.visualmd.VisualMD-Preview"
+  export APP_NAME="Zed MD Preview"
+  APP_ID="dev.zedmd.ZedMD-Preview"
 elif [[ "$channel" == "nightly" ]]; then
-  export APP_NAME="Visual MD Nightly"
-  APP_ID="dev.visualmd.VisualMD-Nightly"
+  export APP_NAME="Zed MD Nightly"
+  APP_ID="dev.zedmd.ZedMD-Nightly"
 elif [[ "$channel" == "dev" ]]; then
-  export APP_NAME="Visual MD Devel"
-  APP_ID="dev.visualmd.VisualMD-Dev"
+  export APP_NAME="Zed MD Devel"
+  APP_ID="dev.zedmd.ZedMD-Dev"
 else
-  export APP_NAME="Visual MD"
-  APP_ID="dev.visualmd.VisualMD"
+  export APP_NAME="Zed MD"
+  APP_ID="dev.zedmd.ZedMD"
 fi
 
 mkdir -p "${zed_dir}/share/applications"

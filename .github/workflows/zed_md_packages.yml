@@ -1,8 +1,8 @@
 # yaml-language-server: $schema=https://www.schemastore.org/github-workflow.json
 #
-# Builds the Visual MD Windows installer and Linux tarball. Runs manually, or on
+# Builds the Zed MD Windows installer and Linux tarball. Runs manually, or on
 # a `v*` tag, where it also publishes a GitHub release.
-name: Visual MD Packages
+name: Zed MD Packages
 
 on:
   workflow_dispatch:
@@ -56,7 +56,7 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.3
         with:
-          shared-key: visual-md-linux-release
+          shared-key: zed-md-linux-release
 
       - name: Install dependencies
         run: ./script/linux
@@ -79,7 +79,7 @@ jobs:
             echo "Error: no Linux tarball produced" >&2
             exit 1
           fi
-          cp "${tarball}" "artifacts/visual-md-${version}-linux-x86_64.tar.gz"
+          cp "${tarball}" "artifacts/zed-md-${version}-linux-x86_64.tar.gz"
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -103,7 +103,7 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.3
         with:
-          shared-key: visual-md-windows-release
+          shared-key: zed-md-windows-release
 
       - name: Bundle Windows
         shell: pwsh
@@ -119,7 +119,7 @@ jobs:
             version="${GITHUB_SHA::7}"
           fi
           mkdir -p artifacts
-          cp "target/VisualMD-x86_64.exe" "artifacts/visual-md-${version}-x86_64-setup.exe"
+          cp "target/ZedMD-x86_64.exe" "artifacts/zed-md-${version}-x86_64-setup.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -149,5 +149,5 @@ jobs:
           set -euo pipefail
           gh release create "${GITHUB_REF_NAME}" dist/* \
             --repo "${GITHUB_REPOSITORY}" \
-            --title "Visual MD ${GITHUB_REF_NAME}" \
+            --title "Zed MD ${GITHUB_REF_NAME}" \
             --generate-notes

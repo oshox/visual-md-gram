@@ -189,10 +189,10 @@ pub enum HighlightKey {
     SelectedTextHighlight,
     SyntaxTreeView(usize),
     VimExchange,
-    /// Visual MD's Markdown decorations, one sub-key per decoration category.
+    /// Zed MD's Markdown decorations, one sub-key per decoration category.
     /// Sub-keys are merged in ascending order, so a higher one wins a conflict.
     VisualMd(usize),
-    /// Visual MD's syntax highlighting inside fenced code blocks, one sub-key
+    /// Zed MD's syntax highlighting inside fenced code blocks, one sub-key
     /// per highlight id.
     VisualMdCodeSyntax(usize),
 }

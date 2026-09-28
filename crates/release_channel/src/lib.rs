@@ -44,10 +44,10 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
 #[cfg(target_os = "windows")]
 pub fn app_identifier() -> &'static str {
     match *RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "VisualMD-Editor-Dev",
-        ReleaseChannel::Nightly => "VisualMD-Editor-Nightly",
-        ReleaseChannel::Preview => "VisualMD-Editor-Preview",
-        ReleaseChannel::Stable => "VisualMD-Editor-Stable",
+        ReleaseChannel::Dev => "ZedMD-Editor-Dev",
+        ReleaseChannel::Nightly => "ZedMD-Editor-Nightly",
+        ReleaseChannel::Preview => "ZedMD-Editor-Preview",
+        ReleaseChannel::Stable => "ZedMD-Editor-Stable",
     }
 }
 
@@ -205,10 +205,10 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Visual MD Dev",
-            ReleaseChannel::Nightly => "Visual MD Nightly",
-            ReleaseChannel::Preview => "Visual MD Preview",
-            ReleaseChannel::Stable => "Visual MD",
+            ReleaseChannel::Dev => "Zed MD Dev",
+            ReleaseChannel::Nightly => "Zed MD Nightly",
+            ReleaseChannel::Preview => "Zed MD Preview",
+            ReleaseChannel::Stable => "Zed MD",
         }
     }
 
@@ -227,10 +227,10 @@ impl ReleaseChannel {
     /// This also has to match the bundle identifier for Zed on macOS.
     pub fn app_id(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "dev.visualmd.VisualMD-Dev",
-            ReleaseChannel::Nightly => "dev.visualmd.VisualMD-Nightly",
-            ReleaseChannel::Preview => "dev.visualmd.VisualMD-Preview",
-            ReleaseChannel::Stable => "dev.visualmd.VisualMD",
+            ReleaseChannel::Dev => "dev.zedmd.ZedMD-Dev",
+            ReleaseChannel::Nightly => "dev.zedmd.ZedMD-Nightly",
+            ReleaseChannel::Preview => "dev.zedmd.ZedMD-Preview",
+            ReleaseChannel::Stable => "dev.zedmd.ZedMD",
         }
     }
 

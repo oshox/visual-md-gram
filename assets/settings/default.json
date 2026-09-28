@@ -140,7 +140,7 @@
   // Whether to enable helix mode and key bindings.
   // Enabling this mode will automatically enable vim mode.
   "helix_mode": false,
-  // Settings for Visual MD's live-preview Markdown editing.
+  // Settings for Zed MD's live-preview Markdown editing.
   "visual_md": {
     // Whether to render Markdown buffers with live preview instead of plain
     // source text.
@@ -1697,8 +1697,8 @@
   //
   // Default: false
   "disable_ai": false,
-  // Automatically update the editor. Off by default in Visual MD: the update
-  // server is upstream Zed's, so updating would replace Visual MD with Zed.
+  // Automatically update the editor. Off by default in Zed MD: the update
+  // server is upstream Zed's, so updating would replace Zed MD with Zed.
   // This setting may be ignored on Linux if installed through a package manager.
   "auto_update": false,
   // How to render LSP `textDocument/documentColor` colors in the editor.

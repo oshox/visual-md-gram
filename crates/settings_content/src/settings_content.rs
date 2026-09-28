@@ -319,7 +319,7 @@ pub struct SettingsContent {
     /// Settings related to Vim mode in Zed.
     pub vim: Option<VimSettingsContent>,
 
-    /// Settings for Visual MD's live-preview Markdown editing.
+    /// Settings for Zed MD's live-preview Markdown editing.
     pub visual_md: Option<VisualMdSettingsContent>,
 
     /// Number of lines to search for modelines at the beginning and end of files.
@@ -1035,7 +1035,7 @@ pub struct CallHierarchySettingsContent {
     pub modal_max_width: Option<ModalWidthContent>,
 }
 
-/// Settings for Visual MD's live-preview Markdown editing: Markdown formatting
+/// Settings for Zed MD's live-preview Markdown editing: Markdown formatting
 /// is rendered inline as you type, with the raw syntax revealed only on the line
 /// (or span) the cursor is touching. See docs/visual-md-spec.md for the full
 /// behavior spec.

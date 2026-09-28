@@ -1040,7 +1040,7 @@ pub struct Editor {
     /// Unlike that global setting, this also suppresses the indentation-based
     /// fold-affordance fallback (`EditorSnapshot::starts_indent`) that fires
     /// independently of any actual crease existing, which doesn't belong in a
-    /// view where "foldable" isn't meaningful (e.g. a Visual MD buffer whose
+    /// view where "foldable" isn't meaningful (e.g. a Zed MD buffer whose
     /// own folds are permanent decorative replacements).
     show_fold_indicators: Option<bool>,
     buffers_with_disabled_indent_guides: HashSet<BufferId>,

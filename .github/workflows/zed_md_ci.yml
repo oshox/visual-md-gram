@@ -1,8 +1,8 @@
 # yaml-language-server: $schema=https://www.schemastore.org/github-workflow.json
 #
-# Checks and tests for the Visual MD changes on top of Zed. Manual only, to
+# Checks and tests for the Zed MD changes on top of Zed. Manual only, to
 # avoid burning Actions minutes on every push; trigger it from the Actions tab.
-name: Visual MD CI
+name: Zed MD CI
 
 on:
   workflow_dispatch:
@@ -48,7 +48,7 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.3
         with:
-          shared-key: visual-md-linux-debug
+          shared-key: zed-md-linux-debug
 
       - name: Install dependencies
         run: ./script/linux
@@ -59,7 +59,7 @@ jobs:
       - name: Check the app builds
         run: cargo check -p zed
 
-      - name: Test Visual MD and the crates it touches
+      - name: Test Zed MD and the crates it touches
         run: >-
           cargo test
           -p visual_md

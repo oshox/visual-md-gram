@@ -25,7 +25,7 @@ impl EditorSnapshot {
             .crease_snapshot
             .query_row(buffer_row, self.buffer_snapshot())
         {
-            // A crease that opts out of the gutter toggle (e.g. Visual MD's
+            // A crease that opts out of the gutter toggle (e.g. Zed MD's
             // permanent decorative replacements) shouldn't fall through to the
             // generic `folded || ...` disclosure below either: that fallback is
             // for a real, user-collapsible region. See
