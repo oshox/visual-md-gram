@@ -23,7 +23,10 @@ pub enum SpanStyle {
     Strikethrough,
     InlineCode,
     Highlight,
-    /// Background tint for a callout's body, keyed by its `[!type]`.
+    /// Background tint for a callout, covering its whole `block_quote`
+    /// range (title row included, not just the body) -- the `>` bar and
+    /// `[!type]` marker both render as non-opaque widgets, so the tint
+    /// shows through underneath them.
     Callout(CalloutKind),
     /// A markdown link's visible text (`[text](url)`) or an autolink's URL
     /// text (`<https://...>`) — never the hidden brackets/parens/angle
@@ -53,6 +56,57 @@ impl CalloutKind {
             _ => Self::Other,
         }
     }
+}
+
+/// A callout's `+`/`-` fold-state suffix, right after `[!type]`. `None` and
+/// `Expanded` render identically (both open) -- kept distinct so the
+/// fold-toggle button in glass_md.rs never writes a redundant `+` back to a
+/// buffer that never had one: collapsing then re-expanding a bare `[!note]`
+/// leaves it bare, not `[!note]+`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalloutFold {
+    None,
+    Expanded,
+    Collapsed,
+}
+
+impl CalloutFold {
+    pub fn is_collapsed(self) -> bool {
+        matches!(self, CalloutFold::Collapsed)
+    }
+}
+
+/// A parsed `> [!type]` callout, everything glass_md.rs needs to render its
+/// title widget and body collapse without re-deriving anything from raw
+/// text. See `detect_callout`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalloutInfo {
+    /// `[!type]` plus any `+`/`-` suffix, as one range.
+    pub marker_range: Range<usize>,
+    pub kind: CalloutKind,
+    /// The exact typed type name (e.g. `"todo"`), kept even when `kind`
+    /// resolves to `Other` -- an unrecognized type still gets a real,
+    /// specific title label, just generic styling.
+    pub raw_type_name: String,
+    pub fold: CalloutFold,
+    /// Where a `+`/`-` character does (or, if `fold` is `None`, would) go --
+    /// a zero-width range positioned right after `]` when absent. Editing
+    /// this one range (an insert, a replace, or a delete to `""`) covers all
+    /// three fold-toggle transitions with the same single-edit shape the
+    /// checkbox toggle already uses.
+    pub suffix_range: Range<usize>,
+    /// The whole `block_quote` node's range, used for the background tint so
+    /// it covers the title row too, not just the body.
+    pub node_range: Range<usize>,
+    /// From the end of `marker_range` to the end of `node_range` -- what
+    /// gets collapsed into an ellipsis crease when `fold` is `Collapsed`.
+    pub body_range: Range<usize>,
+    /// Whether a selection touches `marker_range`. When `true`,
+    /// `plan_block_quote` reveals it as raw, dimmed text (like every other
+    /// hideable construct) instead of glass_md.rs rendering its title
+    /// widget for it -- the callout's raw-text editing affordance, standing
+    /// in for a right-click "change type" menu this crate doesn't build.
+    pub touched: bool,
 }
 
 /// What kind of typographic marker a `glyph_markers` entry replaces. Kept as
@@ -89,10 +143,13 @@ pub struct Plan {
     /// Content byte ranges (markers excluded) that get a persistent style.
     pub styled_spans: Vec<(Range<usize>, SpanStyle)>,
     /// Marker byte ranges replaced with a specific glyph (list bullets and
-    /// renumbered ordinals, blockquote/callout left bars, callout titles) —
-    /// unlike `hidden_markers`, these are always folded regardless of
-    /// selection, since a typographic marker isn't "raw source syntax" the
-    /// way `**`/`#`/`>` are; there's nothing to reveal by touching them.
+    /// renumbered ordinals, blockquote/callout left bars) — unlike
+    /// `hidden_markers`, these are always folded regardless of selection,
+    /// since a typographic marker isn't "raw source syntax" the way
+    /// `**`/`#`/`>` are; there's nothing to reveal by touching them. A
+    /// callout's own `[!type]` title is deliberately *not* here (see
+    /// `callouts` below) — it needs to reveal as raw text on touch, so a
+    /// user can retype the type name or its fold suffix directly.
     pub glyph_markers: Vec<(Range<usize>, GlyphKind)>,
     /// Byte ranges of `[ ]`/`[x]` task markers, with their current checked
     /// state (from which grammar node matched, `task_list_marker_checked`
@@ -137,6 +194,11 @@ pub struct Plan {
     /// never hidden or block-replaced -- every cell stays normal, always-
     /// editable inline text (see `TableInfo`'s own doc comment for why).
     pub tables: Vec<TableInfo>,
+    /// Parsed `> [!type]` callouts (see `CalloutInfo`), one per callout
+    /// regardless of touch state -- glass_md.rs still needs an untouched-but-
+    /// collapsed callout's `body_range` even while its title happens to be
+    /// showing raw (touched) text.
+    pub callouts: Vec<CalloutInfo>,
 }
 
 /// A column's alignment, from its `pipe_table_delimiter_cell`
@@ -523,12 +585,14 @@ fn plan_block_quote(
         }
     }
 
-    let callout = detect_callout(node, text);
-    if let Some((marker_range, kind, body_range)) = &callout {
-        plan.hidden_markers.push(marker_range.clone());
-        if !body_range.is_empty() {
-            plan.styled_spans.push((body_range.clone(), SpanStyle::Callout(*kind)));
+    if let Some(callout) = detect_callout(node, text, selections) {
+        if callout.touched {
+            plan.dimmed_markers.push(callout.marker_range.clone());
         }
+        if !callout.node_range.is_empty() {
+            plan.styled_spans.push((callout.node_range.clone(), SpanStyle::Callout(callout.kind)));
+        }
+        plan.callouts.push(callout);
     }
 
     let mut cursor = node.walk();
@@ -761,7 +825,7 @@ fn table_row_cells(row: Node, text: &str, plan: &mut Plan) -> Vec<TableCell> {
 /// line. Returns the `[!type]` marker's own byte range (to hide), the
 /// recognized callout kind, and the byte range of the rest of the
 /// blockquote's content (to tint).
-fn detect_callout(block_quote: Node, text: &str) -> Option<(Range<usize>, CalloutKind, Range<usize>)> {
+fn detect_callout(block_quote: Node, text: &str, selections: &[Range<usize>]) -> Option<CalloutInfo> {
     let node_range = block_quote.byte_range();
     let first_marker_end = {
         let mut cursor = block_quote.walk();
@@ -780,16 +844,37 @@ fn detect_callout(block_quote: Node, text: &str) -> Option<(Range<usize>, Callou
     if type_name.is_empty() || !type_name.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
-    let marker_end = first_marker_end + close + 1;
-    // Optional fold-state suffix (`+`/`-`) right after the closing bracket.
-    let marker_end = if text.as_bytes().get(marker_end) == Some(&b'+') || text.as_bytes().get(marker_end) == Some(&b'-') {
-        marker_end + 1
-    } else {
-        marker_end
+    let bracket_end = first_marker_end + close + 1;
+    let (fold, suffix_range) = match text.as_bytes().get(bracket_end) {
+        Some(b'+') => (CalloutFold::Expanded, bracket_end..bracket_end + 1),
+        Some(b'-') => (CalloutFold::Collapsed, bracket_end..bracket_end + 1),
+        _ => (CalloutFold::None, bracket_end..bracket_end),
     };
+    let marker_end = suffix_range.end;
     let marker_range = first_marker_end..marker_end;
-    let body_start = marker_end;
-    Some((marker_range, CalloutKind::from_type_name(type_name), body_start..node_range.end))
+    // Matches `plan_heading`'s own "touched" scope, not a bare overlap with
+    // `marker_range`: a heading reveals its marker when the cursor is
+    // anywhere on that (single-line) construct, so a callout reveals its
+    // title when the cursor is anywhere on *its* title line -- including
+    // past the marker, in same-line text like "> [!warning] Be careful" --
+    // but deliberately not for a cursor anywhere in the body, which stays
+    // independently live-previewed (per spec) rather than coupled to the
+    // title's own raw/rendered state.
+    let title_line_end = text[node_range.start..node_range.end]
+        .find('\n')
+        .map(|offset| node_range.start + offset)
+        .unwrap_or(node_range.end);
+    let touched = touches_selection(&(node_range.start..title_line_end), selections);
+    Some(CalloutInfo {
+        kind: CalloutKind::from_type_name(type_name),
+        raw_type_name: type_name.to_string(),
+        fold,
+        suffix_range,
+        body_range: marker_end..node_range.end,
+        node_range,
+        marker_range,
+        touched,
+    })
 }
 
 /// The real `tree-sitter-md` crate's `MarkdownParser` (see `plan()`'s doc
@@ -1393,16 +1478,120 @@ mod tests {
     }
 
     #[test]
-    fn callout_hides_bracket_syntax_and_tints_body() {
+    fn callout_hides_bracket_syntax_and_tints_the_whole_box() {
         let text = "> [!warning] Be careful\n";
         let result = plan(text, &[]);
-        assert!(result.hidden_markers.contains(&(2..12)));
+        // The marker never lands in `hidden_markers` (that would trigger the
+        // generic space-fold): glass_md.rs renders its own title widget for
+        // an untouched callout, driven by `Plan::callouts` instead.
+        assert!(!result.hidden_markers.contains(&(2..12)));
+        assert!(!result.dimmed_markers.contains(&(2..12)));
+        let callout = result.callouts.first().expect("expected one callout");
+        assert_eq!(callout.marker_range, 2..12);
+        assert_eq!(callout.kind, CalloutKind::Warning);
+        assert_eq!(callout.raw_type_name, "warning");
+        assert_eq!(callout.fold, CalloutFold::None);
+        assert!(!callout.touched);
+        // The tint covers the whole block_quote node (title row included),
+        // not just the body.
+        assert_eq!(callout.node_range, 0..text.len());
         assert!(
             result
                 .styled_spans
                 .iter()
-                .any(|(_, style)| *style == SpanStyle::Callout(CalloutKind::Warning))
+                .any(|(range, style)| *range == callout.node_range && *style == SpanStyle::Callout(CalloutKind::Warning))
         );
+    }
+
+    #[test]
+    fn touched_callout_marker_reveals_as_raw_dimmed_text() {
+        let text = "> [!warning] Be careful\n";
+        // Cursor placed inside the `[!warning]` marker range (2..12).
+        let result = plan(text, &[5..5]);
+        assert!(result.dimmed_markers.contains(&(2..12)));
+        assert!(!result.hidden_markers.contains(&(2..12)));
+        let callout = result.callouts.first().expect("expected one callout");
+        assert!(callout.touched);
+        // Still tinted and still tracked, even while its title shows raw.
+        assert!(
+            result
+                .styled_spans
+                .iter()
+                .any(|(range, style)| *range == callout.node_range && *style == SpanStyle::Callout(CalloutKind::Warning))
+        );
+    }
+
+    #[test]
+    fn cursor_anywhere_on_the_title_line_touches_it_not_just_the_marker_bytes() {
+        let text = "> [!warning] Be careful\n";
+        // Cursor inside "careful", well past the `[!warning]` marker itself,
+        // but still on the same title line -- matches `plan_heading`'s own
+        // "touched" scope (the whole construct's line, not a bare overlap
+        // with the marker's own bytes).
+        let result = plan(text, &[20..20]);
+        let callout = result.callouts.first().expect("expected one callout");
+        assert!(callout.touched);
+        assert!(result.dimmed_markers.contains(&(2..12)));
+    }
+
+    #[test]
+    fn cursor_in_a_multiline_callouts_body_does_not_touch_the_title() {
+        let text = "> [!note] Title\n> Body line one\n> Body line two\n";
+        // Cursor inside "Body line one" (second line) -- the body stays
+        // independently live-previewed; it shouldn't couple back to
+        // revealing the title's raw `[!note]` text.
+        let cursor = text.find("line one").unwrap();
+        let result = plan(text, &[cursor..cursor]);
+        let callout = result.callouts.first().expect("expected one callout");
+        assert!(!callout.touched);
+        assert!(result.hidden_markers.is_empty() || !result.hidden_markers.contains(&callout.marker_range));
+        assert!(!result.dimmed_markers.contains(&callout.marker_range));
+    }
+
+    #[test]
+    fn callout_fold_suffix_states_parse_correctly() {
+        let none = plan("> [!note] a\n", &[]);
+        assert_eq!(none.callouts.first().unwrap().fold, CalloutFold::None);
+
+        let expanded = plan("> [!note]+ a\n", &[]);
+        assert_eq!(expanded.callouts.first().unwrap().fold, CalloutFold::Expanded);
+
+        let collapsed = plan("> [!note]- a\n", &[]);
+        let collapsed_callout = collapsed.callouts.first().unwrap();
+        assert_eq!(collapsed_callout.fold, CalloutFold::Collapsed);
+        assert!(collapsed_callout.fold.is_collapsed());
+        assert!(!CalloutFold::None.is_collapsed());
+    }
+
+    #[test]
+    fn callout_suffix_range_supports_insert_and_replace() {
+        // No suffix: a zero-width insertion point right after `]`.
+        let none = plan("> [!note] a\n", &[]);
+        let callout = none.callouts.first().unwrap();
+        assert_eq!(callout.suffix_range, callout.marker_range.end..callout.marker_range.end);
+
+        // An existing suffix: a one-byte range to replace or delete.
+        let collapsed = plan("> [!note]- a\n", &[]);
+        let callout = collapsed.callouts.first().unwrap();
+        assert_eq!(callout.suffix_range.end - callout.suffix_range.start, 1);
+        assert_eq!(callout.suffix_range.end, callout.marker_range.end);
+    }
+
+    #[test]
+    fn unrecognized_callout_type_keeps_its_raw_name() {
+        let result = plan("> [!todo] buy milk\n", &[]);
+        let callout = result.callouts.first().expect("expected one callout");
+        assert_eq!(callout.kind, CalloutKind::Other);
+        assert_eq!(callout.raw_type_name, "todo");
+    }
+
+    #[test]
+    fn nested_callouts_do_not_panic_and_each_gets_its_own_info() {
+        let text = "> [!note] outer\n> > [!warning] inner\n";
+        let result = plan(text, &[]);
+        assert_eq!(result.callouts.len(), 2);
+        assert!(result.callouts.iter().any(|c| c.kind == CalloutKind::Note));
+        assert!(result.callouts.iter().any(|c| c.kind == CalloutKind::Warning));
     }
 
     #[test]

@@ -464,6 +464,17 @@
     },
   },
   {
+    // Shadows `workspace::ToggleLeftDock`/`editor::ShowSignatureHelp` while
+    // glass_md is actively decorating this buffer; see glass_md's module doc
+    // (M10) for why that's safe.
+    "context": "Editor && glass_md",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-b": "glass_md::ToggleBold",
+      "cmd-i": "glass_md::ToggleItalic",
+    },
+  },
+  {
     "context": "Editor && extension == svg",
     "use_key_equivalents": true,
     "bindings": {
