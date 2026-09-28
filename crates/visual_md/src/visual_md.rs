@@ -138,12 +138,97 @@
 //!   vertical bars are rendered, not a horizontal line between every data
 //!   row.
 //!
+//! **M10** adds the spec's "Selection formatting shortcuts" bullet for bold
+//! and italic: `ToggleBold`/`ToggleItalic` (bound to `ctrl/cmd-b`/`i` in the
+//! keymap's `Editor && visual_md` context), handled by
+//! `intercept_toggle_bold`/`intercept_toggle_italic`, which both delegate
+//! their actual detection/wrap/unwrap logic to the pure
+//! [`format_toggle::toggle`] — same shape as M5's `list_continuation`. The
+//! other shortcut the spec calls out, pasting a URL over a selection to make
+//! `[text](url)`, needs no work here: it already exists in Zed core
+//! (`Editor::paste`, see `test_paste_url_from_other_app_creates_markdown_link_over_selected_text`
+//! in `crates/editor/src/editor_tests.rs`).
+//!
+//! `ctrl/cmd-b`/`i` are bound elsewhere too (`workspace::ToggleLeftDock` and
+//! `editor::ShowSignatureHelp`, respectively) — the new bindings
+//! *deliberately* shadow those, but only inside a Markdown buffer visual_md
+//! is actively decorating: the `visual_md` key context is added by
+//! `VisualMdAddon::extend_key_context`, gated on the same `active` flag
+//! `refresh` already computes from `is_markdown_editor` + the setting. If
+//! `intercept_toggle` ever finds nothing to do (empty selections, a
+//! selection covering no bold/italic-eligible text, or the setting just got
+//! disabled mid-keystroke), it calls `cx.propagate()`, which lets gpui's key
+//! dispatch continue down the context stack to the shadowed binding — so
+//! `ctrl-b` still opens the dock outside a live-preview buffer, and even
+//! falls back to it inside one if the shortcut genuinely has nothing to
+//! toggle. Vim mode is a known, narrow gap: `vim.jsonc`'s own `ctrl-b`/`ctrl-i`
+//! bindings (page-up, jump-forward) take precedence in normal/visual mode,
+//! so these shortcuts currently only fire in insert mode or with vim off.
+//!
+//! **M11** upgrades callouts (`> [!type]`) from M2's minimal handling (the
+//! `[!type]` bracket syntax permanently hidden, no icon, no color) into real
+//! boxes: an icon + capitalized title chip, a `+`/`-` fold toggle that
+//! actually collapses the body, and a background tint per kind
+//! (`callout_look`, reusing Zed's existing semantic status colors —
+//! `cx.theme().status()` — rather than inventing new theme tokens). Two
+//! fixes rode along with the new construct, not just additions:
+//! - The `[!type]` marker used to be unconditionally hidden, with no way to
+//!   reveal it no matter where the cursor was — there was literally no way
+//!   to edit a callout's type. It now reveals as raw, dimmed text exactly
+//!   like every other hideable construct here, scoped to the *title line*
+//!   specifically (matching `plan_heading`'s own "touched" scope, not a
+//!   bare overlap with the marker's own bytes) so editing the type doesn't
+//!   couple to the body, which stays independently live-previewed per spec.
+//!   This is also the callout's whole "change type" affordance — there's no
+//!   right-click menu (see below).
+//! - Callout body coloring had been explicitly removed in an earlier
+//!   session (grouped with inline-code/highlight, "per product direction,
+//!   only structural styling survives") — a real conflict with the spec
+//!   file's own "colored, rounded box" wording. Resolved by asking the user:
+//!   color comes back for callouts specifically, as a second deliberate
+//!   exception alongside links (`KEY_LINK`) — a callout's whole purpose is
+//!   standing out, unlike the tints that were removed.
+//!
+//! The title widget (`callout_title_placeholder`) is modeled directly on
+//! `checkbox_placeholder`: its chevron is a real click target that writes
+//! the fold suffix back to the buffer with the same single-edit shape the
+//! checkbox uses for `[ ]`/`[x]`, not a read-only glyph. The collapsed body
+//! (`callout_collapsed_body_placeholder`) is a genuine multi-line `Crease`
+//! spanning every body line — the same mechanism Zed's own code folding
+//! uses to collapse a function body, not a new capability — fed into the
+//! same unified `folds` list every other decoration in `refresh` already
+//! uses, so its diffing/removal falls out of `apply_folds` for free.
+//!
+//! Disclosed scope trims:
+//! - No right-click "change callout type" menu — direct raw-text editing of
+//!   the now-revealable marker covers the same need.
+//! - The left accent bar stays the same neutral color as a plain
+//!   blockquote's, not tinted per kind — `GlyphKind::BlockquoteBar` is also
+//!   emitted from a second, unrelated code path (`plan_inline`'s
+//!   `block_continuation` handling, for a wrapped paragraph's continuation
+//!   lines inside a blockquote) that has no easy access to the enclosing
+//!   callout's kind; the background tint and title icon already do the
+//!   identifying work, so threading kind context into that second path
+//!   wasn't worth it this pass.
+//! - Nested callouts of *different* kinds get no special overlap
+//!   resolution — whichever kind's `KEY_CALLOUT_*` happens to be numbered
+//!   higher wins the background-color conflict for the overlapping bytes,
+//!   not necessarily the innermost one. Real-world callouts essentially
+//!   never nest mismatched kinds, so this is a disclosed, low-cost trim
+//!   rather than a general regression (nesting itself works fine — see
+//!   `nested_callouts_do_not_panic_and_each_gets_its_own_info`).
+//! - No genuine multi-line CSS box (border, corner radius): the "box" is
+//!   entirely a per-line background tint + icon + left bar, the same
+//!   honest, real-decorations-only approach M9 used for tables, rather than
+//!   faking a DOM structure this crate's decoration primitives don't have.
+//!
 //! The parsing and decision logic lives in [`plan`], a pure function with no
 //! GPUI or `Editor` dependency. This module's job is only to drive it off
 //! editor events and translate its plain byte ranges into creases and
 //! `highlight_text` calls, diffing against what was previously applied so a
 //! single keystroke or cursor move touches only what changed.
 
+mod format_toggle;
 mod list_continuation;
 mod plan;
 
@@ -161,17 +246,30 @@ use editor::{
     Addon, Anchor, Bias, Editor, EditorEvent, HighlightKey, MultiBufferOffset, MultiBufferSnapshot,
     SelectionEffects,
 };
+use format_toggle::Emphasis;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FontFamilyName, FontStyle, FontWeight,
-    HighlightStyle, Hsla, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
-    StatefulInteractiveElement, StrikethroughStyle, Styled, Subscription, Task, TextRun,
-    WeakEntity, Window, black, div, px, rgb, svg,
+    HighlightStyle, Hsla, InteractiveElement, IntoElement, KeyContext, ParentElement, Pixels,
+    SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, Subscription, Task,
+    TextRun, WeakEntity, Window, actions, black, div, px, rgb, svg,
 };
 use language::{Language, Rope};
-use plan::{GlyphKind, Plan, SpanStyle, TableAlignment};
+use plan::{CalloutFold, CalloutKind, GlyphKind, Plan, SpanStyle, TableAlignment};
 use settings::{RegisterSetting, Settings, SettingsContent};
 use util::ResultExt;
+
+actions!(
+    visual_md,
+    [
+        /// Toggles `**bold**` on the selection (or unwraps it, or edits an
+        /// empty pair at the cursor) — see `intercept_toggle_bold`.
+        ToggleBold,
+        /// Toggles `*italic*` on the selection, the same way `ToggleBold`
+        /// does for bold — see `intercept_toggle_italic`.
+        ToggleItalic,
+    ]
+);
 
 /// The `visual_md` user setting: `{ "visual_md": { "enabled": true } }`. Defaults to
 /// on, per the project goal of always using live preview for Markdown in Zed.
@@ -216,9 +314,14 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     let buffer = editor.buffer().clone();
     let state = VisualMdState::new(buffer, window, cx);
     let newline_action = editor.register_action(cx.listener(intercept_newline));
+    let toggle_bold_action = editor.register_action(cx.listener(intercept_toggle_bold));
+    let toggle_italic_action = editor.register_action(cx.listener(intercept_toggle_italic));
     editor.register_addon(VisualMdAddon {
         _state: state,
         _newline_action: newline_action,
+        _toggle_bold_action: toggle_bold_action,
+        _toggle_italic_action: toggle_italic_action,
+        active: false,
         folded_markers: Vec::new(),
         hr_blocks: Vec::new(),
         code_fence_borders: Vec::new(),
@@ -320,6 +423,85 @@ fn intercept_newline(
     });
 }
 
+/// Handles `ToggleBold`, bound to `ctrl/cmd-b` in a visual_md-managed
+/// Markdown editor (see the keymap's `Editor && visual_md` context and this
+/// module's M10 doc section). Delegates all the actual detection/wrap/unwrap
+/// logic to [`format_toggle::toggle`]; this function's only job is dispatch
+/// (the enabled/language guard, matching `intercept_newline`'s) and applying
+/// the returned edits/selections as one transaction.
+fn intercept_toggle_bold(
+    editor: &mut Editor,
+    _: &ToggleBold,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    intercept_toggle(editor, Emphasis::Bold, window, cx);
+}
+
+/// Handles `ToggleItalic` — see `intercept_toggle_bold`.
+fn intercept_toggle_italic(
+    editor: &mut Editor,
+    _: &ToggleItalic,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    intercept_toggle(editor, Emphasis::Italic, window, cx);
+}
+
+fn intercept_toggle(
+    editor: &mut Editor,
+    kind: Emphasis,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    if !is_markdown_editor(editor, cx)
+        || !VisualMdSettings::try_get(cx).is_some_and(|settings| settings.enabled)
+    {
+        cx.propagate();
+        return;
+    }
+
+    let display_snapshot = editor.display_snapshot(cx);
+    let selections = editor
+        .selections
+        .all::<MultiBufferOffset>(&display_snapshot)
+        .into_iter()
+        .map(|selection| {
+            let range = selection.range();
+            range.start.0..range.end.0
+        })
+        .collect::<Vec<_>>();
+    if selections.is_empty() {
+        cx.propagate();
+        return;
+    }
+
+    let text = editor.buffer().read(cx).snapshot(cx).text();
+    let result = format_toggle::toggle(&text, &selections, kind);
+    if result.edits.is_empty() {
+        cx.propagate();
+        return;
+    }
+
+    let buffer_edits = result.edits.into_iter().map(|(range, insert)| {
+        (
+            MultiBufferOffset(range.start)..MultiBufferOffset(range.end),
+            insert,
+        )
+    });
+    let new_cursors = result
+        .selections
+        .into_iter()
+        .map(|range| MultiBufferOffset(range.start)..MultiBufferOffset(range.end));
+
+    editor.transact(window, cx, |editor, window, cx| {
+        editor.edit(buffer_edits, cx);
+        editor.change_selections(SelectionEffects::default(), window, cx, |s| {
+            s.select_ranges(new_cursors);
+        });
+    });
+}
+
 fn is_markdown_editor(editor: &Editor, cx: &App) -> bool {
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     snapshot
@@ -337,6 +519,17 @@ struct VisualMdAddon {
     /// as long as this editor is visual_md-managed; dropping it would let
     /// `Editor::newline` handle every Enter keypress unconditionally again.
     _newline_action: Subscription,
+    /// Keep the `ToggleBold`/`ToggleItalic` interceptors (see
+    /// `intercept_toggle_bold`/`intercept_toggle_italic`) alive the same way
+    /// `_newline_action` does.
+    _toggle_bold_action: Subscription,
+    _toggle_italic_action: Subscription,
+    /// Whether `refresh` last found this editor markdown-and-enabled.
+    /// `extend_key_context` reads this to add the `visual_md` context key the
+    /// keymap's `Editor && visual_md` bindings (`ToggleBold`/`ToggleItalic`)
+    /// match against, so they only shadow the dock/signature-help shortcuts
+    /// while visual_md is actually decorating this buffer.
+    active: bool,
     folded_markers: Vec<(Range<usize>, String, CreaseId)>,
     /// Horizontal-rule block decorations currently inserted (see
     /// `apply_horizontal_rules`). Unlike `folded_markers`, no content-key
@@ -372,6 +565,12 @@ struct VisualMdAddon {
 }
 
 impl Addon for VisualMdAddon {
+    fn extend_key_context(&self, key_context: &mut KeyContext, _: &App) {
+        if self.active {
+            key_context.add("visual_md");
+        }
+    }
+
     fn to_any(&self) -> &dyn Any {
         self
     }
@@ -485,6 +684,61 @@ const KEY_LINK: usize = 10;
 // practice inline code/fence ranges don't currently overlap prose spans.
 const KEY_PROSE_FONT: usize = 11;
 const KEY_CODE_FONT: usize = 12;
+// One key per `CalloutKind` (M11), the same reasoning the per-level heading
+// keys use: each kind sets a different `background_color`, and keeping them
+// disjoint means a callout that changes type (edited from `[!note]` to
+// `[!warning]`) cleanly drops its old tint instead of compositing two
+// backgrounds together.
+const KEY_CALLOUT_NOTE: usize = 13;
+const KEY_CALLOUT_TIP: usize = 14;
+const KEY_CALLOUT_WARNING: usize = 15;
+const KEY_CALLOUT_DANGER: usize = 16;
+const KEY_CALLOUT_OTHER: usize = 17;
+
+fn callout_key(kind: CalloutKind) -> usize {
+    match kind {
+        CalloutKind::Note => KEY_CALLOUT_NOTE,
+        CalloutKind::Tip => KEY_CALLOUT_TIP,
+        CalloutKind::Warning => KEY_CALLOUT_WARNING,
+        CalloutKind::Danger => KEY_CALLOUT_DANGER,
+        CalloutKind::Other => KEY_CALLOUT_OTHER,
+    }
+}
+
+/// The icon path (see `checkbox_placeholder`'s own `svg().path(...)` for why
+/// this crate spells these out as raw asset paths rather than depending on
+/// the `ui`/`icons` crates for a single enum) and the accent/background
+/// colors a callout of `kind` renders with, reusing Zed's existing semantic
+/// status colors (`cx.theme().status()`, the same tokens
+/// `crates/editor/src/element.rs` uses for diagnostic severities) rather
+/// than inventing new theme tokens for what is, structurally, the same
+/// note/warning/error vocabulary.
+fn callout_look(kind: CalloutKind, cx: &App) -> (&'static str, Hsla, Hsla) {
+    use theme::ActiveTheme;
+    let status = cx.theme().status();
+    match kind {
+        CalloutKind::Note => ("icons/info.svg", status.info, status.info_background),
+        CalloutKind::Tip => (
+            "icons/sparkle.svg",
+            status.success,
+            status.success_background,
+        ),
+        CalloutKind::Warning => (
+            "icons/warning.svg",
+            status.warning,
+            status.warning_background,
+        ),
+        CalloutKind::Danger => (
+            "icons/x_circle_filled.svg",
+            status.error,
+            status.error_background,
+        ),
+        // An unrecognized `[!type]` still gets a real callout box, just a
+        // neutral "additional information" treatment rather than a false
+        // severity -- `hint` is the status color already meant for that.
+        CalloutKind::Other => ("icons/quote.svg", status.hint, status.hint_background),
+    }
+}
 
 fn heading_key(level: u8) -> usize {
     match level {
@@ -566,6 +820,10 @@ fn visible_byte_range(
 fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     let enabled = is_markdown_editor(editor, cx)
         && VisualMdSettings::try_get(cx).is_some_and(|settings| settings.enabled);
+
+    if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
+        addon.active = enabled;
+    }
 
     // Line numbers don't fit the live-preview reading experience (Obsidian's
     // own live preview doesn't show them either), so hide them for as long
@@ -664,6 +922,49 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
             checkbox_placeholder(editor_handle.clone(), *checked),
         )
     }));
+    // An untouched callout's title (see `callout_title_placeholder`'s own
+    // doc comment for why a touched one is excluded here -- it reveals as
+    // raw, dimmed text via `dimmed_markers` instead, handled entirely by
+    // `apply_style_highlights`, not this fold list).
+    folds.extend(
+        computed
+            .callouts
+            .iter()
+            .filter(|callout| !callout.touched)
+            .map(|callout| {
+                (
+                    callout.marker_range.clone(),
+                    format!(
+                        "callout-title:{:?}:{:?}:{}",
+                        callout.kind, callout.fold, callout.raw_type_name
+                    ),
+                    callout_title_placeholder(
+                        editor_handle.clone(),
+                        callout.kind,
+                        callout.raw_type_name.clone(),
+                        callout.fold,
+                        callout.suffix_range.clone(),
+                    ),
+                )
+            }),
+    );
+    // A collapsed callout's body folds regardless of whether its title is
+    // currently touched -- collapsing is a deliberate choice the user made
+    // by clicking the chevron, not a cursor-driven reveal, so editing the
+    // type name on the title line doesn't spuriously re-expand the body.
+    folds.extend(
+        computed
+            .callouts
+            .iter()
+            .filter(|callout| callout.fold.is_collapsed() && !callout.body_range.is_empty())
+            .map(|callout| {
+                (
+                    callout.body_range.clone(),
+                    "callout-collapsed".to_string(),
+                    callout_collapsed_body_placeholder(),
+                )
+            }),
+    );
     folds.extend(table_alignment_spacer_folds(
         &computed, &snapshot, window, cx,
     ));
@@ -877,6 +1178,120 @@ fn checkbox_placeholder(editor: WeakEntity<Editor>, checked: bool) -> editor::Fo
         }),
         collapsed_text: Some(SharedString::from(if checked { "[x]" } else { "[ ]" })),
         ..base_placeholder()
+    }
+}
+
+/// An untouched callout's `[!type]` (plus any `+`/`-` suffix) marker range,
+/// replacing it with a chevron + icon + capitalized title -- modeled
+/// directly on `checkbox_placeholder`: the chevron is a real click target
+/// that writes the fold suffix back to the buffer the same one-edit way the
+/// checkbox writes `[ ]`/`[x]`, rather than a read-only glyph. There's
+/// deliberately no right-click "change type" menu (see this module's M11
+/// doc section) -- touching this line at all (a plain click that lands the
+/// cursor, not a click on this widget) reveals it as raw, dimmed `[!type]`
+/// text instead of this widget (see `plan_block_quote`), which is how a
+/// user actually retypes the type name or hand-edits the suffix.
+fn callout_title_placeholder(
+    editor: WeakEntity<Editor>,
+    kind: CalloutKind,
+    raw_type_name: String,
+    fold: CalloutFold,
+    suffix_range: Range<usize>,
+) -> editor::FoldPlaceholder {
+    let collapsed = fold.is_collapsed();
+    let label = SharedString::from(capitalize(&raw_type_name));
+    editor::FoldPlaceholder {
+        render: std::sync::Arc::new(move |fold_id, _range, cx| {
+            let editor = editor.clone();
+            let suffix_range = suffix_range.clone();
+            let label = label.clone();
+            let (icon_path, color, _background) = callout_look(kind, cx);
+            let chevron_path = if collapsed {
+                "icons/chevron_right.svg"
+            } else {
+                "icons/chevron_down.svg"
+            };
+            div()
+                .id(fold_id)
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .h_full()
+                .child(
+                    div()
+                        .id("callout-fold-toggle")
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(14.))
+                        .child(svg().path(chevron_path).size(px(12.)).text_color(color))
+                        .on_click(move |_event, _window, cx| {
+                            let new_suffix = if collapsed { "" } else { "-" };
+                            let edit_range = MultiBufferOffset(suffix_range.start)
+                                ..MultiBufferOffset(suffix_range.end);
+                            editor
+                                .update(cx, |editor, cx| {
+                                    editor.edit([(edit_range, new_suffix)], cx)
+                                })
+                                .log_err();
+                        }),
+                )
+                .child(svg().path(icon_path).size(px(13.)).text_color(color))
+                .child(
+                    div()
+                        .text_color(color)
+                        .font_weight(FontWeight::BOLD)
+                        .child(label),
+                )
+                .into_any_element()
+        }),
+        // Deliberately the capitalized label, not literal `[!type]` bracket
+        // text -- keeps this distinguishable from the *touched*, raw-dimmed
+        // rendering of the same marker (which does show the literal
+        // brackets), both for a real viewer scanning the buffer and for
+        // tests asserting on `display_text()`.
+        collapsed_text: Some(SharedString::from(capitalize(&raw_type_name))),
+        ..base_placeholder()
+    }
+}
+
+/// A collapsed callout's body (`fold == Collapsed`), from just after the
+/// title line's marker through the end of the callout -- a genuine
+/// multi-line crease, the same mechanism Zed's own code folding uses to
+/// collapse a function body, not a new capability. No kind-specific styling
+/// here: the callout's background tint (`SpanStyle::Callout`) already covers
+/// this row regardless of fold state, so it shows through underneath this
+/// chip exactly like it does under the title widget above.
+fn callout_collapsed_body_placeholder() -> editor::FoldPlaceholder {
+    editor::FoldPlaceholder {
+        render: std::sync::Arc::new(|_, _, cx| {
+            let color = {
+                use theme::ActiveTheme;
+                cx.theme().colors().text_muted
+            };
+            div()
+                .px(px(4.))
+                .h_full()
+                .flex()
+                .items_center()
+                .text_color(color)
+                .child(SharedString::from("(collapsed)"))
+                .into_any_element()
+        }),
+        collapsed_text: Some(SharedString::from("(collapsed)")),
+        ..base_placeholder()
+    }
+}
+
+/// Capitalizes only the first character, leaving the rest as typed (so a
+/// deliberately-stylized custom type like `[!tODO]` isn't mangled into
+/// something the user didn't write).
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
     }
 }
 
@@ -1647,6 +2062,32 @@ fn apply_style_highlights(
         false,
         cx,
     );
+
+    // Callout boxes (M11): a second deliberate color exception alongside
+    // links, per explicit product direction -- a callout's whole purpose is
+    // visually standing out, unlike the inline-code/highlight tints removed
+    // above. One key per kind (see `KEY_CALLOUT_NOTE`'s own comment); the
+    // background covers the callout's *whole* node range (title row
+    // included), set on `SpanStyle::Callout` by `plan_block_quote`.
+    for kind in [
+        CalloutKind::Note,
+        CalloutKind::Tip,
+        CalloutKind::Warning,
+        CalloutKind::Danger,
+        CalloutKind::Other,
+    ] {
+        let (_, _, background) = callout_look(kind, cx);
+        editor.highlight_text_key(
+            HighlightKey::VisualMd(callout_key(kind)),
+            anchor_ranges(&spans_of(SpanStyle::Callout(kind))),
+            HighlightStyle {
+                background_color: Some(background),
+                ..HighlightStyle::default()
+            },
+            false,
+            cx,
+        );
+    }
 
     // Prose/code font split (M7). visual_md doesn't otherwise touch fonts at
     // all: every markdown buffer today renders entirely in the editor's
@@ -2577,5 +3018,307 @@ mod integration_tests {
 
         cx.dispatch_action(editor::actions::Newline);
         cx.assert_editor_state("- one\nˇ\n");
+    }
+
+    /// Exercises `ToggleBold` (see `format_toggle`) through the real action
+    /// dispatch, confirming `intercept_toggle_bold` is actually wired up via
+    /// `editor.register_action` and applies `format_toggle::toggle`'s edits
+    /// and selections correctly against a live buffer.
+    #[gpui::test]
+    async fn toggle_bold_wraps_a_selection(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("Hello «worldˇ» now\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(ToggleBold);
+        cx.assert_editor_state("Hello **«worldˇ»** now\n");
+    }
+
+    #[gpui::test]
+    async fn toggle_bold_twice_returns_to_the_original_text(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("Hello «worldˇ» now\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(ToggleBold);
+        cx.run_until_parked();
+        cx.assert_editor_state("Hello **«worldˇ»** now\n");
+
+        cx.dispatch_action(ToggleBold);
+        cx.assert_editor_state("Hello «worldˇ» now\n");
+    }
+
+    #[gpui::test]
+    async fn toggle_bold_from_a_bare_cursor_inserts_then_removes_empty_markers(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("Helloˇ world\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(ToggleBold);
+        cx.assert_editor_state("Hello**ˇ** world\n");
+
+        cx.dispatch_action(ToggleBold);
+        cx.assert_editor_state("Helloˇ world\n");
+    }
+
+    #[gpui::test]
+    async fn toggle_italic_wraps_a_selection(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("Hello «worldˇ» now\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(ToggleItalic);
+        cx.assert_editor_state("Hello *«worldˇ»* now\n");
+    }
+
+    /// One `editor.transact` per dispatch (see `intercept_toggle`) means a
+    /// single `Undo` reverts the whole wrap in one step, not two separate
+    /// marker-insertion edits.
+    #[gpui::test]
+    async fn undo_after_toggle_bold_reverts_in_one_step(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("Hello «worldˇ» now\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(ToggleBold);
+        cx.assert_editor_state("Hello **«worldˇ»** now\n");
+
+        cx.dispatch_action(editor::actions::Undo);
+        cx.assert_editor_state("Hello «worldˇ» now\n");
+    }
+
+    /// Confirms `intercept_toggle` genuinely falls through (`cx.propagate()`)
+    /// in a non-Markdown buffer rather than swallowing the action, the same
+    /// invariant `newline_is_unaffected_in_a_non_markdown_buffer` checks for
+    /// `intercept_newline`.
+    #[gpui::test]
+    async fn toggle_bold_does_nothing_in_a_non_markdown_buffer(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("Hello «worldˇ» now\n");
+        cx.run_until_parked();
+
+        cx.dispatch_action(ToggleBold);
+        cx.assert_editor_state("Hello «worldˇ» now\n");
+    }
+
+    /// The keymap's `Editor && visual_md` bindings (`ToggleBold`/
+    /// `ToggleItalic`) depend on `VisualMdAddon::extend_key_context` adding
+    /// this key exactly when visual_md is actively decorating the buffer —
+    /// confirms both the present and absent cases directly against a real
+    /// `Editor::key_context`.
+    #[gpui::test]
+    async fn visual_md_key_context_is_present_on_markdown_and_absent_otherwise(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("Helloˇ world\n");
+        cx.run_until_parked();
+
+        let context_without_language = cx.update_editor(|editor, window, cx| {
+            editor.key_context(window, cx).contains("visual_md")
+        });
+        assert!(!context_without_language);
+
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        let context_with_markdown = cx.update_editor(|editor, window, cx| {
+            editor.key_context(window, cx).contains("visual_md")
+        });
+        assert!(context_with_markdown);
+    }
+
+    /// Exercises the M11 callout title widget through a real `refresh()`,
+    /// confirming an untouched callout renders its icon/chevron/label chip
+    /// (`collapsed_text` is the capitalized label, e.g. "Warning" -- see
+    /// `callout_title_placeholder`'s own comment for why that's
+    /// deliberately *not* the literal `[!warning]` bracket text) rather than
+    /// Zed's default fold ellipsis or raw source.
+    #[gpui::test]
+    async fn untouched_callout_title_folds_to_its_icon_chip(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("Otherˇ line\n> [!warning] Be careful\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+
+        let displayed = cx.display_text();
+        assert!(
+            displayed.contains("Warning"),
+            "expected the capitalized label chip, got {displayed:?}"
+        );
+        assert!(
+            !displayed.contains("[!warning]"),
+            "raw bracket text leaked through: {displayed:?}"
+        );
+        assert!(
+            !displayed.contains('⋯'),
+            "found Zed's default fold ellipsis in {displayed:?}"
+        );
+    }
+
+    /// The other half of the pair above: touching the title line (a cursor
+    /// anywhere on it, not just overlapping the marker's own bytes -- see
+    /// `plan::cursor_anywhere_on_the_title_line_touches_it_not_just_the_marker_bytes`)
+    /// reveals the literal `[!warning]` text instead of the chip, which is
+    /// how a user actually retypes the type name -- there's no right-click
+    /// "change type" menu in this milestone's scope.
+    #[gpui::test]
+    async fn touched_callout_title_reveals_raw_bracket_text(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("> [!warning] ˇBe careful\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+
+        let displayed = cx.display_text();
+        assert!(
+            displayed.contains("[!warning]"),
+            "expected raw bracket text, got {displayed:?}"
+        );
+        assert!(
+            !displayed.contains("Warning "),
+            "chip should not render while touched: {displayed:?}"
+        );
+    }
+
+    /// Clicking the chevron isn't simulable in this harness (no real mouse
+    /// events -- see `toggling_a_checkbox_edits_the_buffer_and_survives_refresh`'s
+    /// own note), so this exercises the exact edit the click handler itself
+    /// performs (writing `-` into `suffix_range`) and confirms it actually
+    /// collapses the body into a crease, then that editing the suffix back
+    /// out (`""`) restores it -- the full round trip the button drives.
+    #[gpui::test]
+    async fn collapsing_a_callout_folds_its_body_and_expanding_restores_it(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇOther line\n> [!note] Title\n> Body line one\n> Body line two\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        assert!(cx.display_text().contains("Body line one"));
+
+        // Same single-edit shape `callout_title_placeholder`'s chevron
+        // `on_click` performs: insert `-` right after `]`.
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let suffix_at = "Other line\n> [!note]".len();
+            let range = to_anchor_range(&snapshot, &(suffix_at..suffix_at));
+            editor.edit([(range, "-")], cx);
+            refresh(editor, window, cx);
+        });
+        let collapsed_text = cx.display_text();
+        assert!(
+            !collapsed_text.contains("Body line one"),
+            "body should be folded away: {collapsed_text:?}"
+        );
+        assert!(
+            !collapsed_text.contains("Body line two"),
+            "body should be folded away: {collapsed_text:?}"
+        );
+        assert!(
+            collapsed_text.contains("(collapsed)"),
+            "expected the collapsed-body chip: {collapsed_text:?}"
+        );
+
+        // Expanding again: delete the `-` suffix (what clicking the chevron
+        // a second time does).
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let suffix_at = "Other line\n> [!note]".len();
+            let range = to_anchor_range(&snapshot, &(suffix_at..suffix_at + 1));
+            editor.edit([(range, "")], cx);
+            refresh(editor, window, cx);
+        });
+        let expanded_text = cx.display_text();
+        assert!(
+            expanded_text.contains("Body line one"),
+            "body should be back: {expanded_text:?}"
+        );
+        assert!(
+            expanded_text.contains("Body line two"),
+            "body should be back: {expanded_text:?}"
+        );
+        assert!(!expanded_text.contains("(collapsed)"));
+    }
+
+    /// An unrecognized `[!todo]` still gets a real callout box (`Other`
+    /// kind, generic styling) rather than falling back to a plain
+    /// blockquote with no title treatment at all.
+    #[gpui::test]
+    async fn unrecognized_callout_type_still_gets_a_title_chip(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇOther line\n> [!todo] buy milk\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+
+        let displayed = cx.display_text();
+        assert!(
+            displayed.contains("Todo"),
+            "expected the raw type name, capitalized, got {displayed:?}"
+        );
+        assert!(!displayed.contains("[!todo]"));
+    }
+
+    /// A callout's body containing other live constructs (bold text, a
+    /// nested list) keeps decorating them correctly through a collapse and
+    /// re-expand -- collapsing shouldn't corrupt or drop unrelated
+    /// decoration state for content that becomes visible again.
+    #[gpui::test]
+    async fn collapsing_and_expanding_preserves_nested_decorations(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇOther line\n> [!note] Title\n> **bold** text\n> - a list item\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        let before = cx.display_text();
+        assert!(before.contains("bold"));
+        assert!(before.contains("a list item"));
+
+        let suffix_at = "Other line\n> [!note]".len();
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let range = to_anchor_range(&snapshot, &(suffix_at..suffix_at));
+            editor.edit([(range, "-")], cx);
+            refresh(editor, window, cx);
+        });
+        assert!(!cx.display_text().contains("bold"));
+
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let range = to_anchor_range(&snapshot, &(suffix_at..suffix_at + 1));
+            editor.edit([(range, "")], cx);
+            refresh(editor, window, cx);
+        });
+        let after = cx.display_text();
+        assert!(
+            after.contains("bold"),
+            "bold text should still decorate after re-expanding: {after:?}"
+        );
+        assert!(
+            after.contains("a list item"),
+            "the nested list should still decorate: {after:?}"
+        );
     }
 }

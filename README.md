@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 > [!WARNING]
 >
 > **Visual MD is a personal fork of [Zed](https://github.com/zed-industries/zed)**,

@@ -607,6 +607,16 @@
     },
   },
   {
+    // Shadows the dock and signature-help shortcuts only while visual_md is
+    // actively decorating this buffer; see visual_md's module doc (M10).
+    "context": "Editor && visual_md",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-b": "visual_md::ToggleBold",
+      "ctrl-i": "visual_md::ToggleItalic",
+    },
+  },
+  {
     "context": "Editor && extension == svg",
     "use_key_equivalents": true,
     "bindings": {
