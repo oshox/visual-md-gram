@@ -907,9 +907,9 @@ mod linux {
                 let dir = cli.parent().context("no parent path for cli")?;
 
                 // libexec is the standard, lib/zed is for Arch (and other non-libexec distros),
-                // ./zed is for the target directory in development builds.
+                // ./visualmd is for the target directory in development builds.
                 let possible_locations =
-                    ["../libexec/zed-editor", "../lib/zed/zed-editor", "./zed"];
+                    ["../libexec/zed-editor", "../lib/zed/zed-editor", "./visualmd"];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
@@ -1274,9 +1274,10 @@ mod windows {
                 let cli = std::env::current_exe()?;
                 let dir = cli.parent().context("no parent path for cli")?;
 
-                // ../Zed.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
-                // directory in development builds.
-                let possible_locations = ["../Zed.exe", "../lib/zed/zed-editor.exe", "./zed.exe"];
+                // ../Zed.exe is the standard, lib/zed is for MSYS2, ./visualmd.exe is for the
+                // target directory in development builds.
+                let possible_locations =
+                    ["../Zed.exe", "../lib/zed/zed-editor.exe", "./visualmd.exe"];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))

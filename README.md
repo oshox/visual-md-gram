@@ -1,3 +1,13 @@
+> [!WARNING]
+>
+> **Visual MD is a personal fork of [Zed](https://github.com/zed-industries/zed)**,
+> hosted at [oshox/visual-md](https://github.com/oshox/visual-md), that adds
+> Obsidian-style live-preview Markdown editing (see
+> [docs/visual-md-spec.md](docs/visual-md-spec.md) and the `visual_md` crate).
+> It is not an official Zed release and is not affiliated with Zed Industries.
+> Visual MD keeps its settings and data separately from Zed and does not
+> auto-update. The rest of this README is upstream Zed's.
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)

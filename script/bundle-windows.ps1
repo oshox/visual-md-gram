@@ -117,7 +117,7 @@ function BuildZedAndItsFriends {
     Write-Output "Building Zed and its friends, for channel: $channel"
     # Build zed.exe, cli.exe and auto_update_helper.exe
     cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --package auto_update_helper --target $target
-    Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\Zed.exe" -Force
+    Copy-Item -Path ".\$CargoOutDir\visualmd.exe" -Destination "$innoDir\Zed.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\cli.exe" -Destination "$innoDir\cli.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\auto_update_helper.exe" -Destination "$innoDir\auto_update_helper.exe" -Force
     # Build explorer_command_injector.dll
@@ -265,59 +265,61 @@ function BuildInstaller {
     $issFilePath = "$innoDir\zed.iss"
     switch ($channel) {
         "stable" {
-            $appId = "{{2DB0DA96-CA55-49BB-AF4F-64AF36A86712}"
+            $appId = "{{5A3070CF-A6C4-4991-8786-4EB2DDEE299C}"
             $appIconName = "app-icon"
-            $appName = "Zed"
-            $appDisplayName = "Zed"
-            $appSetupName = "Zed-$Architecture"
-            # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Stable-Instance-Mutex"
+            $appName = "Visual MD"
+            $appDisplayName = "Visual MD"
+            $appSetupName = "VisualMD-$Architecture"
+            # The mutex name here should match `release_channel::app_identifier()`
+            $appMutex = "VisualMD-Editor-Stable-Instance-Mutex"
             $appExeName = "Zed"
-            $regValueName = "Zed"
+            $regValueName = "VisualMD"
             $appUserId = "ZedIndustries.Zed"
-            $appShellNameShort = "Z&ed"
+            $appShellNameShort = "&Visual MD"
             $appAppxFullName = "ZedIndustries.Zed_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "preview" {
-            $appId = "{{F70E4811-D0E2-4D88-AC99-D63752799F95}"
+            $appId = "{{07AF441F-C8D8-41BD-96FE-5421C4BBC5E0}"
             $appIconName = "app-icon-preview"
-            $appName = "Zed Preview"
-            $appDisplayName = "Zed Preview"
-            $appSetupName = "Zed-$Architecture"
-            # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Preview-Instance-Mutex"
+            $appName = "Visual MD Preview"
+            $appDisplayName = "Visual MD Preview"
+            $appSetupName = "VisualMD-$Architecture"
+            # The mutex name here should match `release_channel::app_identifier()`
+            $appMutex = "VisualMD-Editor-Preview-Instance-Mutex"
             $appExeName = "Zed"
-            $regValueName = "ZedPreview"
+            $regValueName = "VisualMDPreview"
             $appUserId = "ZedIndustries.Zed.Preview"
-            $appShellNameShort = "Z&ed Preview"
+            $appShellNameShort = "&Visual MD Preview"
             $appAppxFullName = "ZedIndustries.Zed.Preview_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "nightly" {
-            $appId = "{{1BDB21D3-14E7-433C-843C-9C97382B2FE0}"
+            $appId = "{{BC7760AD-F16B-41A3-AD86-06FFFAAAFAE7}"
             $appIconName = "app-icon-nightly"
-            $appName = "Zed Nightly"
-            $appDisplayName = "Zed Nightly"
-            $appSetupName = "Zed-$Architecture"
-            # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Nightly-Instance-Mutex"
+            $appName = "Visual MD Nightly"
+            $appDisplayName = "Visual MD Nightly"
+            $appSetupName = "VisualMD-$Architecture"
+            # The mutex name here should match `release_channel::app_identifier()`, used by
+            # crates\zed\src\zed\windows_only_instance.rs
+            $appMutex = "VisualMD-Editor-Nightly-Instance-Mutex"
             $appExeName = "Zed"
-            $regValueName = "ZedNightly"
+            $regValueName = "VisualMDNightly"
             $appUserId = "ZedIndustries.Zed.Nightly"
-            $appShellNameShort = "Z&ed Editor Nightly"
+            $appShellNameShort = "&Visual MD Nightly"
             $appAppxFullName = "ZedIndustries.Zed.Nightly_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "dev" {
-            $appId = "{{8357632E-24A4-4F32-BA97-E575B4D1FE5D}"
+            $appId = "{{13D3AF84-03CE-4B74-95EB-03E2BEC9105F}"
             $appIconName = "app-icon-dev"
-            $appName = "Zed Dev"
-            $appDisplayName = "Zed Dev"
-            $appSetupName = "Zed-$Architecture"
-            # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Dev-Instance-Mutex"
+            $appName = "Visual MD Dev"
+            $appDisplayName = "Visual MD Dev"
+            $appSetupName = "VisualMD-$Architecture"
+            # The mutex name here should match `release_channel::app_identifier()`, used by
+            # crates\zed\src\zed\windows_only_instance.rs
+            $appMutex = "VisualMD-Editor-Dev-Instance-Mutex"
             $appExeName = "Zed"
-            $regValueName = "ZedDev"
+            $regValueName = "VisualMDDev"
             $appUserId = "ZedIndustries.Zed.Dev"
-            $appShellNameShort = "Z&ed Dev"
+            $appShellNameShort = "&Visual MD Dev"
             $appAppxFullName = "ZedIndustries.Zed.Dev_1.0.0.0_neutral__japxn1gcva8rg"
         }
         default {

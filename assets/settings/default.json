@@ -1697,9 +1697,10 @@
   //
   // Default: false
   "disable_ai": false,
-  // Automatically update Zed. This setting may be ignored on Linux if
-  // installed through a package manager.
-  "auto_update": true,
+  // Automatically update the editor. Off by default in Visual MD: the update
+  // server is upstream Zed's, so updating would replace Visual MD with Zed.
+  // This setting may be ignored on Linux if installed through a package manager.
+  "auto_update": false,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //
   // Possible values:
