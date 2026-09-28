@@ -319,6 +319,9 @@ pub struct SettingsContent {
     /// Settings related to Vim mode in Zed.
     pub vim: Option<VimSettingsContent>,
 
+    /// Settings for Visual MD's live-preview Markdown editing.
+    pub visual_md: Option<VisualMdSettingsContent>,
+
     /// Number of lines to search for modelines at the beginning and end of files.
     /// Modelines contain editor directives (e.g., vim/emacs settings) that configure
     /// the editor behavior for specific files.
@@ -408,7 +411,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
-        title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
+        title_bar, vim_mode, calls, which_key, vim, visual_md, modeline_lines, feature_flags,
         instrumentation,
     },
     defaults: {},
@@ -1030,6 +1033,20 @@ pub struct CallHierarchySettingsContent {
     ///
     /// Default: medium
     pub modal_max_width: Option<ModalWidthContent>,
+}
+
+/// Settings for Visual MD's live-preview Markdown editing: Markdown formatting
+/// is rendered inline as you type, with the raw syntax revealed only on the line
+/// (or span) the cursor is touching. See docs/visual-md-spec.md for the full
+/// behavior spec.
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug, JsonSchema, MergeFrom)]
+pub struct VisualMdSettingsContent {
+    /// Whether to render Markdown buffers with live preview instead of plain
+    /// source text.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 #[with_fallible_options]

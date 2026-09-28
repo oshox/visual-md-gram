@@ -20083,6 +20083,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "visual_md"
+version = "0.1.0"
+dependencies = [
+ "assets",
+ "collections",
+ "editor",
+ "gpui",
+ "language",
+ "multi_buffer",
+ "release_channel",
+ "semver",
+ "settings",
+ "theme",
+ "theme_settings",
+ "tree-sitter",
+ "tree-sitter-md",
+ "util",
+]
+
+[[package]]
 name = "vscode_theme"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23032,6 +23052,7 @@ dependencies = [
  "uuid",
  "vim",
  "vim_mode_setting",
+ "visual_md",
  "watch",
  "web_search",
  "web_search_providers",

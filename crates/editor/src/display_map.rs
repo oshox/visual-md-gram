@@ -189,6 +189,12 @@ pub enum HighlightKey {
     SelectedTextHighlight,
     SyntaxTreeView(usize),
     VimExchange,
+    /// Visual MD's Markdown decorations, one sub-key per decoration category.
+    /// Sub-keys are merged in ascending order, so a higher one wins a conflict.
+    VisualMd(usize),
+    /// Visual MD's syntax highlighting inside fenced code blocks, one sub-key
+    /// per highlight id.
+    VisualMdCodeSyntax(usize),
 }
 
 pub trait ToDisplayPoint {
@@ -2306,12 +2312,14 @@ impl DisplaySnapshot {
                     render_toggle,
                     render_trailer,
                     metadata,
+                    hide_gutter_toggle,
                 } => Some(Crease::Inline {
                     range: range.to_point(self.buffer_snapshot()),
                     placeholder: placeholder.clone(),
                     render_toggle: render_toggle.clone(),
                     render_trailer: render_trailer.clone(),
                     metadata: metadata.clone(),
+                    hide_gutter_toggle: *hide_gutter_toggle,
                 }),
                 Crease::Block {
                     range,
@@ -2401,6 +2409,7 @@ impl DisplaySnapshot {
                 render_toggle: None,
                 render_trailer: None,
                 metadata: None,
+                hide_gutter_toggle: false,
             })
         } else {
             None

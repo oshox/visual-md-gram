@@ -2,6 +2,7 @@ use std::{
     hash::{Hash, Hasher},
     iter, mem,
     ops::Range,
+    sync::LazyLock,
 };
 
 use crate::{
@@ -12,6 +13,7 @@ use crate::{
     point, px, quad, rems, size,
 };
 use collections::HashSet;
+use parking_lot::Mutex;
 use refineable::Refineable;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -509,6 +511,9 @@ impl TextStyle {
     /// Create a new text style with the given highlighting applied.
     pub fn highlight(mut self, style: impl Into<HighlightStyle>) -> Self {
         let style = style.into();
+        if let Some(family) = style.font_family {
+            self.font_family = SharedString::new_static(family.as_str());
+        }
         if let Some(weight) = style.font_weight {
             self.font_weight = weight;
         }
@@ -581,6 +586,10 @@ pub struct HighlightStyle {
     /// The color of the text
     pub color: Option<Hsla>,
 
+    /// Overrides the text's font family, e.g. to switch a code span from a
+    /// prose font back to the buffer's monospace font.
+    pub font_family: Option<FontFamilyName>,
+
     /// The font weight, e.g. bold
     pub font_weight: Option<FontWeight>,
 
@@ -598,6 +607,43 @@ pub struct HighlightStyle {
 
     /// Similar to the CSS `opacity` property, this will cause the text to be less vibrant.
     pub fade_out: Option<f32>,
+
+    /// A multiplier applied to the whole line's font size and line height when
+    /// this highlight is present (e.g. `1.8` for an H1-sized heading line).
+    ///
+    /// Unlike every other field here, this applies to the entire display row the
+    /// highlighted range falls on, not just the highlighted bytes: `shape_line`
+    /// accepts a single font size per line, so a consumer that wants per-row
+    /// sizing (see the editor's Visual MD heading support) reads this off any
+    /// chunk on the row and picks that row's font size itself.
+    pub font_size_scale: Option<f32>,
+}
+
+/// An interned font family name.
+///
+/// [`HighlightStyle`] stores font family overrides as this handle rather than a
+/// [`SharedString`] so that it can remain `Copy`. Font family names form a small,
+/// bounded set, so interned names are never freed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FontFamilyName(&'static str);
+
+impl FontFamilyName {
+    /// Returns the interned handle for the given font family name.
+    pub fn new(name: &str) -> Self {
+        static NAMES: LazyLock<Mutex<HashSet<&'static str>>> = LazyLock::new(Default::default);
+        let mut names = NAMES.lock();
+        if let Some(name) = names.get(name) {
+            return Self(name);
+        }
+        let name: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        names.insert(name);
+        Self(name)
+    }
+
+    /// The font family name.
+    pub fn as_str(&self) -> &'static str {
+        self.0
+    }
 }
 
 impl Eq for HighlightStyle {}
@@ -605,6 +651,7 @@ impl Eq for HighlightStyle {}
 impl Hash for HighlightStyle {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.color.hash(state);
+        self.font_family.hash(state);
         self.font_weight.hash(state);
         self.font_style.hash(state);
         self.background_color.hash(state);
@@ -612,6 +659,11 @@ impl Hash for HighlightStyle {
         self.strikethrough.hash(state);
         state.write_u32(u32::from_be_bytes(
             self.fade_out.map(|f| f.to_be_bytes()).unwrap_or_default(),
+        ));
+        state.write_u32(u32::from_be_bytes(
+            self.font_size_scale
+                .map(|f| f.to_be_bytes())
+                .unwrap_or_default(),
         ));
     }
 }
@@ -900,12 +952,14 @@ impl From<&TextStyle> for HighlightStyle {
     fn from(other: &TextStyle) -> Self {
         Self {
             color: Some(other.color),
+            font_family: Some(FontFamilyName::new(&other.font_family)),
             font_weight: Some(other.font_weight),
             font_style: Some(other.font_style),
             background_color: other.background_color,
             underline: other.underline,
             strikethrough: other.strikethrough,
             fade_out: None,
+            font_size_scale: None,
         }
     }
 }
@@ -933,6 +987,7 @@ impl HighlightStyle {
                     }
                 })
                 .or(self.color),
+            font_family: other.font_family.or(self.font_family),
             font_weight: other.font_weight.or(self.font_weight),
             font_style: other.font_style.or(self.font_style),
             background_color: other.background_color.or(self.background_color),
@@ -946,6 +1001,7 @@ impl HighlightStyle {
                         .unwrap_or(source_fade)
                 })
                 .or(self.fade_out),
+            font_size_scale: other.font_size_scale.or(self.font_size_scale),
         }
     }
 }
@@ -1362,6 +1418,8 @@ mod tests {
                 color: Some(red()),
                 wavy: true,
             }),
+            font_family: None,
+            font_size_scale: None,
         };
         let expected_style = style_b;
 
@@ -1394,6 +1452,8 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            font_family: None,
+            font_size_scale: None,
         };
 
         let expected_style = HighlightStyle {
@@ -1412,6 +1472,8 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            font_family: None,
+            font_size_scale: None,
         };
 
         let style_c = style_c.highlight(style_d);

@@ -188,6 +188,11 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn set_show_fold_indicators(&mut self, show_fold_indicators: bool, cx: &mut Context<Self>) {
+        self.show_fold_indicators = Some(show_fold_indicators);
+        cx.notify();
+    }
+
     pub fn disable_expand_excerpt_buttons(&mut self, cx: &mut Context<Self>) {
         self.disable_expand_excerpt_buttons = true;
         cx.notify();

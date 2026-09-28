@@ -25,6 +25,18 @@ impl EditorSnapshot {
             .crease_snapshot
             .query_row(buffer_row, self.buffer_snapshot())
         {
+            // A crease that opts out of the gutter toggle (e.g. Visual MD's
+            // permanent decorative replacements) shouldn't fall through to the
+            // generic `folded || ...` disclosure below either: that fallback is
+            // for a real, user-collapsible region. See
+            // `Crease::hide_gutter_toggle`.
+            if let Crease::Inline {
+                hide_gutter_toggle: true,
+                ..
+            } = crease
+            {
+                return None;
+            }
             is_foldable = true;
             match crease {
                 Crease::Inline { render_toggle, .. } | Crease::Block { render_toggle, .. } => {

@@ -1036,6 +1036,13 @@ pub struct Editor {
     show_diff_review_button: bool,
     show_wrap_guides: Option<bool>,
     show_indent_guides: Option<bool>,
+    /// Overrides `EditorSettings::gutter.folds` for this editor instance.
+    /// Unlike that global setting, this also suppresses the indentation-based
+    /// fold-affordance fallback (`EditorSnapshot::starts_indent`) that fires
+    /// independently of any actual crease existing, which doesn't belong in a
+    /// view where "foldable" isn't meaningful (e.g. a Visual MD buffer whose
+    /// own folds are permanent decorative replacements).
+    show_fold_indicators: Option<bool>,
     buffers_with_disabled_indent_guides: HashSet<BufferId>,
     highlight_order: usize,
     highlighted_rows: TypeIdHashMap<Vec<RowHighlight>>,
@@ -1266,6 +1273,7 @@ pub struct EditorSnapshot {
     show_runnables: Option<bool>,
     show_breakpoints: Option<bool>,
     show_bookmarks: Option<bool>,
+    show_fold_indicators: Option<bool>,
     git_blame_gutter_max_author_length: Option<usize>,
     pub display_snapshot: DisplaySnapshot,
     pub placeholder_display_snapshot: Option<DisplaySnapshot>,
@@ -2408,6 +2416,7 @@ impl Editor {
             show_runnables: None,
             show_bookmarks: None,
             show_breakpoints: None,
+            show_fold_indicators: None,
             show_diff_review_button: false,
             show_wrap_guides: None,
             show_indent_guides,
@@ -3148,6 +3157,7 @@ impl Editor {
             show_runnables: self.show_runnables,
             show_bookmarks: self.show_bookmarks,
             show_breakpoints: self.show_breakpoints,
+            show_fold_indicators: self.show_fold_indicators,
             git_blame_gutter_max_author_length,
             scroll_anchor: self.scroll_manager.shared_scroll_anchor(cx),
             display_snapshot,
