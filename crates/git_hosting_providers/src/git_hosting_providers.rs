@@ -19,6 +19,7 @@ pub fn init(cx: &mut App) {
     crate::settings::init(cx);
 
     let provider_registry = GitHostingProviderRegistry::global(cx);
+    provider_registry.register_hosting_provider(Arc::new(Azure));
     provider_registry.register_hosting_provider(Arc::new(Bitbucket::public_instance()));
     provider_registry.register_hosting_provider(Arc::new(Chromium));
     provider_registry.register_hosting_provider(Arc::new(Forgejo::public_instance()));
@@ -26,7 +27,8 @@ pub fn init(cx: &mut App) {
     provider_registry.register_hosting_provider(Arc::new(Gitee));
     provider_registry.register_hosting_provider(Arc::new(Github::public_instance()));
     provider_registry.register_hosting_provider(Arc::new(Gitlab::public_instance()));
-    provider_registry.register_hosting_provider(Arc::new(Sourcehut::public_instance()));
+    provider_registry.register_hosting_provider(Arc::new(SourceHut::public_instance()));
+    provider_registry.register_hosting_provider(Arc::new(Tangled::public_instance()));
 }
 
 /// Registers additional Git hosting providers.
@@ -51,6 +53,8 @@ pub async fn register_additional_providers(
         provider_registry.register_hosting_provider(Arc::new(gitea_self_hosted));
     } else if let Ok(bitbucket_self_hosted) = Bitbucket::from_remote_url(&origin_url) {
         provider_registry.register_hosting_provider(Arc::new(bitbucket_self_hosted));
+    } else if let Ok(sourcehut_self_hosted) = SourceHut::from_remote_url(&origin_url) {
+        provider_registry.register_hosting_provider(Arc::new(sourcehut_self_hosted));
     }
 }
 
@@ -81,9 +85,12 @@ mod tests {
                 "https://jlannister@github.com/some-org/some-repo.git",
                 Some("github.com".to_string()),
             ),
-            ("git@github.com:westeros/oldtown.git", Some("github.com".to_string())),
             (
-                "git@my.super.long.subdomain.com:westeros/oldtown.git",
+                "git@github.com:zed-industries/zed.git",
+                Some("github.com".to_string()),
+            ),
+            (
+                "git@my.super.long.subdomain.com:zed-industries/zed.git",
                 Some("my.super.long.subdomain.com".to_string()),
             ),
         ];

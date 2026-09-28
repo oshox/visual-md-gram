@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use crate::{
-    RemotePlatform,
+    RemoteArch, RemoteOs, RemotePlatform,
     json_log::LogRecord,
     protocol::{MESSAGE_LEN_SIZE, message_len_from_buffer, read_message_with_len, write_message},
 };
@@ -12,8 +12,11 @@ use futures::{
 };
 use gpui::{AppContext as _, AsyncApp, Task};
 use rpc::proto::Envelope;
-use smol::process::Child;
+use util::command::Child;
 
+pub mod docker;
+#[cfg(any(test, feature = "test-support"))]
+pub mod mock;
 pub mod ssh;
 pub mod wsl;
 
@@ -27,9 +30,11 @@ fn parse_platform(output: &str) -> Result<RemotePlatform> {
     };
 
     let os = match os {
-        "Darwin" => "macos",
-        "Linux" => "linux",
-        _ => anyhow::bail!("Remote servers are not yet available for {os:?}."),
+        "Darwin" => RemoteOs::MacOs,
+        "Linux" => RemoteOs::Linux,
+        _ => anyhow::bail!(
+            "Prebuilt remote servers are not yet available for {os:?}. See https://zed.dev/docs/remote-development"
+        ),
     };
 
     // exclude armv5,6,7 as they are 32-bit.
@@ -38,14 +43,73 @@ fn parse_platform(output: &str) -> Result<RemotePlatform> {
         || arch.starts_with("arm64")
         || arch.starts_with("aarch64")
     {
-        "aarch64"
+        RemoteArch::Aarch64
     } else if arch.starts_with("x86") {
-        "x86_64"
+        RemoteArch::X86_64
     } else {
-        anyhow::bail!("Remote servers are not yet available for {arch:?}.")
+        anyhow::bail!(
+            "Prebuilt remote servers are not yet available for {arch:?}. See https://zed.dev/docs/remote-development"
+        )
     };
 
     Ok(RemotePlatform { os, arch })
+}
+
+/// The command (program + args) used to read a remote host's OS version, given
+/// its detected OS.
+///
+/// The output is parsed by [`parse_os_version`].
+pub(crate) fn os_version_command(os: RemoteOs) -> (&'static str, &'static [&'static str]) {
+    match os {
+        // Matches the `/etc/os-release` parsing in `client::telemetry::os_version`.
+        RemoteOs::Linux => ("cat", &["/etc/os-release"]),
+        RemoteOs::MacOs => ("sw_vers", &["-productVersion"]),
+        // Prints e.g. "Microsoft Windows [Version 10.0.19045.5011]".
+        RemoteOs::Windows => ("cmd.exe", &["/c", "ver"]),
+    }
+}
+
+/// Parses the output of [`os_version_command`] into a human-readable version
+/// string, matching the conventions used by `client::telemetry::os_version`.
+///
+/// For Linux this is `"{ID} {VERSION_ID}"` (e.g. `"ubuntu 24.04"`); for macOS it
+/// is the product version (e.g. `"15.6.1"`); for Windows it is the
+/// `major.minor.build` version (e.g. `"10.0.19045"`). Returns `None` if nothing
+/// usable could be parsed.
+pub(crate) fn parse_os_version(os: RemoteOs, output: &str) -> Option<String> {
+    let output = output.trim();
+    if output.is_empty() {
+        return None;
+    }
+    match os {
+        RemoteOs::Linux => util::parse_os_release(output),
+        RemoteOs::MacOs => {
+            // `sw_vers -productVersion` prints a single version line.
+            output
+                .lines()
+                .next_back()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+        }
+        RemoteOs::Windows => parse_windows_version(output),
+    }
+}
+
+/// Extracts a `major.minor.build` version from the output of `cmd.exe /c ver`,
+/// e.g. `"Microsoft Windows [Version 10.0.19045.5011]"` -> `"10.0.19045"`.
+///
+/// Scans for the first dotted run of integers (rather than relying on the
+/// surrounding, potentially localized, text) and drops the trailing revision so
+/// the format matches `client::telemetry::os_version` on Windows.
+fn parse_windows_version(output: &str) -> Option<String> {
+    output
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .filter_map(|token| {
+            let parts: Vec<&str> = token.split('.').filter(|part| !part.is_empty()).collect();
+            (parts.len() >= 3 && parts.iter().all(|part| part.parse::<u32>().is_ok()))
+                .then(|| parts[..3].join("."))
+        })
+        .next()
 }
 
 /// Parses the output of `echo $SHELL` to determine the remote shell.
@@ -62,15 +126,15 @@ fn parse_shell(output: &str, fallback_shell: &str) -> String {
 }
 
 fn handle_rpc_messages_over_child_process_stdio(
-    mut ssh_proxy_process: Child,
+    mut remote_proxy_process: Child,
     incoming_tx: UnboundedSender<Envelope>,
     mut outgoing_rx: UnboundedReceiver<Envelope>,
     mut connection_activity_tx: Sender<()>,
     cx: &AsyncApp,
 ) -> Task<Result<i32>> {
-    let mut child_stderr = ssh_proxy_process.stderr.take().unwrap();
-    let mut child_stdout = ssh_proxy_process.stdout.take().unwrap();
-    let mut child_stdin = ssh_proxy_process.stdin.take().unwrap();
+    let mut child_stderr = remote_proxy_process.stderr.take().unwrap();
+    let mut child_stdout = remote_proxy_process.stdout.take().unwrap();
+    let mut child_stdin = remote_proxy_process.stdin.take().unwrap();
 
     let mut stdin_buffer = Vec::new();
     let mut stdout_buffer = Vec::new();
@@ -100,7 +164,9 @@ fn handle_rpc_messages_over_child_process_stdio(
                 }
 
                 let message_len = message_len_from_buffer(&stdout_buffer);
-                let envelope = read_message_with_len(&mut child_stdout, &mut stdout_buffer, message_len).await?;
+                let envelope =
+                    read_message_with_len(&mut child_stdout, &mut stdout_buffer, message_len)
+                        .await?;
                 connection_activity_tx.try_send(()).ok();
                 incoming_tx.unbounded_send(envelope).ok();
             }
@@ -111,14 +177,19 @@ fn handle_rpc_messages_over_child_process_stdio(
         loop {
             stderr_buffer.resize(stderr_offset + 1024, 0);
 
-            let len = child_stderr.read(&mut stderr_buffer[stderr_offset..]).await?;
+            let len = child_stderr
+                .read(&mut stderr_buffer[stderr_offset..])
+                .await?;
             if len == 0 {
                 return anyhow::Ok(());
             }
 
             stderr_offset += len;
             let mut start_ix = 0;
-            while let Some(ix) = stderr_buffer[start_ix..stderr_offset].iter().position(|b| b == &b'\n') {
+            while let Some(ix) = stderr_buffer[start_ix..stderr_offset]
+                .iter()
+                .position(|b| b == &b'\n')
+            {
                 let line_ix = start_ix + ix;
                 let content = &stderr_buffer[start_ix..line_ix];
                 start_ix = line_ix + 1;
@@ -126,7 +197,10 @@ fn handle_rpc_messages_over_child_process_stdio(
                     record.log(log::logger())
                 } else {
                     std::io::stderr()
-                        .write_fmt(format_args!("(remote) {}\n", String::from_utf8_lossy(content)))
+                        .write_fmt(format_args!(
+                            "(remote) {}\n",
+                            String::from_utf8_lossy(content)
+                        ))
                         .ok();
                 }
             }
@@ -149,7 +223,14 @@ fn handle_rpc_messages_over_child_process_stdio(
                 result.context("stderr")
             }
         };
-        let status = ssh_proxy_process.status().await?.code().unwrap_or(1);
+        let exit_status = remote_proxy_process.status().await?;
+        let status = exit_status.code().unwrap_or_else(|| {
+            #[cfg(unix)]
+            let status = std::os::unix::process::ExitStatusExt::signal(&exit_status).unwrap_or(1);
+            #[cfg(not(unix))]
+            let status = 1;
+            status
+        });
         match result {
             Ok(_) => Ok(status),
             Err(error) => Err(error),
@@ -157,37 +238,109 @@ fn handle_rpc_messages_over_child_process_stdio(
     })
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
 async fn build_remote_server_from_source(
     platform: &crate::RemotePlatform,
     delegate: &dyn crate::RemoteClientDelegate,
+    binary_exists_on_server: bool,
     cx: &mut AsyncApp,
 ) -> Result<Option<std::path::PathBuf>> {
-    use smol::process::{Command, Stdio};
     use std::env::VarError;
-    use std::path::Path;
-    use util::command::new_smol_command;
+    use util::command::{Command, Stdio, new_command};
+
+    if let Ok(path) = std::env::var("ZED_COPY_REMOTE_SERVER") {
+        let path = std::path::PathBuf::from(path);
+        if path.exists() {
+            return Ok(Some(path));
+        } else {
+            log::warn!(
+                "ZED_COPY_REMOTE_SERVER path does not exist, falling back to ZED_BUILD_REMOTE_SERVER: {}",
+                path.display()
+            );
+        }
+    }
+
+    // By default, we make building remote server from source opt-out and we do not force artifact compression
+    // for quicker builds.
+    let build_remote_server =
+        std::env::var("ZED_BUILD_REMOTE_SERVER").unwrap_or("nocompress".into());
+
+    if let "never" = &*build_remote_server {
+        return Ok(None);
+    } else if let "false" | "no" | "off" | "0" = &*build_remote_server {
+        if binary_exists_on_server {
+            return Ok(None);
+        }
+        log::warn!("ZED_BUILD_REMOTE_SERVER is disabled, but no server binary exists on the server")
+    }
 
     async fn run_cmd(command: &mut Command) -> Result<()> {
-        log::info!("Command: {:?}", command);
-        let output = command.kill_on_drop(true).stderr(Stdio::inherit()).output().await?;
-        anyhow::ensure!(output.status.success(), "Failed to run command: {command:?}");
+        let output = command
+            .kill_on_drop(true)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Failed to run command: {command:?}: output: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         Ok(())
     }
 
-    let use_musl = true;
+    async fn ensure_rustup_target(
+        triple: &str,
+        delegate: &dyn crate::RemoteClientDelegate,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let rustup = which("rustup", cx)
+            .await?
+            .context("rustup not found on $PATH, install rustup (see https://rustup.rs/)")?;
+        delegate.set_status(Some("Adding rustup target for cross-compilation"), cx);
+        log::info!("adding rustup target");
+        run_cmd(
+            new_command(rustup)
+                .current_dir(
+                    util::dev_repo_root()
+                        .context("locating the zed checkout to add the rustup target")?,
+                )
+                .args(["target", "add"])
+                .arg(&triple),
+        )
+        .await?;
+        Ok(())
+    }
+
+    enum RemoteServerBuildMode {
+        Native,
+        Xwin,
+        Zig,
+    }
+
+    impl RemoteServerBuildMode {
+        fn build_command(&self) -> &[&'static str] {
+            match self {
+                RemoteServerBuildMode::Native => &["build"],
+                RemoteServerBuildMode::Xwin => &["xwin", "build"],
+                RemoteServerBuildMode::Zig => &["zigbuild"],
+            }
+        }
+    }
+
+    let use_musl = !build_remote_server.contains("nomusl");
     let triple = format!(
         "{}-{}",
         platform.arch,
         match platform.os {
-            "linux" =>
+            RemoteOs::Linux =>
                 if use_musl {
                     "unknown-linux-musl"
                 } else {
                     "unknown-linux-gnu"
                 },
-            "macos" => "apple-darwin",
-            _ => anyhow::bail!("can't cross compile for: {:?}", platform),
+            RemoteOs::MacOs => "apple-darwin",
+            RemoteOs::Windows => "pc-windows-msvc",
         }
     );
     let mut rust_flags = match std::env::var("RUSTFLAGS") {
@@ -198,110 +351,164 @@ async fn build_remote_server_from_source(
             String::new()
         }
     };
-    if platform.os == "linux" && use_musl {
+    if platform.os == RemoteOs::Linux && use_musl {
         rust_flags.push_str(" -C target-feature=+crt-static");
 
-        if let Ok(path) = std::env::var("GRAM_ZSTD_MUSL_LIB") {
+        if let Ok(path) = std::env::var("ZED_ZSTD_MUSL_LIB") {
             rust_flags.push_str(&format!(" -C link-arg=-L{path}"));
         }
     }
-
-    if platform.arch == std::env::consts::ARCH && platform.os == std::env::consts::OS {
-        delegate.set_status(Some("Building remote server binary from source"), cx);
-        log::info!("building remote server binary from source");
-        run_cmd(
-            new_smol_command("cargo")
-                .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
-                .args([
-                    "build",
-                    "--package",
-                    "remote_server",
-                    "--target-dir",
-                    "target/remote_server",
-                    "--target",
-                    &triple,
-                ])
-                .env("RUSTFLAGS", &rust_flags),
-        )
-        .await?;
+    let remote_build_mode = if platform.arch.as_str() == std::env::consts::ARCH
+        && platform.os.as_str() == std::env::consts::OS
+    {
+        RemoteServerBuildMode::Native
+    } else if platform.os.as_str() == "windows" {
+        RemoteServerBuildMode::Xwin
     } else {
-        if which("zig", cx).await?.is_none() {
-            anyhow::bail!(if cfg!(not(windows)) {
-                "zig not found on $PATH, install zig (see https://ziglang.org/learn/getting-started or use zigup)"
-            } else {
-                "zig not found on $PATH, install zig (use `winget install -e --id zig.zig` or see https://ziglang.org/learn/getting-started or use zigup)"
-            });
-        }
-
-        let rustup = which("rustup", cx)
-            .await?
-            .context("rustup not found on $PATH, install rustup (see https://rustup.rs/)")?;
-        delegate.set_status(Some("Adding rustup target for cross-compilation"), cx);
-        log::info!("adding rustup target");
-        run_cmd(new_smol_command(rustup).args(["target", "add"]).arg(&triple)).await?;
-
-        if which("cargo-zigbuild", cx).await?.is_none() {
-            delegate.set_status(Some("Installing cargo-zigbuild for cross-compilation"), cx);
-            log::info!("installing cargo-zigbuild");
-            run_cmd(new_smol_command("cargo").args(["install", "--locked", "cargo-zigbuild"])).await?;
-        }
-
-        delegate.set_status(
-            Some(&format!("Building remote binary from source for {triple} with Zig")),
-            cx,
-        );
-        log::info!("building remote binary from source for {triple} with Zig");
-        run_cmd(
-            new_smol_command("cargo")
-                .args([
-                    "zigbuild",
-                    "--package",
-                    "remote_server",
-                    "--target-dir",
-                    "target/remote_server",
-                    "--target",
-                    &triple,
-                ])
-                .env("RUSTFLAGS", &rust_flags),
-        )
-        .await?;
+        RemoteServerBuildMode::Zig
     };
-    let bin_path = Path::new("target")
+
+    match remote_build_mode {
+        RemoteServerBuildMode::Native => {
+            delegate.set_status(Some("Building remote server binary from source"), cx);
+            log::info!("building remote server binary from source");
+        }
+        RemoteServerBuildMode::Zig => {
+            if which("zig", cx).await?.is_none() {
+                anyhow::bail!(if cfg!(not(windows)) {
+                    "zig not found on $PATH, install zig (see https://ziglang.org/learn/getting-started or use zigup)"
+                } else {
+                    "zig not found on $PATH, install zig (use `winget install -e --id zig.zig` or see https://ziglang.org/learn/getting-started or use zigup)"
+                });
+            }
+
+            ensure_rustup_target(&triple, delegate, cx).await?;
+
+            if which("cargo-zigbuild", cx).await?.is_none() {
+                delegate.set_status(Some("Installing cargo-zigbuild for cross-compilation"), cx);
+                log::info!("installing cargo-zigbuild");
+                run_cmd(new_command("cargo").args(["install", "--locked", "cargo-zigbuild"]))
+                    .await?;
+            }
+
+            delegate.set_status(
+                Some(&format!(
+                    "Building remote binary from source for {triple} with Zig"
+                )),
+                cx,
+            );
+            log::info!("building remote binary from source for {triple} with Zig");
+        }
+        RemoteServerBuildMode::Xwin => {
+            if which("clang", cx).await?.is_none() {
+                anyhow::bail!(
+                    "clang not found on $PATH, install clang to cross-compile the Windows remote server (see https://clang.llvm.org/)"
+                );
+            }
+
+            if which("cargo-xwin", cx).await?.is_none() {
+                anyhow::bail!(
+                    "cargo-xwin not found on $PATH. Install it with `cargo install --locked cargo-xwin`.\n\n\
+                     Note that cargo-xwin downloads Microsoft's CRT and Windows SDK; by using it you \
+                     accept Microsoft's license (see https://go.microsoft.com/fwlink/?LinkId=2086102)"
+                );
+            }
+
+            ensure_rustup_target(&triple, delegate, cx).await?;
+
+            delegate.set_status(Some("Adding llvm-tools for cross-compilation"), cx);
+            log::info!("adding llvm-tools component");
+            run_cmd(
+                new_command("rustup")
+                    .current_dir(
+                        util::dev_repo_root()
+                            .context("locating the zed checkout to add the llvm-tools component")?,
+                    )
+                    .args(["component", "add", "llvm-tools"]),
+            )
+            .await?;
+
+            delegate.set_status(
+                Some(&format!(
+                    "Building remote binary from source for {triple} with xwin"
+                )),
+                cx,
+            );
+            log::info!("building remote binary from source for {triple} with xwin");
+        }
+    };
+    run_cmd(
+        new_command("cargo")
+            .current_dir(
+                util::dev_repo_root()
+                    .context("locating the zed checkout to build remote_server from source")?,
+            )
+            .args(remote_build_mode.build_command())
+            .args([
+                "--package",
+                "remote_server",
+                "--features",
+                "debug-embed",
+                "--target-dir",
+                "target/remote_server",
+                "--target",
+                &triple,
+            ])
+            .env("RUSTFLAGS", &rust_flags),
+    )
+    .await?;
+
+    let bin_path = util::dev_repo_root()
+        .context("locating the zed checkout that built remote_server from source")?
+        .join("target")
         .join("remote_server")
         .join(&triple)
         .join("debug")
-        .join("remote_server");
+        .join("remote_server")
+        .with_extension(if platform.os.is_windows() { "exe" } else { "" });
 
-    delegate.set_status(Some("Compressing binary"), cx);
+    let path = if !build_remote_server.contains("nocompress") {
+        delegate.set_status(Some("Compressing binary"), cx);
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        run_cmd(new_smol_command("gzip").args(["-f", &bin_path.to_string_lossy()])).await?;
-    }
+        #[cfg(not(target_os = "windows"))]
+        let archive_path = {
+            run_cmd(new_command("gzip").arg("-f").arg(&bin_path)).await?;
+            bin_path.with_extension("gz")
+        };
 
-    #[cfg(target_os = "windows")]
-    {
-        // On Windows, we use 7z to compress the binary
+        #[cfg(target_os = "windows")]
+        let archive_path = {
+            let zip_path = bin_path.with_extension("zip");
+            if smol::fs::metadata(&zip_path).await.is_ok() {
+                smol::fs::remove_file(&zip_path).await?;
+            }
+            let compress_command = format!(
+                "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
+                bin_path.display(),
+                zip_path.display(),
+            );
+            run_cmd(new_command("powershell.exe").args([
+                "-NoProfile",
+                "-Command",
+                &compress_command,
+            ]))
+            .await?;
+            zip_path
+        };
 
-        let seven_zip = which("7z.exe", cx)
-            .await?
-            .context("7z.exe not found on $PATH, install it (e.g. with `winget install -e --id 7zip.7zip`)")?;
-        let gz_path = format!("target/remote_server/{}/debug/remote_server.gz", triple);
-        if smol::fs::metadata(&gz_path).await.is_ok() {
-            smol::fs::remove_file(&gz_path).await?;
-        }
-        run_cmd(new_smol_command(seven_zip).args(["a", "-tgzip", &gz_path, &bin_path.to_string_lossy()])).await?;
-    }
-
-    let mut archive_path = bin_path;
-    archive_path.set_extension("gz");
-    let path = std::env::current_dir()?.join(archive_path);
+        std::env::current_dir()?.join(archive_path)
+    } else {
+        bin_path
+    };
 
     Ok(Some(path))
 }
 
-#[cfg(debug_assertions)]
-async fn which(binary_name: impl AsRef<str>, cx: &mut AsyncApp) -> Result<Option<std::path::PathBuf>> {
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+async fn which(
+    binary_name: impl AsRef<str>,
+    cx: &mut AsyncApp,
+) -> Result<Option<std::path::PathBuf>> {
     let binary_name = binary_name.as_ref().to_string();
     let binary_name_cloned = binary_name.clone();
     let res = cx
@@ -323,36 +530,89 @@ mod tests {
     #[test]
     fn test_parse_platform() {
         let result = parse_platform("Linux x86_64\n").unwrap();
-        assert_eq!(result.os, "linux");
-        assert_eq!(result.arch, "x86_64");
+        assert_eq!(result.os, RemoteOs::Linux);
+        assert_eq!(result.arch, RemoteArch::X86_64);
 
         let result = parse_platform("Darwin arm64\n").unwrap();
-        assert_eq!(result.os, "macos");
-        assert_eq!(result.arch, "aarch64");
+        assert_eq!(result.os, RemoteOs::MacOs);
+        assert_eq!(result.arch, RemoteArch::Aarch64);
 
         let result = parse_platform("Linux x86_64").unwrap();
-        assert_eq!(result.os, "linux");
-        assert_eq!(result.arch, "x86_64");
+        assert_eq!(result.os, RemoteOs::Linux);
+        assert_eq!(result.arch, RemoteArch::X86_64);
 
         let result = parse_platform("some shell init output\nLinux aarch64\n").unwrap();
-        assert_eq!(result.os, "linux");
-        assert_eq!(result.arch, "aarch64");
+        assert_eq!(result.os, RemoteOs::Linux);
+        assert_eq!(result.arch, RemoteArch::Aarch64);
 
         let result = parse_platform("some shell init output\nLinux aarch64").unwrap();
-        assert_eq!(result.os, "linux");
-        assert_eq!(result.arch, "aarch64");
+        assert_eq!(result.os, RemoteOs::Linux);
+        assert_eq!(result.arch, RemoteArch::Aarch64);
 
-        assert_eq!(parse_platform("Linux armv8l\n").unwrap().arch, "aarch64");
-        assert_eq!(parse_platform("Linux aarch64\n").unwrap().arch, "aarch64");
-        assert_eq!(parse_platform("Linux x86_64\n").unwrap().arch, "x86_64");
+        assert_eq!(
+            parse_platform("Linux armv8l\n").unwrap().arch,
+            RemoteArch::Aarch64
+        );
+        assert_eq!(
+            parse_platform("Linux aarch64\n").unwrap().arch,
+            RemoteArch::Aarch64
+        );
+        assert_eq!(
+            parse_platform("Linux x86_64\n").unwrap().arch,
+            RemoteArch::X86_64
+        );
 
-        let result =
-            parse_platform(r#"Linux x86_64 - What you're referring to as Linux, is in fact, GNU/Linux...\n"#).unwrap();
-        assert_eq!(result.os, "linux");
-        assert_eq!(result.arch, "x86_64");
+        let result = parse_platform(
+            r#"Linux x86_64 - What you're referring to as Linux, is in fact, GNU/Linux...\n"#,
+        )
+        .unwrap();
+        assert_eq!(result.os, RemoteOs::Linux);
+        assert_eq!(result.arch, RemoteArch::X86_64);
 
         assert!(parse_platform("Windows x86_64\n").is_err());
         assert!(parse_platform("Linux armv7l\n").is_err());
+    }
+
+    #[test]
+    fn test_parse_os_version() {
+        // Linux delegates to `util::parse_os_release` (tested there); confirm
+        // the dispatch is wired up.
+        let os_release = "ID=ubuntu\nVERSION_ID=\"24.04\"\n";
+        assert_eq!(
+            parse_os_version(RemoteOs::Linux, os_release),
+            Some("ubuntu 24.04".to_string())
+        );
+
+        // macOS `sw_vers -productVersion` prints a bare version, possibly after
+        // shell initialization noise.
+        assert_eq!(
+            parse_os_version(RemoteOs::MacOs, "15.6.1\n"),
+            Some("15.6.1".to_string())
+        );
+        assert_eq!(
+            parse_os_version(RemoteOs::MacOs, "shell noise\n26.0\n"),
+            Some("26.0".to_string())
+        );
+        assert_eq!(parse_os_version(RemoteOs::MacOs, ""), None);
+
+        // Windows `cmd.exe /c ver`, with the trailing revision dropped to match
+        // the `major.minor.build` format used by local Windows telemetry.
+        assert_eq!(
+            parse_os_version(
+                RemoteOs::Windows,
+                "Microsoft Windows [Version 10.0.19045.5011]\n"
+            ),
+            Some("10.0.19045".to_string())
+        );
+        // Localized output: only the version number is relied upon.
+        assert_eq!(
+            parse_os_version(
+                RemoteOs::Windows,
+                "Microsoft Windows [Versione 10.0.22631.1]"
+            ),
+            Some("10.0.22631".to_string())
+        );
+        assert_eq!(parse_os_version(RemoteOs::Windows, "no version here"), None);
     }
 
     #[test]
@@ -361,8 +621,14 @@ mod tests {
         assert_eq!(parse_shell("/bin/zsh\n", "sh"), "/bin/zsh");
 
         assert_eq!(parse_shell("/bin/bash", "sh"), "/bin/bash");
-        assert_eq!(parse_shell("some shell init output\n/bin/bash\n", "sh"), "/bin/bash");
-        assert_eq!(parse_shell("some shell init output\n/bin/bash", "sh"), "/bin/bash");
+        assert_eq!(
+            parse_shell("some shell init output\n/bin/bash\n", "sh"),
+            "/bin/bash"
+        );
+        assert_eq!(
+            parse_shell("some shell init output\n/bin/bash", "sh"),
+            "/bin/bash"
+        );
         assert_eq!(parse_shell("", "sh"), "sh");
         assert_eq!(parse_shell("\n", "sh"), "sh");
     }

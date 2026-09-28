@@ -2,7 +2,7 @@ use std::{cmp::Ordering, ops::Range, time::Duration};
 
 use collections::HashSet;
 use gpui::{App, AppContext as _, Context, Task, Window};
-use language::language_settings::language_settings;
+use language::language_settings::LanguageSettings;
 use multi_buffer::{IndentGuide, MultiBufferRow, ToPoint};
 use text::{LineIndent, Point};
 use util::ResultExt;
@@ -37,7 +37,7 @@ impl Editor {
     ) -> Option<Vec<IndentGuide>> {
         let show_indent_guides = self.should_show_indent_guides().unwrap_or_else(|| {
             if let Some(buffer) = self.buffer().read(cx).as_singleton() {
-                language_settings(buffer.read(cx).language().map(|l| l.name()), buffer.read(cx).file(), cx)
+                LanguageSettings::for_buffer(buffer.read(cx), cx)
                     .indent_guides
                     .enabled
             } else {
@@ -74,9 +74,14 @@ impl Editor {
             .active_indent_range
             .as_ref()
             .map(|active_indent_range| {
-                should_recalculate_indented_range(state.cursor_row, cursor_row, active_indent_range, snapshot)
+                should_recalculate_indented_range(
+                    state.cursor_row,
+                    cursor_row,
+                    active_indent_range,
+                    snapshot,
+                )
             })
-            .unwrap_or(true)
+            .unwrap_or(state.cursor_row != cursor_row)
         {
             state.dirty = true;
         } else {
@@ -97,7 +102,7 @@ impl Editor {
 
             // Try to resolve the indent in a short amount of time, otherwise move it to a background task.
             match cx
-                .background_executor()
+                .foreground_executor()
                 .block_with_timeout(Duration::from_micros(200), task)
             {
                 Ok(result) => state.active_indent_range = result,
@@ -118,9 +123,12 @@ impl Editor {
 
         let active_indent_range = state.active_indent_range.as_ref()?;
 
-        let candidates = indent_guides.iter().enumerate().filter(|(_, indent_guide)| {
-            indent_guide.indent_level() == active_indent_range.indent.len(indent_guide.tab_size)
-        });
+        let candidates = indent_guides
+            .iter()
+            .enumerate()
+            .filter(|(_, indent_guide)| {
+                indent_guide.indent_level() == active_indent_range.indent.len(indent_guide.tab_size)
+            });
 
         let mut matches = HashSet::default();
         for (i, indent) in candidates {
@@ -194,7 +202,10 @@ pub fn indent_guides_in_range(
         .collect()
 }
 
-async fn resolve_indented_range(snapshot: DisplaySnapshot, buffer_row: MultiBufferRow) -> Option<ActiveIndentedRange> {
+async fn resolve_indented_range(
+    snapshot: DisplaySnapshot,
+    buffer_row: MultiBufferRow,
+) -> Option<ActiveIndentedRange> {
     snapshot
         .buffer_snapshot()
         .enclosing_indent(buffer_row)

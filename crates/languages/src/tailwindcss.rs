@@ -5,9 +5,11 @@ use language::{LspAdapter, LspAdapterDelegate, LspInstaller, Toolchain};
 use lsp::{LanguageServerBinary, LanguageServerName, Uri};
 use node_runtime::{NodeRuntime, VersionStrategy};
 use project::lsp_store::language_server_settings;
+use semver::Version;
 use serde_json::json;
 use std::{
     ffi::OsString,
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -25,7 +27,8 @@ pub struct TailwindCssLspAdapter {
 
 // Implements the LSP adapter for the Tailwind CSS LSP fork: https://github.com/zed-industries/zed/pull/39517#issuecomment-3368206678
 impl TailwindCssLspAdapter {
-    const SERVER_NAME: LanguageServerName = LanguageServerName::new_static("tailwindcss-intellisense-css");
+    const SERVER_NAME: LanguageServerName =
+        LanguageServerName::new_static("tailwindcss-intellisense-css");
     const PACKAGE_NAME: &str = "@tailwindcss/language-server";
 
     pub fn new(node: NodeRuntime) -> Self {
@@ -34,20 +37,22 @@ impl TailwindCssLspAdapter {
 }
 
 impl LspInstaller for TailwindCssLspAdapter {
-    type BinaryVersion = String;
+    type BinaryVersion = Version;
 
     async fn fetch_latest_server_version(
         &self,
-        _: &dyn LspAdapterDelegate,
+        _: &Arc<dyn LspAdapterDelegate>,
         _: bool,
         _: &mut AsyncApp,
     ) -> Result<Self::BinaryVersion> {
-        self.node.npm_package_latest_version(Self::PACKAGE_NAME).await
+        self.node
+            .npm_package_latest_version(Self::PACKAGE_NAME)
+            .await
     }
 
     async fn check_if_user_installed(
         &self,
-        delegate: &dyn LspAdapterDelegate,
+        delegate: &Arc<dyn LspAdapterDelegate>,
         _: Option<Toolchain>,
         _: &AsyncApp,
     ) -> Option<LanguageServerBinary> {
@@ -61,52 +66,59 @@ impl LspInstaller for TailwindCssLspAdapter {
         })
     }
 
-    async fn fetch_server_binary(
+    fn fetch_server_binary(
         &self,
-        latest_version: Self::BinaryVersion,
+        _latest_version: Self::BinaryVersion,
         container_dir: PathBuf,
-        _: &dyn LspAdapterDelegate,
-    ) -> Result<LanguageServerBinary> {
-        let server_path = container_dir.join(SERVER_PATH);
-        let latest_version = latest_version.to_string();
+        _: &Arc<dyn LspAdapterDelegate>,
+    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+        let node = self.node.clone();
 
-        self.node
-            .npm_install_packages(&container_dir, &[(Self::PACKAGE_NAME, latest_version.as_str())])
-            .await?;
+        async move {
+            let server_path = container_dir.join(SERVER_PATH);
 
-        Ok(LanguageServerBinary {
-            path: self.node.binary_path().await?,
-            env: None,
-            arguments: server_binary_arguments(&server_path),
-        })
-    }
+            node.npm_install_latest_packages(&container_dir, &[Self::PACKAGE_NAME])
+                .await?;
 
-    async fn check_if_version_installed(
-        &self,
-        version: &Self::BinaryVersion,
-        container_dir: &PathBuf,
-        _: &dyn LspAdapterDelegate,
-    ) -> Option<LanguageServerBinary> {
-        let server_path = container_dir.join(SERVER_PATH);
-
-        let should_install_language_server = self
-            .node
-            .should_install_npm_package(
-                Self::PACKAGE_NAME,
-                &server_path,
-                container_dir,
-                VersionStrategy::Latest(version),
-            )
-            .await;
-
-        if should_install_language_server {
-            None
-        } else {
-            Some(LanguageServerBinary {
-                path: self.node.binary_path().await.ok()?,
+            Ok(LanguageServerBinary {
+                path: node.binary_path().await?,
                 env: None,
                 arguments: server_binary_arguments(&server_path),
             })
+        }
+    }
+
+    fn check_if_version_installed(
+        &self,
+        version: &Self::BinaryVersion,
+        container_dir: &PathBuf,
+        _: &Arc<dyn LspAdapterDelegate>,
+    ) -> impl Send + Future<Output = Option<LanguageServerBinary>> + use<> {
+        let node = self.node.clone();
+        let version = version.clone();
+        let container_dir = container_dir.clone();
+
+        async move {
+            let server_path = container_dir.join(SERVER_PATH);
+
+            let should_install_language_server = node
+                .should_install_npm_package(
+                    Self::PACKAGE_NAME,
+                    &server_path,
+                    &container_dir,
+                    VersionStrategy::Latest(&version),
+                )
+                .await;
+
+            if should_install_language_server {
+                None
+            } else {
+                Some(LanguageServerBinary {
+                    path: node.binary_path().await.ok()?,
+                    env: None,
+                    arguments: server_binary_arguments(&server_path),
+                })
+            }
         }
     }
 
@@ -128,6 +140,7 @@ impl LspAdapter for TailwindCssLspAdapter {
     async fn initialization_options(
         self: Arc<Self>,
         _: &Arc<dyn LspAdapterDelegate>,
+        _: &mut AsyncApp,
     ) -> Result<Option<serde_json::Value>> {
         Ok(Some(json!({
             "provideFormatter": true
@@ -154,8 +167,9 @@ impl LspAdapter for TailwindCssLspAdapter {
         });
 
         let project_options = cx.update(|cx| {
-            language_server_settings(delegate.as_ref(), &self.name(), cx).and_then(|s| s.settings.clone())
-        })?;
+            language_server_settings(delegate.as_ref(), &self.name(), cx)
+                .and_then(|s| s.settings.clone())
+        });
 
         if let Some(override_options) = project_options {
             merge_json_value_into(override_options, &mut default_config);
@@ -165,10 +179,16 @@ impl LspAdapter for TailwindCssLspAdapter {
     }
 }
 
-async fn get_cached_server_binary(container_dir: PathBuf, node: &NodeRuntime) -> Option<LanguageServerBinary> {
+async fn get_cached_server_binary(
+    container_dir: PathBuf,
+    node: &NodeRuntime,
+) -> Option<LanguageServerBinary> {
     maybe!(async {
         let server_path = container_dir.join(SERVER_PATH);
-        anyhow::ensure!(server_path.exists(), "missing executable in directory {server_path:?}");
+        anyhow::ensure!(
+            server_path.exists(),
+            "missing executable in directory {server_path:?}"
+        );
         Ok(LanguageServerBinary {
             path: node.binary_path().await?,
             env: None,

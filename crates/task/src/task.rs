@@ -1,4 +1,4 @@
-//! Baseline interface of Tasks in Gram: all tasks in Gram are intended to use those for implementing their own logic.
+//! Baseline interface of Tasks in Zed: all tasks in Zed are intended to use those for implementing their own logic.
 
 mod adapter_schema;
 mod debug_format;
@@ -15,28 +15,29 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 pub use adapter_schema::{AdapterSchema, AdapterSchemas};
-pub use app_actions::RevealTarget;
 pub use debug_format::{
-    AttachRequest, BuildTaskDefinition, DebugRequest, DebugScenario, DebugTaskFile, GramDebugConfig, LaunchRequest,
-    Request, TcpArgumentsTemplate,
+    AttachRequest, BuildTaskDefinition, DebugRequest, DebugScenario, DebugTaskFile, LaunchRequest,
+    Request, TcpArgumentsTemplate, ZedDebugConfig,
 };
 pub use task_template::{
-    DebugArgsRequest, HideStrategy, RevealStrategy, SaveStrategy, TaskTemplate, TaskTemplates,
-    substitute_variables_in_map, substitute_variables_in_str,
+    DebugArgsRequest, HideStrategy, RevealStrategy, SaveStrategy, TaskHook, TaskTemplate,
+    TaskTemplates, substitute_variables_in_map, substitute_variables_in_str,
 };
 pub use util::shell::{Shell, ShellKind};
 pub use util::shell_builder::ShellBuilder;
 pub use vscode_debug_format::VsCodeDebugTaskFile;
 pub use vscode_format::VsCodeTaskFile;
+pub use zed_actions::RevealTarget;
 
 /// Task identifier, unique within the application.
 /// Based on it, task reruns and terminal tabs are managed.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct TaskId(pub String);
 
-/// Contains all information needed by Gram to spawn a new terminal tab for the given task.
+/// Contains all information needed by Zed to spawn a new terminal tab for the given task.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct SpawnInTerminal {
     /// Id of the task to use when determining task tab affinity.
@@ -68,7 +69,7 @@ pub struct SpawnInTerminal {
     pub hide: HideStrategy,
     /// Which shell to use when spawning the task.
     pub shell: Shell,
-    /// Whether to show the task summary line in the task output (sucess/failure).
+    /// Whether to show the task summary line in the task output (success/failure).
     pub show_summary: bool,
     /// Whether to show the command line in the task output.
     pub show_command: bool,
@@ -84,8 +85,15 @@ impl SpawnInTerminal {
             label: self.label.clone(),
             command: self.command.clone(),
             args: self.args.clone(),
-            env: self.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            cwd: self.cwd.clone().map(|cwd| cwd.to_string_lossy().into_owned()),
+            env: self
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            cwd: self
+                .cwd
+                .clone()
+                .map(|cwd| cwd.to_string_lossy().into_owned()),
         }
     }
 
@@ -138,7 +146,7 @@ impl ResolvedTask {
     }
 }
 
-/// Variables, available for use in [`TaskContext`] when a Gram's [`TaskTemplate`] gets resolved into a [`ResolvedTask`].
+/// Variables, available for use in [`TaskContext`] when a Zed's [`TaskTemplate`] gets resolved into a [`ResolvedTask`].
 /// Name of the variable must be a valid shell variable identifier, which generally means that it is
 /// a word  consisting only  of alphanumeric characters and underscores,
 /// and beginning with an alphabetic character or an  underscore.
@@ -166,11 +174,27 @@ pub enum VariableName {
     Column,
     /// Text from the latest selection.
     SelectedText,
+    /// The language of the currently opened buffer (e.g., "Rust", "Python").
+    Language,
     /// The symbol selected by the symbol tagging system, specifically the @run capture in a runnables.scm
     RunnableSymbol,
     /// Open a Picker to select a process ID to use in place
     /// Can only be used to debug configurations
     PickProcessId,
+    /// An absolute path of the main (original) git worktree for the current repository.
+    /// For normal checkouts, this equals the worktree root. For linked worktrees,
+    /// this is the original repo's working directory.
+    MainGitWorktree,
+    /// Full SHA for the Git commit associated with the task context.
+    GitSha,
+    /// Short SHA for the Git commit associated with the task context.
+    GitShaShort,
+    /// Name of the Git repository associated with the task context.
+    GitRepositoryName,
+    /// Absolute path of the Git repository associated with the task context.
+    GitRepositoryPath,
+    /// Name of the Git ref (branch, remote ref, or tag) associated with the task context.
+    GitRef,
     /// Custom variable, provided by the plugin or other external source.
     /// Will be printed with `CUSTOM_` prefix to avoid potential conflicts with other variables.
     Custom(Cow<'static, str>),
@@ -191,7 +215,7 @@ impl FromStr for VariableName {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let without_prefix = s.strip_prefix(GRAM_VARIABLE_NAME_PREFIX).ok_or(())?;
+        let without_prefix = s.strip_prefix(ZED_VARIABLE_NAME_PREFIX).ok_or(())?;
         let value = match without_prefix {
             "FILE" => Self::File,
             "FILENAME" => Self::Filename,
@@ -203,10 +227,19 @@ impl FromStr for VariableName {
             "SYMBOL" => Self::Symbol,
             "RUNNABLE_SYMBOL" => Self::RunnableSymbol,
             "SELECTED_TEXT" => Self::SelectedText,
+            "LANGUAGE" => Self::Language,
             "ROW" => Self::Row,
             "COLUMN" => Self::Column,
+            "MAIN_GIT_WORKTREE" => Self::MainGitWorktree,
+            "GIT_SHA" => Self::GitSha,
+            "GIT_SHA_SHORT" => Self::GitShaShort,
+            "GIT_REPOSITORY_NAME" => Self::GitRepositoryName,
+            "GIT_REPOSITORY_PATH" => Self::GitRepositoryPath,
+            "GIT_REF" => Self::GitRef,
             _ => {
-                if let Some(custom_name) = without_prefix.strip_prefix(GRAM_CUSTOM_VARIABLE_NAME_PREFIX) {
+                if let Some(custom_name) =
+                    without_prefix.strip_prefix(ZED_CUSTOM_VARIABLE_NAME_PREFIX)
+                {
                     Self::Custom(Cow::Owned(custom_name.to_owned()))
                 } else {
                     return Err(());
@@ -218,31 +251,41 @@ impl FromStr for VariableName {
 }
 
 /// A prefix that all [`VariableName`] variants are prefixed with when used in environment variables and similar template contexts.
-pub const GRAM_VARIABLE_NAME_PREFIX: &str = "GRAM_";
-const GRAM_CUSTOM_VARIABLE_NAME_PREFIX: &str = "CUSTOM_";
+pub const ZED_VARIABLE_NAME_PREFIX: &str = "ZED_";
+const ZED_CUSTOM_VARIABLE_NAME_PREFIX: &str = "CUSTOM_";
 
 impl std::fmt::Display for VariableName {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::File => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}FILE"),
-            Self::Filename => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}FILENAME"),
-            Self::RelativeFile => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}RELATIVE_FILE"),
-            Self::RelativeDir => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}RELATIVE_DIR"),
-            Self::Dirname => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}DIRNAME"),
-            Self::Stem => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}STEM"),
-            Self::WorktreeRoot => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}WORKTREE_ROOT"),
-            Self::Symbol => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}SYMBOL"),
-            Self::Row => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}ROW"),
-            Self::Column => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}COLUMN"),
-            Self::SelectedText => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}SELECTED_TEXT"),
-            Self::RunnableSymbol => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}RUNNABLE_SYMBOL"),
-            Self::PickProcessId => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}PICK_PID"),
-            Self::Custom(s) => write!(f, "{GRAM_VARIABLE_NAME_PREFIX}{GRAM_CUSTOM_VARIABLE_NAME_PREFIX}{s}"),
+            Self::File => write!(f, "{ZED_VARIABLE_NAME_PREFIX}FILE"),
+            Self::Filename => write!(f, "{ZED_VARIABLE_NAME_PREFIX}FILENAME"),
+            Self::RelativeFile => write!(f, "{ZED_VARIABLE_NAME_PREFIX}RELATIVE_FILE"),
+            Self::RelativeDir => write!(f, "{ZED_VARIABLE_NAME_PREFIX}RELATIVE_DIR"),
+            Self::Dirname => write!(f, "{ZED_VARIABLE_NAME_PREFIX}DIRNAME"),
+            Self::Stem => write!(f, "{ZED_VARIABLE_NAME_PREFIX}STEM"),
+            Self::WorktreeRoot => write!(f, "{ZED_VARIABLE_NAME_PREFIX}WORKTREE_ROOT"),
+            Self::Symbol => write!(f, "{ZED_VARIABLE_NAME_PREFIX}SYMBOL"),
+            Self::Row => write!(f, "{ZED_VARIABLE_NAME_PREFIX}ROW"),
+            Self::Column => write!(f, "{ZED_VARIABLE_NAME_PREFIX}COLUMN"),
+            Self::SelectedText => write!(f, "{ZED_VARIABLE_NAME_PREFIX}SELECTED_TEXT"),
+            Self::Language => write!(f, "{ZED_VARIABLE_NAME_PREFIX}LANGUAGE"),
+            Self::RunnableSymbol => write!(f, "{ZED_VARIABLE_NAME_PREFIX}RUNNABLE_SYMBOL"),
+            Self::PickProcessId => write!(f, "{ZED_VARIABLE_NAME_PREFIX}PICK_PID"),
+            Self::MainGitWorktree => write!(f, "{ZED_VARIABLE_NAME_PREFIX}MAIN_GIT_WORKTREE"),
+            Self::GitSha => write!(f, "{ZED_VARIABLE_NAME_PREFIX}GIT_SHA"),
+            Self::GitShaShort => write!(f, "{ZED_VARIABLE_NAME_PREFIX}GIT_SHA_SHORT"),
+            Self::GitRepositoryName => write!(f, "{ZED_VARIABLE_NAME_PREFIX}GIT_REPOSITORY_NAME"),
+            Self::GitRepositoryPath => write!(f, "{ZED_VARIABLE_NAME_PREFIX}GIT_REPOSITORY_PATH"),
+            Self::GitRef => write!(f, "{ZED_VARIABLE_NAME_PREFIX}GIT_REF"),
+            Self::Custom(s) => write!(
+                f,
+                "{ZED_VARIABLE_NAME_PREFIX}{ZED_CUSTOM_VARIABLE_NAME_PREFIX}{s}"
+            ),
         }
     }
 }
 
-/// Container for predefined environment variables that describe state of Gram at the time the task was spawned.
+/// Container for predefined environment variables that describe state of Zed at the time the task was spawned.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct TaskVariables(HashMap<VariableName, String>);
 
@@ -293,17 +336,35 @@ impl IntoIterator for TaskVariables {
 }
 
 /// Keeps track of the file associated with a task and context of tasks execution (i.e. current file or current function).
-/// Keeps all Gram-related state inside, used to produce a resolved task out of its template.
+/// Keeps all Zed-related state inside, used to produce a resolved task out of its template.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TaskContext {
     /// A path to a directory in which the task should be executed.
     pub cwd: Option<PathBuf>,
     /// Additional environment variables associated with a given task.
     pub task_variables: TaskVariables,
-    /// Environment variables obtained when loading the project into Gram.
+    /// Environment variables obtained when loading the project into Zed.
     /// This is the environment one would get when `cd`ing in a terminal
     /// into the project's root directory.
     pub project_env: HashMap<String, String>,
+}
+
+/// A shared reference to a [`TaskContext`], used to avoid cloning the context multiple times.
+#[derive(Clone, Debug, Default)]
+pub struct SharedTaskContext(Arc<TaskContext>);
+
+impl std::ops::Deref for SharedTaskContext {
+    type Target = TaskContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<TaskContext> for SharedTaskContext {
+    fn from(context: TaskContext) -> Self {
+        Self(Arc::new(context))
+    }
 }
 
 /// This is a new type representing a 'tag' on a 'runnable symbol', typically a test of main() function, found via treesitter.
@@ -341,22 +402,25 @@ pub fn shell_to_proto(shell: Shell) -> proto::Shell {
 
 type VsCodeEnvVariable = String;
 type VsCodeCommand = String;
-type GramEnvVariable = String;
+type ZedEnvVariable = String;
 
 struct EnvVariableReplacer {
-    variables: HashMap<VsCodeEnvVariable, GramEnvVariable>,
-    commands: HashMap<VsCodeCommand, GramEnvVariable>,
+    variables: HashMap<VsCodeEnvVariable, ZedEnvVariable>,
+    commands: HashMap<VsCodeCommand, ZedEnvVariable>,
 }
 
 impl EnvVariableReplacer {
-    fn new(variables: HashMap<VsCodeEnvVariable, GramEnvVariable>) -> Self {
+    fn new(variables: HashMap<VsCodeEnvVariable, ZedEnvVariable>) -> Self {
         Self {
             variables,
             commands: HashMap::default(),
         }
     }
 
-    fn with_commands(mut self, commands: impl IntoIterator<Item = (VsCodeCommand, GramEnvVariable)>) -> Self {
+    fn with_commands(
+        mut self,
+        commands: impl IntoIterator<Item = (VsCodeCommand, ZedEnvVariable)>,
+    ) -> Self {
         self.commands = commands.into_iter().collect();
         self
     }
@@ -375,7 +439,7 @@ impl EnvVariableReplacer {
             _ => input,
         }
     }
-    // Replaces occurrences of VsCode-specific environment variables with Gram equivalents.
+    // Replaces occurrences of VsCode-specific environment variables with Zed equivalents.
     fn replace(&self, input: &str) -> String {
         shellexpand::env_with_context_no_errors(&input, |var: &str| {
             // Colons denote a default value in case the variable is not set. We want to preserve that default, as otherwise shellexpand will substitute it for us.
@@ -398,7 +462,7 @@ impl EnvVariableReplacer {
                 }
             };
             if let Some(substitution) = self.variables.get(variable_name) {
-                // Got a VSCode->Gram hit, perform a substitution
+                // Got a VSCode->Zed hit, perform a substitution
                 let mut name = format!("${{{substitution}");
                 append_previous_default(&mut name);
                 name.push('}');

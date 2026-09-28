@@ -4,6 +4,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use rope::{Point, Rope};
+use std::hint::black_box;
 use sum_tree::Bias;
 use util::RandomCharIter;
 
@@ -38,7 +39,10 @@ fn generate_random_rope_ranges(rng: &mut StdRng, rope: &Rope) -> Vec<Range<usize
     let mut ranges = Vec::new();
     let mut start = 0;
     for _ in 0..num_ranges {
-        let range_start = rope.clip_offset(rng.random_range(start..=(start + range_max_len)), sum_tree::Bias::Left);
+        let range_start = rope.clip_offset(
+            rng.random_range(start..=(start + range_max_len)),
+            sum_tree::Bias::Left,
+        );
         let range_end = rope.clip_offset(
             rng.random_range(range_start..(range_start + range_max_len)),
             sum_tree::Bias::Right,
@@ -176,8 +180,8 @@ fn rope_benchmarks(c: &mut Criterion) {
                 || generate_random_rope_points(&mut rng, &rope),
                 |offsets| {
                     for offset in offsets.iter() {
-                        std::hint::black_box(rope.clip_point(*offset, Bias::Left));
-                        std::hint::black_box(rope.clip_point(*offset, Bias::Right));
+                        black_box(rope.clip_point(*offset, Bias::Left));
+                        black_box(rope.clip_point(*offset, Bias::Right));
                     }
                 },
                 BatchSize::SmallInput,
@@ -197,7 +201,7 @@ fn rope_benchmarks(c: &mut Criterion) {
                 || generate_random_rope_points(&mut rng, &rope),
                 |offsets| {
                     for offset in offsets.iter() {
-                        std::hint::black_box(rope.point_to_offset(*offset));
+                        black_box(rope.point_to_offset(*offset));
                     }
                 },
                 BatchSize::SmallInput,
@@ -225,7 +229,7 @@ fn rope_benchmarks(c: &mut Criterion) {
                 },
                 |offsets| {
                     for offset in offsets.iter() {
-                        std::hint::black_box(rope.cursor(*offset));
+                        black_box(rope.cursor(*offset));
                     }
                 },
                 BatchSize::SmallInput,

@@ -13,15 +13,16 @@ use serde_json::json;
 use crate::{Editor, ToPoint};
 use collections::HashSet;
 use futures::Future;
+use futures::stream::StreamExt;
 use gpui::{Context, Entity, Focusable as _, VisualTestContext, Window};
 use indoc::indoc;
 use language::{
-    BlockCommentConfig, FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, LanguageQueries, point_to_lsp,
+    BlockCommentConfig, FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, LanguageQueries,
+    point_to_lsp,
 };
 use lsp::{notification, request};
 use project::Project;
-use smol::stream::StreamExt;
-use workspace::{AppState, Workspace, WorkspaceHandle};
+use workspace::{AppState, MultiWorkspace, Workspace, WorkspaceHandle};
 
 use super::editor_test_context::{AssertionContextManager, EditorTestContext};
 
@@ -94,26 +95,43 @@ impl EditorLspTestContext {
             )
             .await;
 
-        let window = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
 
         let workspace = window.root(cx).unwrap();
 
         let mut cx = VisualTestContext::from_window(*window.deref(), cx);
         project
-            .update(&mut cx, |project, cx| project.find_or_create_worktree(root, true, cx))
+            .update(&mut cx, |project, cx| {
+                project.find_or_create_worktree(root, true, cx)
+            })
             .await
             .unwrap();
-        cx.read(|cx| workspace.read(cx).worktree_scans_complete(cx)).await;
-        let file = cx.read(|cx| workspace.file_project_paths(cx)[0].clone());
+        cx.read(|cx| {
+            workspace
+                .read(cx)
+                .workspace()
+                .read(cx)
+                .worktree_scans_complete(cx)
+        })
+        .await;
+        let file = cx.read(|cx| workspace.read(cx).workspace().file_project_paths(cx)[0].clone());
         let item = workspace
             .update_in(&mut cx, |workspace, window, cx| {
-                workspace.open_path(file, None, true, window, cx)
+                workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.open_path(file, None, true, window, cx)
+                })
             })
             .await
             .expect("Could not open test file");
-        let editor = cx.update(|_, cx| item.act_as::<Editor>(cx).expect("Opened test file wasn't an editor"));
+        let editor = cx.update(|_, cx| {
+            item.act_as::<Editor>(cx)
+                .expect("Opened test file wasn't an editor")
+        });
         editor.update_in(&mut cx, |editor, window, cx| {
             let nav_history = workspace
+                .read(cx)
+                .workspace()
                 .read(cx)
                 .active_pane()
                 .read(cx)
@@ -123,6 +141,12 @@ impl EditorLspTestContext {
         });
 
         let lsp = fake_servers.next().await.unwrap();
+
+        // Ensure the language server is fully registered with the buffer
+        cx.executor().run_until_parked();
+
+        let workspace = cx.read(|cx| workspace.read(cx).workspace().clone());
+
         Self {
             cx: EditorTestContext {
                 cx,
@@ -153,10 +177,10 @@ impl EditorLspTestContext {
         let language = Language::new(
             LanguageConfig {
                 name: "Typescript".into(),
-                matcher: LanguageMatcher {
+                matcher: (LanguageMatcher {
                     path_suffixes: vec!["ts".to_string()],
                     ..Default::default()
-                },
+                }).into(),
                 brackets: language::BracketPairConfig {
                     pairs: vec![language::BracketPair {
                         start: "{".to_string(),
@@ -248,17 +272,20 @@ impl EditorLspTestContext {
         Self::new(language, capabilities, cx).await
     }
 
-    pub async fn new_tsx(capabilities: lsp::ServerCapabilities, cx: &mut gpui::TestAppContext) -> EditorLspTestContext {
+    pub async fn new_tsx(
+        capabilities: lsp::ServerCapabilities,
+        cx: &mut gpui::TestAppContext,
+    ) -> EditorLspTestContext {
         let mut word_characters: HashSet<char> = Default::default();
         word_characters.insert('$');
         word_characters.insert('#');
         let language = Language::new(
             LanguageConfig {
                 name: "TSX".into(),
-                matcher: LanguageMatcher {
+                matcher: (LanguageMatcher {
                     path_suffixes: vec!["tsx".to_string()],
                     ..Default::default()
-                },
+                }).into(),
                 brackets: language::BracketPairConfig {
                     pairs: vec![language::BracketPair {
                         start: "{".to_string(),
@@ -363,10 +390,11 @@ impl EditorLspTestContext {
         let language = Language::new(
             LanguageConfig {
                 name: "HTML".into(),
-                matcher: LanguageMatcher {
+                matcher: (LanguageMatcher {
                     path_suffixes: vec!["html".into()],
                     ..Default::default()
-                },
+                })
+                .into(),
                 block_comment: Some(BlockCommentConfig {
                     start: "<!--".into(),
                     prefix: "".into(),
@@ -391,11 +419,16 @@ impl EditorLspTestContext {
     }
 
     pub async fn new_markdown_with_rust(cx: &mut gpui::TestAppContext) -> Self {
-        let context = Self::new(Arc::into_inner(markdown_lang()).unwrap(), Default::default(), cx).await;
+        let context = Self::new(
+            Arc::into_inner(markdown_lang()).unwrap(),
+            Default::default(),
+            cx,
+        )
+        .await;
 
-        let language_registry = context
-            .workspace
-            .read_with(cx, |workspace, cx| workspace.project().read(cx).languages().clone());
+        let language_registry = context.workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).languages().clone()
+        });
         language_registry.add(rust_lang());
 
         context
@@ -417,7 +450,8 @@ impl EditorLspTestContext {
 
         self.editor(|editor, _, cx| {
             let buffer = editor.buffer().read(cx);
-            let (start_buffer, start_offset) = buffer.point_to_buffer_offset(start_point, cx).unwrap();
+            let (start_buffer, start_offset) =
+                buffer.point_to_buffer_offset(start_point, cx).unwrap();
             let start = point_to_lsp(start_offset.to_point_utf16(&start_buffer.read(cx)));
             let (end_buffer, end_offset) = buffer.point_to_buffer_offset(end_point, cx).unwrap();
             let end = point_to_lsp(end_offset.to_point_utf16(&end_buffer.read(cx)));
@@ -446,7 +480,10 @@ impl EditorLspTestContext {
         self.workspace.update_in(&mut self.cx.cx, update)
     }
 
-    pub fn set_request_handler<T, F, Fut>(&self, mut handler: F) -> futures::channel::mpsc::UnboundedReceiver<()>
+    pub fn set_request_handler<T, F, Fut>(
+        &self,
+        mut handler: F,
+    ) -> futures::channel::mpsc::UnboundedReceiver<()>
     where
         T: 'static + request::Request,
         T::Params: 'static + Send,
@@ -465,12 +502,12 @@ impl EditorLspTestContext {
     }
 
     #[cfg(target_os = "windows")]
-    fn root_path() -> &'static Path {
+    pub fn root_path() -> &'static Path {
         Path::new("C:\\root")
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn root_path() -> &'static Path {
+    pub fn root_path() -> &'static Path {
         Path::new("/root")
     }
 }

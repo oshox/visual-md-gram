@@ -140,7 +140,11 @@ impl KeyContext {
 
     /// Get the associated value for a given identifier or key.
     pub fn get(&self, key: &str) -> Option<&SharedString> {
-        self.0.iter().find(|entry| entry.key.as_ref() == key)?.value.as_ref()
+        self.0
+            .iter()
+            .find(|entry| entry.key.as_ref() == key)?
+            .value
+            .as_ref()
     }
 }
 
@@ -174,25 +178,41 @@ pub enum KeyBindingContextPredicate {
     NotEqual(SharedString, SharedString),
     /// A predicate that will match a given predicate appearing below another predicate.
     /// in the element tree
-    Descendant(Box<KeyBindingContextPredicate>, Box<KeyBindingContextPredicate>),
+    Descendant(
+        Box<KeyBindingContextPredicate>,
+        Box<KeyBindingContextPredicate>,
+    ),
     /// Predicate that will invert another predicate.
     Not(Box<KeyBindingContextPredicate>),
     /// A predicate that will match if both of its children match.
-    And(Box<KeyBindingContextPredicate>, Box<KeyBindingContextPredicate>),
+    And(
+        Box<KeyBindingContextPredicate>,
+        Box<KeyBindingContextPredicate>,
+    ),
     /// A predicate that will match if either of its children match.
-    Or(Box<KeyBindingContextPredicate>, Box<KeyBindingContextPredicate>),
+    Or(
+        Box<KeyBindingContextPredicate>,
+        Box<KeyBindingContextPredicate>,
+    ),
 }
 
 impl fmt::Display for KeyBindingContextPredicate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Identifier(name) => write!(f, "{}", name),
-            Self::Equal(left, right) => write!(f, "{} == {}", left, right),
-            Self::NotEqual(left, right) => write!(f, "{} != {}", left, right),
-            Self::Not(pred) => write!(f, "!{}", pred),
-            Self::Descendant(parent, child) => write!(f, "{} > {}", parent, child),
-            Self::And(left, right) => write!(f, "({} && {})", left, right),
-            Self::Or(left, right) => write!(f, "({} || {})", left, right),
+            Self::Identifier(name) => write!(f, "{name}"),
+            Self::Equal(left, right) => write!(f, "{left} == {right}"),
+            Self::NotEqual(left, right) => write!(f, "{left} != {right}"),
+            Self::Descendant(parent, child) => write!(f, "{parent} > {child}"),
+            Self::Not(pred) => match pred.as_ref() {
+                Self::Identifier(name) => write!(f, "!{name}"),
+                _ => write!(f, "!({pred})"),
+            },
+            Self::And(..) => self.fmt_joined(f, " && ", LogicalOperator::And, |node| {
+                matches!(node, Self::Or(..))
+            }),
+            Self::Or(..) => self.fmt_joined(f, " || ", LogicalOperator::Or, |node| {
+                matches!(node, Self::And(..))
+            }),
         }
     }
 }
@@ -249,7 +269,7 @@ impl KeyBindingContextPredicate {
 
     /// Eval a predicate against a set of contexts, arranged from lowest to highest.
     #[allow(unused)]
-    pub(crate) fn eval(&self, contexts: &[KeyContext]) -> bool {
+    pub fn eval(&self, contexts: &[KeyContext]) -> bool {
         self.eval_inner(contexts, contexts)
     }
 
@@ -260,8 +280,14 @@ impl KeyBindingContextPredicate {
         };
         match self {
             Self::Identifier(name) => context.contains(name),
-            Self::Equal(left, right) => context.get(left).map(|value| value == right).unwrap_or(false),
-            Self::NotEqual(left, right) => context.get(left).map(|value| value != right).unwrap_or(true),
+            Self::Equal(left, right) => context
+                .get(left)
+                .map(|value| value == right)
+                .unwrap_or(false),
+            Self::NotEqual(left, right) => context
+                .get(left)
+                .map(|value| value != right)
+                .unwrap_or(true),
             Self::Not(pred) => {
                 for i in 0..all_contexts.len() {
                     if pred.eval_inner(&all_contexts[..=i], all_contexts) {
@@ -310,7 +336,9 @@ impl KeyBindingContextPredicate {
 
         match other {
             KeyBindingContextPredicate::Descendant(_, child) => self.is_superset(child),
-            KeyBindingContextPredicate::And(left, right) => self.is_superset(left) || self.is_superset(right),
+            KeyBindingContextPredicate::And(left, right) => {
+                self.is_superset(left) || self.is_superset(right)
+            }
             KeyBindingContextPredicate::Identifier(_) => false,
             KeyBindingContextPredicate::Equal(_, _) => false,
             KeyBindingContextPredicate::NotEqual(_, _) => false,
@@ -320,7 +348,10 @@ impl KeyBindingContextPredicate {
     }
 
     fn parse_expr(mut source: &str, min_precedence: u32) -> anyhow::Result<(Self, &str)> {
-        type Op = fn(KeyBindingContextPredicate, KeyBindingContextPredicate) -> Result<KeyBindingContextPredicate>;
+        type Op = fn(
+            KeyBindingContextPredicate,
+            KeyBindingContextPredicate,
+        ) -> Result<KeyBindingContextPredicate>;
 
         let (mut predicate, rest) = Self::parse_primary(source)?;
         source = rest;
@@ -412,6 +443,52 @@ impl KeyBindingContextPredicate {
             anyhow::bail!("operands of != must be identifiers");
         }
     }
+
+    fn fmt_joined(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        separator: &str,
+        operator: LogicalOperator,
+        needs_parens: impl Fn(&Self) -> bool + Copy,
+    ) -> fmt::Result {
+        let mut first = true;
+        self.fmt_joined_inner(f, separator, operator, needs_parens, &mut first)
+    }
+
+    fn fmt_joined_inner(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        separator: &str,
+        operator: LogicalOperator,
+        needs_parens: impl Fn(&Self) -> bool + Copy,
+        first: &mut bool,
+    ) -> fmt::Result {
+        match (operator, self) {
+            (LogicalOperator::And, Self::And(left, right))
+            | (LogicalOperator::Or, Self::Or(left, right)) => {
+                left.fmt_joined_inner(f, separator, operator, needs_parens, first)?;
+                right.fmt_joined_inner(f, separator, operator, needs_parens, first)
+            }
+            (_, node) => {
+                if !*first {
+                    f.write_str(separator)?;
+                }
+                *first = false;
+
+                if needs_parens(node) {
+                    write!(f, "({node})")
+                } else {
+                    write!(f, "{node}")
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LogicalOperator {
+    And,
+    Or,
 }
 
 const PRECEDENCE_CHILD: u32 = 1;
@@ -429,7 +506,9 @@ fn is_vim_operator_char(c: char) -> bool {
 }
 
 fn skip_whitespace(source: &str) -> &str {
-    let len = source.find(|c: char| !c.is_whitespace()).unwrap_or(source.len());
+    let len = source
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(source.len());
     &source[len..]
 }
 
@@ -464,7 +543,10 @@ mod tests {
         expected.set("foo", "bar");
         assert_eq!(KeyContext::parse("baz foo=bar").unwrap(), expected);
         assert_eq!(KeyContext::parse("baz foo = bar").unwrap(), expected);
-        assert_eq!(KeyContext::parse("  baz foo   =   bar baz").unwrap(), expected);
+        assert_eq!(
+            KeyContext::parse("  baz foo   =   bar baz").unwrap(),
+            expected
+        );
         assert_eq!(KeyContext::parse(" baz foo = bar").unwrap(), expected);
     }
 
@@ -504,7 +586,9 @@ mod tests {
             NotEqual("c".into(), "d".into())
         );
         assert_eq!(
-            KeyBindingContextPredicate::parse("c == !d").unwrap_err().to_string(),
+            KeyBindingContextPredicate::parse("c == !d")
+                .unwrap_err()
+                .to_string(),
             "operands of == must be identifiers"
         );
     }
@@ -513,7 +597,10 @@ mod tests {
     fn test_parse_boolean_operators() {
         assert_eq!(
             KeyBindingContextPredicate::parse("a || b").unwrap(),
-            Or(Box::new(Identifier("a".into())), Box::new(Identifier("b".into())))
+            Or(
+                Box::new(Identifier("a".into())),
+                Box::new(Identifier("b".into()))
+            )
         );
         assert_eq!(
             KeyBindingContextPredicate::parse("a || !b && c").unwrap(),
@@ -528,8 +615,14 @@ mod tests {
         assert_eq!(
             KeyBindingContextPredicate::parse("a && b || c&&d").unwrap(),
             Or(
-                Box::new(And(Box::new(Identifier("a".into())), Box::new(Identifier("b".into())))),
-                Box::new(And(Box::new(Identifier("c".into())), Box::new(Identifier("d".into()))))
+                Box::new(And(
+                    Box::new(Identifier("a".into())),
+                    Box::new(Identifier("b".into()))
+                )),
+                Box::new(And(
+                    Box::new(Identifier("c".into())),
+                    Box::new(Identifier("d".into()))
+                ))
             )
         );
         assert_eq!(
@@ -549,7 +642,10 @@ mod tests {
             KeyBindingContextPredicate::parse("a && b && c && d").unwrap(),
             And(
                 Box::new(And(
-                    Box::new(And(Box::new(Identifier("a".into())), Box::new(Identifier("b".into())))),
+                    Box::new(And(
+                        Box::new(Identifier("a".into())),
+                        Box::new(Identifier("b".into()))
+                    )),
                     Box::new(Identifier("c".into())),
                 )),
                 Box::new(Identifier("d".into()))
@@ -571,7 +667,10 @@ mod tests {
         );
         assert_eq!(
             KeyBindingContextPredicate::parse(" ( a || b ) ").unwrap(),
-            Or(Box::new(Identifier("a".into())), Box::new(Identifier("b".into())),)
+            Or(
+                Box::new(Identifier("a".into())),
+                Box::new(Identifier("b".into())),
+            )
         );
     }
 
@@ -610,7 +709,11 @@ mod tests {
 
         let grandparent_context = KeyContext::try_from("grandparent").unwrap();
 
-        let contexts = vec![grandparent_context, parent_context.clone(), child_context.clone()];
+        let contexts = vec![
+            grandparent_context,
+            parent_context.clone(),
+            child_context.clone(),
+        ];
         assert!(predicate.eval(&contexts));
 
         let other_context = KeyContext::try_from("other").unwrap();
@@ -676,17 +779,23 @@ mod tests {
         let editor_context = KeyContext::try_from("Editor").unwrap();
 
         // Workspace > Pane > Editor
-        let workspace_pane_editor = vec![workspace_context.clone(), pane_context.clone(), editor_context.clone()];
+        let workspace_pane_editor = vec![
+            workspace_context.clone(),
+            pane_context.clone(),
+            editor_context.clone(),
+        ];
 
         // Pane > (Pane > Editor) - should not match
         let pane_pane_editor = KeyBindingContextPredicate::parse("Pane > (Pane > Editor)").unwrap();
         assert!(!pane_pane_editor.eval(&workspace_pane_editor));
 
-        let workspace_pane_editor_predicate = KeyBindingContextPredicate::parse("Workspace > Pane > Editor").unwrap();
+        let workspace_pane_editor_predicate =
+            KeyBindingContextPredicate::parse("Workspace > Pane > Editor").unwrap();
         assert!(workspace_pane_editor_predicate.eval(&workspace_pane_editor));
 
         // (Pane > Pane) > Editor - should not match
-        let pane_pane_then_editor = KeyBindingContextPredicate::parse("(Pane > Pane) > Editor").unwrap();
+        let pane_pane_then_editor =
+            KeyBindingContextPredicate::parse("(Pane > Pane) > Editor").unwrap();
         assert!(!pane_pane_then_editor.eval(&workspace_pane_editor));
 
         // Pane > !Workspace - should match
@@ -700,5 +809,83 @@ mod tests {
         assert!(not_workspace.eval(slice::from_ref(&pane_context)));
         assert!(not_workspace.eval(slice::from_ref(&editor_context)));
         assert!(!not_workspace.eval(&workspace_pane_editor));
+    }
+
+    // MARK: - Display
+
+    #[test]
+    fn test_context_display() {
+        fn ident(s: &str) -> Box<KeyBindingContextPredicate> {
+            Box::new(Identifier(SharedString::new(s)))
+        }
+        fn eq(a: &str, b: &str) -> Box<KeyBindingContextPredicate> {
+            Box::new(Equal(SharedString::new(a), SharedString::new(b)))
+        }
+        fn not_eq(a: &str, b: &str) -> Box<KeyBindingContextPredicate> {
+            Box::new(NotEqual(SharedString::new(a), SharedString::new(b)))
+        }
+        fn and(
+            a: Box<KeyBindingContextPredicate>,
+            b: Box<KeyBindingContextPredicate>,
+        ) -> Box<KeyBindingContextPredicate> {
+            Box::new(And(a, b))
+        }
+        fn or(
+            a: Box<KeyBindingContextPredicate>,
+            b: Box<KeyBindingContextPredicate>,
+        ) -> Box<KeyBindingContextPredicate> {
+            Box::new(Or(a, b))
+        }
+        fn descendant(
+            a: Box<KeyBindingContextPredicate>,
+            b: Box<KeyBindingContextPredicate>,
+        ) -> Box<KeyBindingContextPredicate> {
+            Box::new(Descendant(a, b))
+        }
+        fn not(a: Box<KeyBindingContextPredicate>) -> Box<KeyBindingContextPredicate> {
+            Box::new(Not(a))
+        }
+
+        let test_cases = [
+            (ident("a"), "a"),
+            (eq("a", "b"), "a == b"),
+            (not_eq("a", "b"), "a != b"),
+            (descendant(ident("a"), ident("b")), "a > b"),
+            (not(ident("a")), "!a"),
+            (not_eq("a", "b"), "a != b"),
+            (descendant(ident("a"), ident("b")), "a > b"),
+            (not(and(ident("a"), ident("b"))), "!(a && b)"),
+            (not(or(ident("a"), ident("b"))), "!(a || b)"),
+            (and(ident("a"), ident("b")), "a && b"),
+            (and(and(ident("a"), ident("b")), ident("c")), "a && b && c"),
+            (or(ident("a"), ident("b")), "a || b"),
+            (or(or(ident("a"), ident("b")), ident("c")), "a || b || c"),
+            (or(ident("a"), and(ident("b"), ident("c"))), "a || (b && c)"),
+            (
+                and(
+                    and(
+                        and(ident("a"), eq("b", "c")),
+                        not(descendant(ident("d"), ident("e"))),
+                    ),
+                    eq("f", "g"),
+                ),
+                "a && b == c && !(d > e) && f == g",
+            ),
+            (
+                and(and(ident("a"), or(ident("b"), ident("c"))), ident("d")),
+                "a && (b || c) && d",
+            ),
+            (
+                or(or(ident("a"), and(ident("b"), ident("c"))), ident("d")),
+                "a || (b && c) || d",
+            ),
+        ];
+
+        for (predicate, expected) in test_cases {
+            let actual = predicate.to_string();
+            assert_eq!(actual, expected);
+            let parsed = KeyBindingContextPredicate::parse(&actual).unwrap();
+            assert_eq!(parsed, *predicate);
+        }
     }
 }

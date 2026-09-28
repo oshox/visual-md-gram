@@ -1,5 +1,8 @@
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
-use gpui::{App, Context, DismissEvent, Entity, EventEmitter, Focusable, Render, Task, WeakEntity, Window, actions};
+use gpui::{
+    App, Context, DismissEvent, Entity, EventEmitter, Focusable, Render, Task, WeakEntity, Window,
+    actions,
+};
 use picker::{Picker, PickerDelegate};
 use project::Fs;
 use settings::{BaseKeymap, Settings, update_settings_file};
@@ -9,7 +12,7 @@ use util::ResultExt;
 use workspace::{ModalView, Workspace, ui::HighlightedLabel};
 
 actions!(
-    gram,
+    zed,
     [
         /// Toggles the base keymap selector modal.
         ToggleBaseKeymapSelector
@@ -65,7 +68,7 @@ impl BaseKeymapSelector {
 
 impl Render for BaseKeymapSelector {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().w(rems(34.)).child(self.picker.clone())
+        v_flex().child(self.picker.clone())
     }
 }
 
@@ -77,7 +80,11 @@ pub struct BaseKeymapSelectorDelegate {
 }
 
 impl BaseKeymapSelectorDelegate {
-    fn new(selector: WeakEntity<BaseKeymapSelector>, fs: Arc<dyn Fs>, cx: &mut Context<BaseKeymapSelector>) -> Self {
+    fn new(
+        selector: WeakEntity<BaseKeymapSelector>,
+        fs: Arc<dyn Fs>,
+        cx: &mut Context<BaseKeymapSelector>,
+    ) -> Self {
         let base = BaseKeymap::get(None, cx);
         let selected_index = BaseKeymap::OPTIONS
             .iter()
@@ -94,6 +101,10 @@ impl BaseKeymapSelectorDelegate {
 
 impl PickerDelegate for BaseKeymapSelectorDelegate {
     type ListItem = ui::ListItem;
+
+    fn name() -> &'static str {
+        "base keymap selector"
+    }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Select a base keymap...".into()
@@ -141,7 +152,16 @@ impl PickerDelegate for BaseKeymapSelectorDelegate {
                     })
                     .collect()
             } else {
-                match_strings(&candidates, &query, false, true, 100, &Default::default(), background).await
+                match_strings(
+                    &candidates,
+                    &query,
+                    false,
+                    true,
+                    100,
+                    &Default::default(),
+                    background,
+                )
+                .await
             };
 
             this.update(cx, |this, _| {
@@ -155,15 +175,24 @@ impl PickerDelegate for BaseKeymapSelectorDelegate {
         })
     }
 
-    fn confirm(&mut self, _: bool, _: &mut Window, cx: &mut Context<Picker<BaseKeymapSelectorDelegate>>) {
+    fn confirm(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        cx: &mut Context<Picker<BaseKeymapSelectorDelegate>>,
+    ) {
         if let Some(selection) = self.matches.get(self.selected_index) {
             let base_keymap = BaseKeymap::from_names(&selection.string);
 
-            update_settings_file(
-                self.fs.clone(),
-                cx,
-                Box::new(move |setting, _| setting.base_keymap = Some(base_keymap.into())),
+            telemetry::event!(
+                "Settings Changed",
+                setting = "keymap",
+                value = base_keymap.to_string()
             );
+
+            update_settings_file(self.fs.clone(), cx, move |setting, _| {
+                setting.base_keymap = Some(base_keymap.into())
+            });
         }
 
         self.selector
@@ -178,7 +207,7 @@ impl PickerDelegate for BaseKeymapSelectorDelegate {
             .update(cx, |_, cx| {
                 cx.emit(DismissEvent);
             })
-            .log_err();
+            .ok();
     }
 
     fn render_match(

@@ -1,17 +1,16 @@
 pub mod running;
 
-use crate::{StackTraceView, persistence::SerializedLayout, session::running::DebugTerminal};
+use crate::{persistence::SerializedLayout, session::running::DebugTerminal};
 use dap::client::SessionId;
 use gpui::{App, Axis, Entity, EventEmitter, FocusHandle, Focusable, Task, WeakEntity};
 use project::debugger::session::Session;
-use project::worktree_store::WorktreeStore;
+
 use project::{Project, debugger::session::SessionQuirks};
 use rpc::proto;
 use running::RunningState;
-use std::cell::OnceCell;
 use ui::prelude::*;
 use workspace::{
-    FollowableItem, ViewId, Workspace,
+    CollaboratorId, FollowableItem, ViewId, Workspace,
     item::{self, Item},
 };
 
@@ -19,9 +18,6 @@ pub struct DebugSession {
     remote_id: Option<workspace::ViewId>,
     pub(crate) running_state: Entity<RunningState>,
     pub(crate) quirks: SessionQuirks,
-    stack_trace_view: OnceCell<Entity<StackTraceView>>,
-    _worktree_store: WeakEntity<WorktreeStore>,
-    workspace: WeakEntity<Workspace>,
 }
 
 impl DebugSession {
@@ -49,13 +45,10 @@ impl DebugSession {
         });
         let quirks = session.read(cx).quirks();
 
-        cx.new(|cx| Self {
+        cx.new(|_| Self {
             remote_id: None,
             running_state,
             quirks,
-            stack_trace_view: OnceCell::new(),
-            _worktree_store: project.read(cx).worktree_store().downgrade(),
-            workspace,
         })
     }
 
@@ -63,28 +56,13 @@ impl DebugSession {
         self.running_state.read(cx).session_id()
     }
 
-    pub(crate) fn stack_trace_view(
-        &mut self,
-        project: &Entity<Project>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> &Entity<StackTraceView> {
-        let workspace = self.workspace.clone();
-        let running_state = self.running_state.clone();
-
-        self.stack_trace_view.get_or_init(|| {
-            let stackframe_list = running_state.read(cx).stack_frame_list().clone();
-
-            cx.new(|cx| StackTraceView::new(workspace.clone(), project.clone(), stackframe_list, window, cx))
-        })
-    }
-
     pub fn session(&self, cx: &App) -> Entity<Session> {
         self.running_state.read(cx).session().clone()
     }
 
     pub(crate) fn shutdown(&mut self, cx: &mut Context<Self>) {
-        self.running_state.update(cx, |state, cx| state.shutdown(cx));
+        self.running_state
+            .update(cx, |state, cx| state.shutdown(cx));
     }
 
     pub(crate) fn label(&self, cx: &mut App) -> Option<SharedString> {
@@ -132,7 +110,7 @@ impl FollowableItem for DebugSession {
         self.remote_id
     }
 
-    fn to_state_proto(&self, _window: &Window, _cx: &App) -> Option<proto::view::Variant> {
+    fn to_state_proto(&self, _window: &mut Window, _cx: &mut App) -> Option<proto::view::Variant> {
         None
     }
 
@@ -150,8 +128,8 @@ impl FollowableItem for DebugSession {
         &self,
         _event: &Self::Event,
         _update: &mut Option<proto::update_view::Variant>,
-        _window: &Window,
-        _cx: &App,
+        _window: &mut Window,
+        _cx: &mut App,
     ) -> bool {
         // update.get_or_insert_with(|| proto::update_view::Variant::DebugPanel(Default::default()));
 
@@ -166,6 +144,18 @@ impl FollowableItem for DebugSession {
         _cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<()>> {
         Task::ready(Ok(()))
+    }
+
+    fn set_leader_id(
+        &mut self,
+        _leader_id: Option<CollaboratorId>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn to_follow_event(_event: &Self::Event) -> Option<workspace::item::FollowEvent> {
+        None
     }
 
     fn dedup(&self, existing: &Self, _window: &Window, cx: &App) -> Option<workspace::item::Dedup> {

@@ -1,24 +1,29 @@
 [package]
 name = "which_key"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
 
 [lib]
-doctest = false
 path = "src/which_key.rs"
-test = false
+doctest = false
 
 [dependencies]
 command_palette.workspace = true
 gpui.workspace = true
 settings.workspace = true
-theme.workspace = true
+theme_settings.workspace = true
 ui.workspace = true
 util.workspace = true
+vim_mode_setting.workspace = true
 workspace.workspace = true
+zed_actions.workspace = true
 
-[lints]
-workspace = true
+[dev-dependencies]
+collections.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+theme.workspace = true

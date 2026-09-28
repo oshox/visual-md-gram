@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-curl --user krig:"$TOKEN" --upload-file "$DEB_FILE" https://codeberg.org/api/packages/GramEditor/debian/pool/gram/release/upload
-curl --user krig:"$TOKEN" --upload-file "$RPM_FILE" https://codeberg.org/api/packages/GramEditor/rpm/upload

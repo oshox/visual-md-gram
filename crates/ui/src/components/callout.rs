@@ -3,7 +3,7 @@ use gpui::AnyElement;
 use crate::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BorderPosition {
+pub enum CalloutBorderPosition {
     Top,
     Bottom,
 }
@@ -19,9 +19,9 @@ pub enum BorderPosition {
 /// let callout = Callout::new()
 ///     .severity(Severity::Warning)
 ///     .icon(IconName::Warning)
-///     .title("Installing Language Extensions")
-///     .description("Installing Wasm extensions requires rustup to be installed.")
-///     .actions_slot(Button::new("got-it", "Got it"));
+///     .title("Be aware of your subscription!")
+///     .description("Your subscription is about to expire. Renew now!")
+///     .actions_slot(Button::new("renew", "Renew Now"));
 /// ```
 ///
 #[derive(IntoElement, RegisterComponent)]
@@ -34,7 +34,8 @@ pub struct Callout {
     actions_slot: Option<AnyElement>,
     dismiss_action: Option<AnyElement>,
     line_height: Option<Pixels>,
-    border_position: BorderPosition,
+    border_position: CalloutBorderPosition,
+    scrollable_description: bool,
 }
 
 impl Callout {
@@ -49,7 +50,8 @@ impl Callout {
             actions_slot: None,
             dismiss_action: None,
             line_height: None,
-            border_position: BorderPosition::Top,
+            border_position: CalloutBorderPosition::Top,
+            scrollable_description: true,
         }
     }
 
@@ -75,6 +77,12 @@ impl Callout {
     /// The description can be single or multi-line text.
     pub fn description(mut self, description: impl Into<SharedString>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Disable internal scrolling when a surrounding container scrolls the entire callout.
+    pub fn scrollable_description(mut self, scrollable: bool) -> Self {
+        self.scrollable_description = scrollable;
         self
     }
 
@@ -105,7 +113,7 @@ impl Callout {
     }
 
     /// Sets the border position in the callout.
-    pub fn border_position(mut self, border_position: BorderPosition) -> Self {
+    pub fn border_position(mut self, border_position: CalloutBorderPosition) -> Self {
         self.border_position = border_position;
         self
     }
@@ -121,7 +129,7 @@ impl RenderOnce for Callout {
             Severity::Info => (
                 IconName::Info,
                 Color::Muted,
-                cx.theme().colors().panel_background.opacity(0.),
+                cx.theme().status().info_background.opacity(0.1),
             ),
             Severity::Success => (
                 IconName::Check,
@@ -133,7 +141,11 @@ impl RenderOnce for Callout {
                 Color::Warning,
                 cx.theme().status().warning_background.opacity(0.2),
             ),
-            Severity::Error => (IconName::XCircle, Color::Error, cx.theme().status().error.opacity(0.08)),
+            Severity::Error => (
+                IconName::XCircle,
+                Color::Error,
+                cx.theme().status().error.opacity(0.08),
+            ),
         };
 
         h_flex()
@@ -143,8 +155,8 @@ impl RenderOnce for Callout {
             .gap_2()
             .items_start()
             .map(|this| match self.border_position {
-                BorderPosition::Top => this.border_t_1(),
-                BorderPosition::Bottom => this.border_b_1(),
+                CalloutBorderPosition::Top => this.border_t_1(),
+                CalloutBorderPosition::Bottom => this.border_b_1(),
             })
             .border_color(cx.theme().colors().border)
             .bg(bg_color)
@@ -170,14 +182,23 @@ impl RenderOnce for Callout {
                             .justify_between()
                             .flex_wrap()
                             .when_some(self.title, |this, title| {
-                                this.child(h_flex().child(Label::new(title).size(LabelSize::Small)))
+                                this.child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .child(Label::new(title).size(LabelSize::Small)),
+                                )
                             })
                             .when(has_actions, |this| {
                                 this.child(
                                     h_flex()
                                         .gap_0p5()
-                                        .when_some(self.actions_slot, |this, action| this.child(action))
-                                        .when_some(self.dismiss_action, |this, action| this.child(action)),
+                                        .when_some(self.actions_slot, |this, action| {
+                                            this.child(action)
+                                        })
+                                        .when_some(self.dismiss_action, |this, action| {
+                                            this.child(action)
+                                        }),
                                 )
                             }),
                     )
@@ -185,9 +206,9 @@ impl RenderOnce for Callout {
                         let base_desc_container = div()
                             .id("callout-description-slot")
                             .w_full()
-                            .max_h_32()
-                            .flex_1()
-                            .overflow_y_scroll()
+                            .when(self.scrollable_description, |this| {
+                                this.max_h_32().flex_1().overflow_y_scroll()
+                            })
                             .text_ui_sm(cx);
 
                         if let Some(description_slot) = self.description_slot {
@@ -211,13 +232,14 @@ impl Component for Callout {
         ComponentScope::DataDisplay
     }
 
-    fn description() -> Option<&'static str> {
-        Some(
-            "Used to display a callout for situations where the user needs to know some information, and likely make a decision.",
-        )
+    fn description() -> &'static str {
+        "Used to display a callout for situations where the user \
+        needs to know some information, and likely make a decision. \
+        This might be a thread running out of tokens, \
+        or running out of prompts on a plan and needing to upgrade."
     }
 
-    fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
+    fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
         let single_action = || Button::new("got-it", "Got it").label_size(LabelSize::Small);
         let multiple_actions = || {
             h_flex()
@@ -231,7 +253,7 @@ impl Component for Callout {
                 "Simple with Title Only",
                 Callout::new()
                     .icon(IconName::Info)
-                    .title("Installing Wasm extensions require rustup to be installed.")
+                    .title("System maintenance scheduled for tonight")
                     .actions_slot(single_action())
                     .into_any_element(),
             )
@@ -252,8 +274,8 @@ impl Component for Callout {
                 "Error with Multiple Actions",
                 Callout::new()
                     .icon(IconName::Close)
-                    .title("WASI SDK Installation")
-                    .description("Compatible cargo installation found. Install WASI SDK or WASI sysroot to build Wasm extension?")
+                    .title("Thread reached the token limit")
+                    .description("Start a new thread from a summary to continue the conversation.")
                     .actions_slot(multiple_actions())
                     .into_any_element(),
             )
@@ -261,9 +283,9 @@ impl Component for Callout {
             single_example(
                 "Multi-line Description",
                 Callout::new()
-                    .icon(IconName::ServerCrash)
-                    .title("There is no subscription")
-                    .description("Gram is\n- Open Source\n- Community-maintained\n- Free as in speech AND beer")
+                    .icon(IconName::Sparkle)
+                    .title("Upgrade to Pro")
+                    .description("• Unlimited threads\n• Priority support\n• Advanced analytics")
                     .actions_slot(multiple_actions())
                     .into_any_element(),
             )
@@ -273,12 +295,25 @@ impl Component for Callout {
                 Callout::new()
                     .severity(Severity::Error)
                     .icon(IconName::XCircle)
-                    .title("Don't be fooled")
+                    .title("Very Long API Error Description")
                     .description_slot(
                         v_flex().gap_1().children(
                             [
-                                "Your current quota is limited only by your imagination.",
+                                "You exceeded your current quota.",
                                 "For more information, visit the docs.",
+                                "Error details:",
+                                "• Quota exceeded for metric",
+                                "• Limit: 0",
+                                "• Model: gemini-3.1-pro",
+                                "Please retry in 26.33s.",
+                                "Additional details:",
+                                "- Request ID: abc123def456",
+                                "- Timestamp: 2024-01-15T10:30:00Z",
+                                "- Region: us-central1",
+                                "- Service: generativelanguage.googleapis.com",
+                                "- Error Code: RESOURCE_EXHAUSTED",
+                                "- Retry After: 26s",
+                                "This error occurs when you have exceeded your API quota.",
                             ]
                             .into_iter()
                             .map(|t| Label::new(t).size(LabelSize::Small).color(Color::Muted)),
@@ -328,12 +363,10 @@ impl Component for Callout {
             ),
         ];
 
-        Some(
-            v_flex()
-                .gap_4()
-                .child(example_group(basic_examples).vertical())
-                .child(example_group_with_title("Severity", severity_examples).vertical())
-                .into_any_element(),
-        )
+        v_flex()
+            .gap_4()
+            .child(example_group(basic_examples).vertical())
+            .child(example_group_with_title("Severity", severity_examples).vertical())
+            .into_any_element()
     }
 }

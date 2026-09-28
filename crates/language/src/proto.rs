@@ -1,6 +1,9 @@
 //! Handles conversions of `language` items to and from the [`rpc`] protocol.
 
-use crate::{CursorShape, Diagnostic, DiagnosticSourceKind, diagnostic_set::DiagnosticEntry};
+use crate::{
+    CursorShape, Diagnostic, DiagnosticMessage, DiagnosticSourceKind,
+    diagnostic_set::DiagnosticEntry,
+};
 use anyhow::{Context as _, Result};
 use clock::ReplicaId;
 use gpui::SharedString;
@@ -83,12 +86,14 @@ pub fn serialize_operation(operation: &crate::Operation) -> proto::Operation {
                 triggers,
                 lamport_timestamp,
                 server_id,
-            } => proto::operation::Variant::UpdateCompletionTriggers(proto::operation::UpdateCompletionTriggers {
-                replica_id: lamport_timestamp.replica_id.as_u16() as u32,
-                lamport_timestamp: lamport_timestamp.value,
-                triggers: triggers.clone(),
-                language_server_id: server_id.to_proto(),
-            }),
+            } => proto::operation::Variant::UpdateCompletionTriggers(
+                proto::operation::UpdateCompletionTriggers {
+                    replica_id: lamport_timestamp.replica_id.as_u16() as u32,
+                    lamport_timestamp: lamport_timestamp.value,
+                    triggers: triggers.clone(),
+                    language_server_id: server_id.to_proto(),
+                },
+            ),
 
             crate::Operation::UpdateLineEnding {
                 line_ending,
@@ -109,12 +114,18 @@ pub fn serialize_edit_operation(operation: &EditOperation) -> proto::operation::
         lamport_timestamp: operation.timestamp.value,
         version: serialize_version(&operation.version),
         ranges: operation.ranges.iter().map(serialize_range).collect(),
-        new_text: operation.new_text.iter().map(|text| text.to_string()).collect(),
+        new_text: operation
+            .new_text
+            .iter()
+            .map(|text| text.to_string())
+            .collect(),
     }
 }
 
 /// Serializes an entry in the undo map to be sent over RPC.
-pub fn serialize_undo_map_entry((edit_id, counts): (&clock::Lamport, &[(clock::Lamport, u32)])) -> proto::UndoMapEntry {
+pub fn serialize_undo_map_entry(
+    (edit_id, counts): (&clock::Lamport, &[(clock::Lamport, u32)]),
+) -> proto::UndoMapEntry {
     proto::UndoMapEntry {
         replica_id: edit_id.replica_id.as_u16() as u32,
         local_timestamp: edit_id.value,
@@ -130,7 +141,9 @@ pub fn serialize_undo_map_entry((edit_id, counts): (&clock::Lamport, &[(clock::L
 }
 
 /// Splits the given list of operations into chunks.
-pub fn split_operations(mut operations: Vec<proto::Operation>) -> impl Iterator<Item = Vec<proto::Operation>> {
+pub fn split_operations(
+    mut operations: Vec<proto::Operation>,
+) -> impl Iterator<Item = Vec<proto::Operation>> {
     #[cfg(any(test, feature = "test-support"))]
     const CHUNK_SIZE: usize = 5;
 
@@ -164,11 +177,11 @@ pub fn serialize_selection(selection: &Selection<Anchor>) -> proto::Selection {
         id: selection.id as u64,
         start: Some(proto::EditorAnchor {
             anchor: Some(serialize_anchor(&selection.start)),
-            excerpt_id: 0,
+            excerpt_id: None,
         }),
         end: Some(proto::EditorAnchor {
             anchor: Some(serialize_anchor(&selection.end)),
-            excerpt_id: 0,
+            excerpt_id: None,
         }),
         reversed: selection.reversed,
     }
@@ -200,48 +213,67 @@ pub fn serialize_diagnostics<'a>(
 ) -> Vec<proto::Diagnostic> {
     diagnostics
         .into_iter()
-        .map(|entry| proto::Diagnostic {
-            source: entry.diagnostic.source.clone(),
-            source_kind: match entry.diagnostic.source_kind {
-                DiagnosticSourceKind::Pulled => proto::diagnostic::SourceKind::Pulled,
-                DiagnosticSourceKind::Pushed => proto::diagnostic::SourceKind::Pushed,
-                DiagnosticSourceKind::Other => proto::diagnostic::SourceKind::Other,
-            } as i32,
-            start: Some(serialize_anchor(&entry.range.start)),
-            end: Some(serialize_anchor(&entry.range.end)),
-            message: entry.diagnostic.message.clone(),
-            markdown: entry.diagnostic.markdown.clone(),
-            severity: match entry.diagnostic.severity {
-                DiagnosticSeverity::ERROR => proto::diagnostic::Severity::Error,
-                DiagnosticSeverity::WARNING => proto::diagnostic::Severity::Warning,
-                DiagnosticSeverity::INFORMATION => proto::diagnostic::Severity::Information,
-                DiagnosticSeverity::HINT => proto::diagnostic::Severity::Hint,
-                _ => proto::diagnostic::Severity::None,
-            } as i32,
-            group_id: entry.diagnostic.group_id as u64,
-            is_primary: entry.diagnostic.is_primary,
-            underline: entry.diagnostic.underline,
-            code: entry.diagnostic.code.as_ref().map(|s| s.to_string()),
-            code_description: entry.diagnostic.code_description.as_ref().map(|s| s.to_string()),
-            is_disk_based: entry.diagnostic.is_disk_based,
-            is_unnecessary: entry.diagnostic.is_unnecessary,
-            data: entry.diagnostic.data.as_ref().map(|data| data.to_string()),
-            registration_id: entry.diagnostic.registration_id.as_ref().map(ToString::to_string),
+        .map(|entry| {
+            let lsp_markup = entry.diagnostic.message.lsp_markup();
+            proto::Diagnostic {
+                source: entry.diagnostic.source.clone(),
+                source_kind: match entry.diagnostic.source_kind {
+                    DiagnosticSourceKind::Pulled => proto::diagnostic::SourceKind::Pulled,
+                    DiagnosticSourceKind::Pushed => proto::diagnostic::SourceKind::Pushed,
+                    DiagnosticSourceKind::Other => proto::diagnostic::SourceKind::Other,
+                } as i32,
+                start: Some(serialize_anchor(&entry.range.start)),
+                end: Some(serialize_anchor(&entry.range.end)),
+                message: entry.diagnostic.message.to_string(),
+                markdown: match lsp_markup {
+                    Some(_) => None,
+                    None => entry.diagnostic.message.markdown().map(ToOwned::to_owned),
+                },
+                markup_message_kind: lsp_markup.map(|(kind, _)| serialize_markup_kind(kind) as i32),
+                untrimmed_markup_message: lsp_markup.and_then(|(_, value)| {
+                    (value != entry.diagnostic.message.as_str()).then(|| value.to_string())
+                }),
+                severity: match entry.diagnostic.severity {
+                    DiagnosticSeverity::ERROR => proto::diagnostic::Severity::Error,
+                    DiagnosticSeverity::WARNING => proto::diagnostic::Severity::Warning,
+                    DiagnosticSeverity::INFORMATION => proto::diagnostic::Severity::Information,
+                    DiagnosticSeverity::HINT => proto::diagnostic::Severity::Hint,
+                    _ => proto::diagnostic::Severity::None,
+                } as i32,
+                group_id: entry.diagnostic.group_id as u64,
+                is_primary: entry.diagnostic.is_primary,
+                underline: entry.diagnostic.underline,
+                code: entry.diagnostic.code.as_ref().map(|s| s.to_string()),
+                code_description: entry
+                    .diagnostic
+                    .code_description
+                    .as_ref()
+                    .map(|s| s.to_string()),
+                is_disk_based: entry.diagnostic.is_disk_based,
+                is_unnecessary: entry.diagnostic.is_unnecessary,
+                data: entry.diagnostic.data.as_ref().map(|data| data.to_string()),
+                registration_id: entry
+                    .diagnostic
+                    .registration_id
+                    .as_ref()
+                    .map(ToString::to_string),
+            }
         })
         .collect()
 }
 
 /// Serializes an [`Anchor`] to be sent over RPC.
 pub fn serialize_anchor(anchor: &Anchor) -> proto::Anchor {
+    let timestamp = anchor.timestamp();
     proto::Anchor {
-        replica_id: anchor.timestamp.replica_id.as_u16() as u32,
-        timestamp: anchor.timestamp.value,
+        replica_id: timestamp.replica_id.as_u16() as u32,
+        timestamp: timestamp.value,
         offset: anchor.offset as u64,
         bias: match anchor.bias {
             Bias::Left => proto::Bias::Left as i32,
             Bias::Right => proto::Bias::Right as i32,
         },
-        buffer_id: anchor.buffer_id.map(Into::into),
+        buffer_id: Some(anchor.buffer_id.into()),
     }
 }
 
@@ -263,83 +295,97 @@ pub fn deserialize_anchor_range(range: proto::AnchorRange) -> Result<Range<Ancho
 // This behavior is currently copied in the collab database, for snapshotting channel notes
 /// Deserializes an [`crate::Operation`] from the RPC representation.
 pub fn deserialize_operation(message: proto::Operation) -> Result<crate::Operation> {
-    Ok(match message.variant.context("missing operation variant")? {
-        proto::operation::Variant::Edit(edit) => {
-            crate::Operation::Buffer(text::Operation::Edit(deserialize_edit_operation(edit)))
-        }
-        proto::operation::Variant::Undo(undo) => crate::Operation::Buffer(text::Operation::Undo(UndoOperation {
-            timestamp: clock::Lamport {
-                replica_id: ReplicaId::new(undo.replica_id as u16),
-                value: undo.lamport_timestamp,
-            },
-            version: deserialize_version(&undo.version),
-            counts: undo
-                .counts
-                .into_iter()
-                .map(|c| {
-                    (
-                        clock::Lamport {
-                            replica_id: ReplicaId::new(c.replica_id as u16),
-                            value: c.lamport_timestamp,
-                        },
-                        c.count,
-                    )
-                })
-                .collect(),
-        })),
-        proto::operation::Variant::UpdateSelections(message) => {
-            let selections = message
-                .selections
-                .into_iter()
-                .filter_map(|selection| {
-                    Some(Selection {
-                        id: selection.id as usize,
-                        start: deserialize_anchor(selection.start?.anchor?)?,
-                        end: deserialize_anchor(selection.end?.anchor?)?,
-                        reversed: selection.reversed,
-                        goal: SelectionGoal::None,
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            crate::Operation::UpdateSelections {
-                lamport_timestamp: clock::Lamport {
-                    replica_id: ReplicaId::new(message.replica_id as u16),
-                    value: message.lamport_timestamp,
-                },
-                selections: Arc::from(selections),
-                line_mode: message.line_mode,
-                cursor_shape: deserialize_cursor_shape(
-                    proto::CursorShape::try_from(message.cursor_shape).context("Missing cursor shape")?,
-                ),
+    Ok(
+        match message.variant.context("missing operation variant")? {
+            proto::operation::Variant::Edit(edit) => {
+                crate::Operation::Buffer(text::Operation::Edit(deserialize_edit_operation(edit)))
             }
-        }
-        proto::operation::Variant::UpdateDiagnostics(message) => crate::Operation::UpdateDiagnostics {
-            lamport_timestamp: clock::Lamport {
-                replica_id: ReplicaId::new(message.replica_id as u16),
-                value: message.lamport_timestamp,
-            },
-            server_id: LanguageServerId(message.server_id as usize),
-            diagnostics: deserialize_diagnostics(message.diagnostics),
+            proto::operation::Variant::Undo(undo) => {
+                crate::Operation::Buffer(text::Operation::Undo(UndoOperation {
+                    timestamp: clock::Lamport {
+                        replica_id: ReplicaId::new(undo.replica_id as u16),
+                        value: undo.lamport_timestamp,
+                    },
+                    version: deserialize_version(&undo.version),
+                    counts: undo
+                        .counts
+                        .into_iter()
+                        .map(|c| {
+                            (
+                                clock::Lamport {
+                                    replica_id: ReplicaId::new(c.replica_id as u16),
+                                    value: c.lamport_timestamp,
+                                },
+                                c.count,
+                            )
+                        })
+                        .collect(),
+                }))
+            }
+            proto::operation::Variant::UpdateSelections(message) => {
+                let selections = message
+                    .selections
+                    .into_iter()
+                    .filter_map(|selection| {
+                        Some(Selection {
+                            id: selection.id as usize,
+                            start: deserialize_anchor(selection.start?.anchor?)?,
+                            end: deserialize_anchor(selection.end?.anchor?)?,
+                            reversed: selection.reversed,
+                            goal: SelectionGoal::None,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                crate::Operation::UpdateSelections {
+                    lamport_timestamp: clock::Lamport {
+                        replica_id: ReplicaId::new(message.replica_id as u16),
+                        value: message.lamport_timestamp,
+                    },
+                    selections: Arc::from(selections),
+                    line_mode: message.line_mode,
+                    cursor_shape: deserialize_cursor_shape(
+                        proto::CursorShape::try_from(message.cursor_shape)
+                            .ok()
+                            .context("Missing cursor shape")?,
+                    ),
+                }
+            }
+            proto::operation::Variant::UpdateDiagnostics(message) => {
+                crate::Operation::UpdateDiagnostics {
+                    lamport_timestamp: clock::Lamport {
+                        replica_id: ReplicaId::new(message.replica_id as u16),
+                        value: message.lamport_timestamp,
+                    },
+                    server_id: LanguageServerId(message.server_id as usize),
+                    diagnostics: deserialize_diagnostics(message.diagnostics),
+                }
+            }
+            proto::operation::Variant::UpdateCompletionTriggers(message) => {
+                crate::Operation::UpdateCompletionTriggers {
+                    triggers: message.triggers,
+                    lamport_timestamp: clock::Lamport {
+                        replica_id: ReplicaId::new(message.replica_id as u16),
+                        value: message.lamport_timestamp,
+                    },
+                    server_id: LanguageServerId::from_proto(message.language_server_id),
+                }
+            }
+            proto::operation::Variant::UpdateLineEnding(message) => {
+                crate::Operation::UpdateLineEnding {
+                    lamport_timestamp: clock::Lamport {
+                        replica_id: ReplicaId::new(message.replica_id as u16),
+                        value: message.lamport_timestamp,
+                    },
+                    line_ending: deserialize_line_ending(
+                        proto::LineEnding::try_from(message.line_ending)
+                            .ok()
+                            .context("missing line_ending")?,
+                    ),
+                }
+            }
         },
-        proto::operation::Variant::UpdateCompletionTriggers(message) => crate::Operation::UpdateCompletionTriggers {
-            triggers: message.triggers,
-            lamport_timestamp: clock::Lamport {
-                replica_id: ReplicaId::new(message.replica_id as u16),
-                value: message.lamport_timestamp,
-            },
-            server_id: LanguageServerId::from_proto(message.language_server_id),
-        },
-        proto::operation::Variant::UpdateLineEnding(message) => crate::Operation::UpdateLineEnding {
-            lamport_timestamp: clock::Lamport {
-                replica_id: ReplicaId::new(message.replica_id as u16),
-                value: message.lamport_timestamp,
-            },
-            line_ending: deserialize_line_ending(
-                proto::LineEnding::try_from(message.line_ending).context("missing line_ending")?,
-            ),
-        },
-    })
+    )
 }
 
 /// Deserializes an [`EditOperation`] from the RPC representation.
@@ -356,7 +402,9 @@ pub fn deserialize_edit_operation(edit: proto::operation::Edit) -> EditOperation
 }
 
 /// Deserializes an entry in the undo map from the RPC representation.
-pub fn deserialize_undo_map_entry(entry: proto::UndoMapEntry) -> (clock::Lamport, Vec<(clock::Lamport, u32)>) {
+pub fn deserialize_undo_map_entry(
+    entry: proto::UndoMapEntry,
+) -> (clock::Lamport, Vec<(clock::Lamport, u32)>) {
     (
         clock::Lamport {
             replica_id: ReplicaId::new(entry.replica_id as u16),
@@ -380,7 +428,10 @@ pub fn deserialize_undo_map_entry(entry: proto::UndoMapEntry) -> (clock::Lamport
 
 /// Deserializes selections from the RPC representation.
 pub fn deserialize_selections(selections: Vec<proto::Selection>) -> Arc<[Selection<Anchor>]> {
-    selections.into_iter().filter_map(deserialize_selection).collect()
+    selections
+        .into_iter()
+        .filter_map(deserialize_selection)
+        .collect()
 }
 
 /// Deserializes a [`Selection`] from the RPC representation.
@@ -394,8 +445,24 @@ pub fn deserialize_selection(selection: proto::Selection) -> Option<Selection<An
     })
 }
 
+pub fn serialize_markup_kind(kind: &lsp::MarkupKind) -> proto::MarkupKind {
+    match kind {
+        lsp::MarkupKind::PlainText => proto::MarkupKind::PlainText,
+        lsp::MarkupKind::Markdown => proto::MarkupKind::Markdown,
+    }
+}
+
+pub fn deserialize_markup_kind(kind: i32) -> Option<lsp::MarkupKind> {
+    match proto::MarkupKind::try_from(kind).ok()? {
+        proto::MarkupKind::PlainText => Some(lsp::MarkupKind::PlainText),
+        proto::MarkupKind::Markdown => Some(lsp::MarkupKind::Markdown),
+    }
+}
+
 /// Deserializes a list of diagnostics from the RPC representation.
-pub fn deserialize_diagnostics(diagnostics: Vec<proto::Diagnostic>) -> Arc<[DiagnosticEntry<Anchor>]> {
+pub fn deserialize_diagnostics(
+    diagnostics: Vec<proto::Diagnostic>,
+) -> Arc<[DiagnosticEntry<Anchor>]> {
     diagnostics
         .into_iter()
         .filter_map(|diagnostic| {
@@ -404,35 +471,57 @@ pub fn deserialize_diagnostics(diagnostics: Vec<proto::Diagnostic>) -> Arc<[Diag
             } else {
                 None
             };
-            Some(DiagnosticEntry {
-                range: deserialize_anchor(diagnostic.start?)?..deserialize_anchor(diagnostic.end?)?,
-                diagnostic: Diagnostic {
+            let message = match diagnostic
+                .markup_message_kind
+                .and_then(deserialize_markup_kind)
+            {
+                Some(kind) => DiagnosticMessage::from_lsp_markup(&lsp::MarkupContent {
+                    kind,
+                    value: diagnostic
+                        .untrimmed_markup_message
+                        .unwrap_or(diagnostic.message),
+                }),
+                None => DiagnosticMessage::plain_with_adapter_markdown(
+                    diagnostic.message,
+                    diagnostic.markdown.map(SharedString::from),
+                ),
+            };
+            Some(DiagnosticEntry::new(
+                deserialize_anchor(diagnostic.start?)?..deserialize_anchor(diagnostic.end?)?,
+                Diagnostic {
                     source: diagnostic.source,
-                    severity: match proto::diagnostic::Severity::try_from(diagnostic.severity).ok()? {
+                    severity: match proto::diagnostic::Severity::try_from(diagnostic.severity)
+                        .ok()?
+                    {
                         proto::diagnostic::Severity::Error => DiagnosticSeverity::ERROR,
                         proto::diagnostic::Severity::Warning => DiagnosticSeverity::WARNING,
                         proto::diagnostic::Severity::Information => DiagnosticSeverity::INFORMATION,
                         proto::diagnostic::Severity::Hint => DiagnosticSeverity::HINT,
                         proto::diagnostic::Severity::None => return None,
                     },
-                    message: diagnostic.message,
-                    markdown: diagnostic.markdown,
+                    message,
                     group_id: diagnostic.group_id as usize,
                     code: diagnostic.code.map(lsp::NumberOrString::from_string),
-                    code_description: diagnostic.code_description.and_then(|s| lsp::Uri::from_str(&s).ok()),
+                    code_description: diagnostic
+                        .code_description
+                        .and_then(|s| lsp::Uri::from_str(&s).ok()),
                     is_primary: diagnostic.is_primary,
                     is_disk_based: diagnostic.is_disk_based,
                     is_unnecessary: diagnostic.is_unnecessary,
                     underline: diagnostic.underline,
                     registration_id: diagnostic.registration_id.map(SharedString::from),
-                    source_kind: match proto::diagnostic::SourceKind::try_from(diagnostic.source_kind).ok()? {
+                    source_kind: match proto::diagnostic::SourceKind::try_from(
+                        diagnostic.source_kind,
+                    )
+                    .ok()?
+                    {
                         proto::diagnostic::SourceKind::Pulled => DiagnosticSourceKind::Pulled,
                         proto::diagnostic::SourceKind::Pushed => DiagnosticSourceKind::Pushed,
                         proto::diagnostic::SourceKind::Other => DiagnosticSourceKind::Other,
                     },
                     data,
                 },
-            })
+            ))
         })
         .collect()
 }
@@ -444,18 +533,20 @@ pub fn deserialize_anchor(anchor: proto::Anchor) -> Option<Anchor> {
     } else {
         None
     };
-    Some(Anchor {
-        timestamp: clock::Lamport {
-            replica_id: ReplicaId::new(anchor.replica_id as u16),
-            value: anchor.timestamp,
-        },
-        offset: anchor.offset as usize,
-        bias: match proto::Bias::try_from(anchor.bias).ok()? {
-            proto::Bias::Left => Bias::Left,
-            proto::Bias::Right => Bias::Right,
-        },
-        buffer_id,
-    })
+    let timestamp = clock::Lamport {
+        replica_id: ReplicaId::new(anchor.replica_id as u16),
+        value: anchor.timestamp,
+    };
+    let bias = match proto::Bias::try_from(anchor.bias).ok()? {
+        proto::Bias::Left => Bias::Left,
+        proto::Bias::Right => Bias::Right,
+    };
+    Some(Anchor::new(
+        timestamp,
+        anchor.offset as u32,
+        bias,
+        buffer_id?,
+    ))
 }
 
 /// Returns a `[clock::Lamport`] timestamp for the given [`proto::Operation`].
@@ -499,7 +590,12 @@ pub fn lamport_timestamp_for_operation(operation: &proto::Operation) -> Option<c
 pub fn serialize_transaction(transaction: &Transaction) -> proto::Transaction {
     proto::Transaction {
         id: Some(serialize_timestamp(transaction.id)),
-        edit_ids: transaction.edit_ids.iter().copied().map(serialize_timestamp).collect(),
+        edit_ids: transaction
+            .edit_ids
+            .iter()
+            .copied()
+            .map(serialize_timestamp)
+            .collect(),
         start: serialize_version(&transaction.start),
     }
 }
@@ -508,7 +604,11 @@ pub fn serialize_transaction(transaction: &Transaction) -> proto::Transaction {
 pub fn deserialize_transaction(transaction: proto::Transaction) -> Result<Transaction> {
     Ok(Transaction {
         id: deserialize_timestamp(transaction.id.context("missing transaction id")?),
-        edit_ids: transaction.edit_ids.into_iter().map(deserialize_timestamp).collect(),
+        edit_ids: transaction
+            .edit_ids
+            .into_iter()
+            .map(deserialize_timestamp)
+            .collect(),
         start: deserialize_version(&transaction.start),
     })
 }

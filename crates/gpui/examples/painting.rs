@@ -1,8 +1,14 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
+#[path = "example_support/fonts.rs"]
+mod example_support;
+
 use gpui::{
-    Application, Background, Bounds, ColorSpace, Context, MouseDownEvent, Path, PathBuilder, PathStyle, Pixels, Point,
-    Render, StrokeOptions, Window, WindowOptions, canvas, div, linear_color_stop, linear_gradient, point, prelude::*,
-    px, quad, rgb, size,
+    Background, Bounds, ColorSpace, Context, MouseDownEvent, Path, PathBuilder, PathStyle, Pixels,
+    Point, Render, StrokeOptions, Window, WindowOptions, canvas, div, linear_color_stop,
+    linear_gradient, point, prelude::*, px, quad, rgb, size,
 };
+use gpui_platform::application;
 
 struct PaintingViewer {
     default_lines: Vec<(Path<Pixels>, Background)>,
@@ -64,8 +70,7 @@ impl PaintingViewer {
         builder.line_to(point(px(50.), px(130.)));
         builder.close();
         let path = builder.build().unwrap();
-        let mut red = rgb(0xFF0000);
-        red.a = 0.5;
+        let red = rgb(0xFF0000).alpha(0.5);
         lines.push((path, red.into()));
 
         // 50% opaque blue path that extends across black quad.
@@ -76,8 +81,7 @@ impl PaintingViewer {
         builder.line_to(point(px(150.), px(130.)));
         builder.close();
         let path = builder.build().unwrap();
-        let mut blue = rgb(0x0000FF);
-        blue.a = 0.5;
+        let blue = rgb(0x0000FF).alpha(0.5);
         lines.push((path, blue.into()));
 
         // 50% opaque green path that extends across black quad.
@@ -88,8 +92,7 @@ impl PaintingViewer {
         builder.line_to(point(px(250.), px(130.)));
         builder.close();
         let path = builder.build().unwrap();
-        let mut green = rgb(0x00FF00);
-        green.a = 0.5;
+        let green = rgb(0x00FF00).alpha(0.5);
         lines.push((path, green.into()));
 
         // 50% opaque black path that extends across black quad.
@@ -100,8 +103,7 @@ impl PaintingViewer {
         builder.line_to(point(px(350.), px(130.)));
         builder.close();
         let path = builder.build().unwrap();
-        let mut black = rgb(0x000000);
-        black.a = 0.5;
+        let black = rgb(0x000000).alpha(0.5);
         lines.push((path, black.into()));
 
         // Two 50% opaque red circles overlapping - center should be darker red
@@ -125,8 +127,7 @@ impl PaintingViewer {
         );
         builder.close();
         let path = builder.build().unwrap();
-        let mut red1 = rgb(0xFF0000);
-        red1.a = 0.5;
+        let red1 = rgb(0xFF0000).alpha(0.5);
         lines.push((path, red1.into()));
 
         let mut builder = PathBuilder::fill();
@@ -149,8 +150,7 @@ impl PaintingViewer {
         );
         builder.close();
         let path = builder.build().unwrap();
-        let mut red2 = rgb(0xFF0000);
-        red2.a = 0.5;
+        let red2 = rgb(0xFF0000).alpha(0.5);
         lines.push((path, red2.into()));
 
         // draw a Rust logo
@@ -235,11 +235,31 @@ impl PaintingViewer {
         let center = point(px(96.), px(96.));
         let pie_center = point(px(775.), px(255.));
         let segments = [
-            (point(px(871.), px(255.)), point(px(747.), px(163.)), rgb(0x1374e9)),
-            (point(px(747.), px(163.)), point(px(679.), px(263.)), rgb(0xe13527)),
-            (point(px(679.), px(263.)), point(px(754.), px(349.)), rgb(0x0751ce)),
-            (point(px(754.), px(349.)), point(px(854.), px(310.)), rgb(0x209742)),
-            (point(px(854.), px(310.)), point(px(871.), px(255.)), rgb(0xfbc10a)),
+            (
+                point(px(871.), px(255.)),
+                point(px(747.), px(163.)),
+                rgb(0x1374e9),
+            ),
+            (
+                point(px(747.), px(163.)),
+                point(px(679.), px(263.)),
+                rgb(0xe13527),
+            ),
+            (
+                point(px(679.), px(263.)),
+                point(px(754.), px(349.)),
+                rgb(0x0751ce),
+            ),
+            (
+                point(px(754.), px(349.)),
+                point(px(854.), px(310.)),
+                rgb(0x209742),
+            ),
+            (
+                point(px(854.), px(310.)),
+                point(px(871.), px(255.)),
+                rgb(0xfbc10a),
+            ),
         ];
 
         for (start, end, color) in segments {
@@ -324,9 +344,11 @@ impl Render for PaintingViewer {
                         div()
                             .flex()
                             .gap_x_2()
-                            .child(button(if dashed { "Solid" } else { "Dashed" }, cx, move |this, _| {
-                                this.dashed = !dashed
-                            }))
+                            .child(button(
+                                if dashed { "Solid" } else { "Dashed" },
+                                cx,
+                                move |this, _| this.dashed = !dashed,
+                            ))
                             .child(button("Clear", cx, |this, cx| this.clear(cx))),
                     ),
             )
@@ -422,8 +444,11 @@ impl Render for PaintingViewer {
     }
 }
 
-fn main() {
-    Application::new().run(|cx| {
+fn run_example() {
+    application().run(|cx| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         cx.open_window(
             WindowOptions {
                 focus: true,
@@ -432,10 +457,22 @@ fn main() {
             |window, cx| cx.new(|cx| PaintingViewer::new(window, cx)),
         )
         .unwrap();
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _window_id| {
             cx.quit();
         })
         .detach();
-        cx.activate();
+        cx.activate(true);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

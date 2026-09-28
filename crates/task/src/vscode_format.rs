@@ -13,15 +13,44 @@ struct TaskOptions {
     env: HashMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq)]
 struct VsCodeTaskDefinition {
     label: String,
-    #[serde(flatten)]
     command: Option<Command>,
-    #[serde(flatten)]
     other_attributes: HashMap<String, serde_json_lenient::Value>,
     options: Option<TaskOptions>,
+}
+
+impl<'de> serde::Deserialize<'de> for VsCodeTaskDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct TaskHelper {
+            #[serde(default)]
+            label: Option<String>,
+            #[serde(flatten)]
+            command: Option<Command>,
+            #[serde(flatten)]
+            other_attributes: HashMap<String, serde_json_lenient::Value>,
+            options: Option<TaskOptions>,
+        }
+
+        let helper = TaskHelper::deserialize(deserializer)?;
+
+        let label = helper
+            .label
+            .unwrap_or_else(|| generate_label(&helper.command));
+
+        Ok(VsCodeTaskDefinition {
+            label,
+            command: helper.command,
+            other_attributes: helper.other_attributes,
+            options: helper.options,
+        })
+    }
 }
 
 #[derive(Clone, Deserialize, PartialEq, Debug)]
@@ -30,6 +59,7 @@ struct VsCodeTaskDefinition {
 enum Command {
     Npm {
         script: String,
+        path: Option<String>,
     },
     Shell {
         command: String,
@@ -41,8 +71,26 @@ enum Command {
     },
 }
 
+fn generate_label(command: &Option<Command>) -> String {
+    match command {
+        Some(Command::Npm { script, .. }) => format!("npm: {}", script),
+        Some(Command::Gulp { task }) => format!("gulp: {}", task),
+        Some(Command::Shell { command, .. }) => {
+            if command.trim().is_empty() {
+                "shell".to_string()
+            } else {
+                command.clone()
+            }
+        }
+        None => "Untitled Task".to_string(),
+    }
+}
+
 impl VsCodeTaskDefinition {
-    fn into_gram_format(self, replacer: &EnvVariableReplacer) -> anyhow::Result<Option<TaskTemplate>> {
+    fn into_zed_format(
+        self,
+        replacer: &EnvVariableReplacer,
+    ) -> anyhow::Result<Option<TaskTemplate>> {
         if self.other_attributes.contains_key("dependsOn") {
             log::warn!(
                 "Skipping deserializing of a task `{}` with the unsupported `dependsOn` key",
@@ -58,10 +106,16 @@ impl VsCodeTaskDefinition {
             bail!("Missing `type` field in task");
         };
 
-        let (command, args) = match command {
-            Command::Npm { script } => ("npm".to_owned(), vec!["run".to_string(), script]),
-            Command::Shell { command, args } => (command, args),
-            Command::Gulp { task } => ("gulp".to_owned(), vec![task]),
+        let (command, args, cwd) = match command {
+            Command::Npm { script, path } => (
+                "npm".to_owned(),
+                vec!["run".to_string(), script],
+                path.map(|path| {
+                    format!("{}/{}", VariableName::WorktreeRoot.template_value(), path)
+                }),
+            ),
+            Command::Shell { command, args } => (command, args, None),
+            Command::Gulp { task } => ("gulp".to_owned(), vec![task], None),
         };
         // Per VSC docs, only `command`, `args` and `options` support variable substitution.
         let command = replacer.replace(&command);
@@ -70,10 +124,13 @@ impl VsCodeTaskDefinition {
             label: self.label,
             command,
             args,
+            cwd: cwd.map(|cwd| replacer.replace(&cwd)),
             ..TaskTemplate::default()
         };
         if let Some(options) = self.options {
-            template.cwd = options.cwd.map(|cwd| replacer.replace(&cwd));
+            if let Some(cwd) = options.cwd {
+                template.cwd = Some(replacer.replace(&cwd));
+            }
             template.env = options.env;
         }
         Ok(Some(template))
@@ -91,15 +148,26 @@ impl TryFrom<VsCodeTaskFile> for TaskTemplates {
 
     fn try_from(value: VsCodeTaskFile) -> Result<Self, Self::Error> {
         let replacer = EnvVariableReplacer::new(HashMap::from_iter([
-            ("workspaceFolder".to_owned(), VariableName::WorktreeRoot.to_string()),
+            (
+                "workspaceFolder".to_owned(),
+                VariableName::WorktreeRoot.to_string(),
+            ),
             ("file".to_owned(), VariableName::File.to_string()),
             ("lineNumber".to_owned(), VariableName::Row.to_string()),
-            ("selectedText".to_owned(), VariableName::SelectedText.to_string()),
+            (
+                "selectedText".to_owned(),
+                VariableName::SelectedText.to_string(),
+            ),
         ]));
         let templates = value
             .tasks
             .into_iter()
-            .filter_map(|vscode_definition| vscode_definition.into_gram_format(&replacer).log_err().flatten())
+            .filter_map(|vscode_definition| {
+                vscode_definition
+                    .into_zed_format(&replacer)
+                    .log_err()
+                    .flatten()
+            })
             .collect();
         Ok(Self(templates))
     }
@@ -114,7 +182,7 @@ mod tests {
         vscode_format::{Command, VsCodeTaskDefinition},
     };
 
-    use super::EnvVariableReplacer;
+    use super::{EnvVariableReplacer, generate_label};
 
     fn compare_without_other_attributes(lhs: VsCodeTaskDefinition, rhs: VsCodeTaskDefinition) {
         assert_eq!(
@@ -141,59 +209,101 @@ mod tests {
         assert_eq!(replacer.replace("${PATH}"), "${PATH}");
         assert_eq!(replacer.replace("${PATH:food}"), "${PATH:food}");
         // And now, the actual replacing
-        let replacer = EnvVariableReplacer::new(HashMap::from_iter([("PATH".to_owned(), "GRAM_PATH".to_owned())]));
+        let replacer = EnvVariableReplacer::new(HashMap::from_iter([(
+            "PATH".to_owned(),
+            "ZED_PATH".to_owned(),
+        )]));
         assert_eq!(replacer.replace("Food"), "Food");
         assert_eq!(
             replacer.replace("$PATH is an environment variable"),
-            "${GRAM_PATH} is an environment variable"
+            "${ZED_PATH} is an environment variable"
         );
-        assert_eq!(replacer.replace("${PATH}"), "${GRAM_PATH}");
-        assert_eq!(replacer.replace("${PATH:food}"), "${GRAM_PATH:food}");
+        assert_eq!(replacer.replace("${PATH}"), "${ZED_PATH}");
+        assert_eq!(replacer.replace("${PATH:food}"), "${ZED_PATH:food}");
     }
 
     #[test]
-    fn can_deserialize_ts_tasks() {
-        const TYPESCRIPT_TASKS: &str = include_str!("../test_data/typescript.json");
-        let vscode_definitions: VsCodeTaskFile = serde_json_lenient::from_str(TYPESCRIPT_TASKS).unwrap();
+    fn can_deserialize_gulp_tasks() {
+        const GULP_TASKS: &str = include_str!("../test_data/tasks-gulp.json");
+        let vscode_definitions: VsCodeTaskFile = serde_json_lenient::from_str(GULP_TASKS).unwrap();
+
+        let expected = vec![VsCodeTaskDefinition {
+            label: "gulp: build tests".to_string(),
+            command: Some(Command::Gulp {
+                task: "build".to_string(),
+            }),
+            other_attributes: Default::default(),
+            options: None,
+        }];
+
+        assert_eq!(vscode_definitions.tasks.len(), expected.len());
+        vscode_definitions
+            .tasks
+            .iter()
+            .zip(expected)
+            .for_each(|(lhs, rhs)| compare_without_other_attributes(lhs.clone(), rhs));
+
+        let expected = vec![TaskTemplate {
+            label: "gulp: build tests".to_string(),
+            command: "gulp".to_string(),
+            args: vec!["build".to_string()],
+            ..Default::default()
+        }];
+
+        let tasks: TaskTemplates = vscode_definitions.try_into().unwrap();
+        assert_eq!(tasks.0, expected);
+    }
+
+    #[test]
+    fn can_deserialize_npm_tasks() {
+        const NPM_TASKS: &str = include_str!("../test_data/tasks-npm.json");
+        let vscode_definitions: VsCodeTaskFile = serde_json_lenient::from_str(NPM_TASKS).unwrap();
 
         let expected = vec![
             VsCodeTaskDefinition {
-                label: "gulp: tests".to_string(),
+                label: "With env".to_string(),
                 command: Some(Command::Npm {
-                    script: "build:tests:notypecheck".to_string(),
+                    script: "build".to_string(),
+                    path: None,
+                }),
+                other_attributes: Default::default(),
+                options: Some(super::TaskOptions {
+                    cwd: None,
+                    env: HashMap::from_iter([("NODE_ENV".to_string(), "production".to_string())]),
+                }),
+            },
+            VsCodeTaskDefinition {
+                label: "With path".to_string(),
+                command: Some(Command::Npm {
+                    script: "build".to_string(),
+                    path: Some("packages/components".to_string()),
                 }),
                 other_attributes: Default::default(),
                 options: None,
             },
             VsCodeTaskDefinition {
-                label: "tsc: watch ./src".to_string(),
-                command: Some(Command::Shell {
-                    command: "node".to_string(),
-                    args: vec![
-                        "${workspaceFolder}/node_modules/typescript/lib/tsc.js".to_string(),
-                        "--build".to_string(),
-                        "${workspaceFolder}/src".to_string(),
-                        "--watch".to_string(),
-                    ],
+                label: "With cwd".to_string(),
+                command: Some(Command::Npm {
+                    script: "build".to_string(),
+                    path: None,
                 }),
                 other_attributes: Default::default(),
-                options: None,
+                options: Some(super::TaskOptions {
+                    cwd: Some("${workspaceFolder}/packages/app".to_string()),
+                    env: Default::default(),
+                }),
             },
             VsCodeTaskDefinition {
-                label: "npm: build:compiler".to_string(),
+                label: "With path and cwd".to_string(),
                 command: Some(Command::Npm {
-                    script: "build:compiler".to_string(),
+                    script: "build".to_string(),
+                    path: Some("packages/components".to_string()),
                 }),
                 other_attributes: Default::default(),
-                options: None,
-            },
-            VsCodeTaskDefinition {
-                label: "npm: build:tests".to_string(),
-                command: Some(Command::Npm {
-                    script: "build:tests:notypecheck".to_string(),
+                options: Some(super::TaskOptions {
+                    cwd: Some("${workspaceFolder}/packages/app".to_string()),
+                    env: Default::default(),
                 }),
-                other_attributes: Default::default(),
-                options: None,
             },
         ];
 
@@ -206,36 +316,97 @@ mod tests {
 
         let expected = vec![
             TaskTemplate {
-                label: "gulp: tests".to_string(),
+                label: "With env".to_string(),
                 command: "npm".to_string(),
-                args: vec!["run".to_string(), "build:tests:notypecheck".to_string()],
+                args: vec!["run".to_string(), "build".to_string()],
+                env: HashMap::from_iter([("NODE_ENV".to_string(), "production".to_string())]),
                 ..Default::default()
             },
             TaskTemplate {
-                label: "tsc: watch ./src".to_string(),
+                label: "With path".to_string(),
+                command: "npm".to_string(),
+                args: vec!["run".to_string(), "build".to_string()],
+                cwd: Some("$ZED_WORKTREE_ROOT/packages/components".to_string()),
+                ..Default::default()
+            },
+            TaskTemplate {
+                label: "With cwd".to_string(),
+                command: "npm".to_string(),
+                args: vec!["run".to_string(), "build".to_string()],
+                cwd: Some("${ZED_WORKTREE_ROOT}/packages/app".to_string()),
+                ..Default::default()
+            },
+            TaskTemplate {
+                label: "With path and cwd".to_string(),
+                command: "npm".to_string(),
+                args: vec!["run".to_string(), "build".to_string()],
+                cwd: Some("${ZED_WORKTREE_ROOT}/packages/app".to_string()),
+                ..Default::default()
+            },
+        ];
+        let tasks: TaskTemplates = vscode_definitions.try_into().unwrap();
+        assert_eq!(tasks.0, expected);
+    }
+
+    #[test]
+    fn can_deserialize_shell_tasks() {
+        const SHELL_TASKS: &str = include_str!("../test_data/tasks-shell.json");
+        let vscode_definitions: VsCodeTaskFile = serde_json_lenient::from_str(SHELL_TASKS).unwrap();
+        let expected = vec![
+            VsCodeTaskDefinition {
+                label: "Without args".to_string(),
+                command: Some(Command::Shell {
+                    command: "cargo build --package rust-analyzer".to_string(),
+                    args: Default::default(),
+                }),
+                options: None,
+                other_attributes: Default::default(),
+            },
+            VsCodeTaskDefinition {
+                label: "With args".to_string(),
+                command: Some(Command::Shell {
+                    command: "node".to_string(),
+                    args: vec![
+                        "${workspaceFolder}/node_modules/typescript/lib/tsc.js".to_string(),
+                        "--build".to_string(),
+                        "${workspaceFolder}/src".to_string(),
+                        "--watch".to_string(),
+                    ],
+                }),
+                options: None,
+                other_attributes: Default::default(),
+            },
+            VsCodeTaskDefinition {
+                label: "Ignored task without type".to_string(),
+                command: None,
+                options: None,
+                other_attributes: Default::default(),
+            },
+        ];
+        assert_eq!(vscode_definitions.tasks.len(), expected.len());
+        vscode_definitions
+            .tasks
+            .iter()
+            .zip(expected)
+            .for_each(|(lhs, rhs)| compare_without_other_attributes(lhs.clone(), rhs));
+        let expected = vec![
+            TaskTemplate {
+                label: "Without args".to_string(),
+                command: "cargo build --package rust-analyzer".to_string(),
+                ..Default::default()
+            },
+            TaskTemplate {
+                label: "With args".to_string(),
                 command: "node".to_string(),
                 args: vec![
-                    "${GRAM_WORKTREE_ROOT}/node_modules/typescript/lib/tsc.js".to_string(),
+                    "${ZED_WORKTREE_ROOT}/node_modules/typescript/lib/tsc.js".to_string(),
                     "--build".to_string(),
-                    "${GRAM_WORKTREE_ROOT}/src".to_string(),
+                    "${ZED_WORKTREE_ROOT}/src".to_string(),
                     "--watch".to_string(),
                 ],
                 ..Default::default()
             },
-            TaskTemplate {
-                label: "npm: build:compiler".to_string(),
-                command: "npm".to_string(),
-                args: vec!["run".to_string(), "build:compiler".to_string()],
-                ..Default::default()
-            },
-            TaskTemplate {
-                label: "npm: build:tests".to_string(),
-                command: "npm".to_string(),
-                args: vec!["run".to_string(), "build:tests:notypecheck".to_string()],
-                ..Default::default()
-            },
         ];
-
         let tasks: TaskTemplates = vscode_definitions.try_into().unwrap();
         assert_eq!(tasks.0, expected);
     }
@@ -243,12 +414,14 @@ mod tests {
     #[test]
     fn can_deserialize_rust_analyzer_tasks() {
         const RUST_ANALYZER_TASKS: &str = include_str!("../test_data/rust-analyzer.json");
-        let vscode_definitions: VsCodeTaskFile = serde_json_lenient::from_str(RUST_ANALYZER_TASKS).unwrap();
+        let vscode_definitions: VsCodeTaskFile =
+            serde_json_lenient::from_str(RUST_ANALYZER_TASKS).unwrap();
         let expected = vec![
             VsCodeTaskDefinition {
                 label: "Build Extension in Background".to_string(),
                 command: Some(Command::Npm {
                     script: "watch".to_string(),
+                    path: Some("editors/code/".to_string()),
                 }),
                 options: None,
                 other_attributes: Default::default(),
@@ -257,6 +430,7 @@ mod tests {
                 label: "Build Extension".to_string(),
                 command: Some(Command::Npm {
                     script: "build".to_string(),
+                    path: Some("editors/code/".to_string()),
                 }),
                 options: None,
                 other_attributes: Default::default(),
@@ -283,6 +457,7 @@ mod tests {
                 label: "Pretest".to_string(),
                 command: Some(Command::Npm {
                     script: "pretest".to_string(),
+                    path: Some("editors/code/".to_string()),
                 }),
                 options: None,
                 other_attributes: Default::default(),
@@ -311,12 +486,14 @@ mod tests {
                 label: "Build Extension in Background".to_string(),
                 command: "npm".to_string(),
                 args: vec!["run".to_string(), "watch".to_string()],
+                cwd: Some("$ZED_WORKTREE_ROOT/editors/code/".to_string()),
                 ..Default::default()
             },
             TaskTemplate {
                 label: "Build Extension".to_string(),
                 command: "npm".to_string(),
                 args: vec!["run".to_string(), "build".to_string()],
+                cwd: Some("$ZED_WORKTREE_ROOT/editors/code/".to_string()),
                 ..Default::default()
             },
             TaskTemplate {
@@ -333,10 +510,70 @@ mod tests {
                 label: "Pretest".to_string(),
                 command: "npm".to_string(),
                 args: vec!["run".to_string(), "pretest".to_string()],
+                cwd: Some("$ZED_WORKTREE_ROOT/editors/code/".to_string()),
                 ..Default::default()
             },
         ];
         let tasks: TaskTemplates = vscode_definitions.try_into().unwrap();
         assert_eq!(tasks.0, expected);
+    }
+
+    #[test]
+    fn can_deserialize_tasks_without_labels() {
+        const TASKS_WITHOUT_LABELS: &str = include_str!("../test_data/tasks-without-labels.json");
+        let vscode_definitions: VsCodeTaskFile =
+            serde_json_lenient::from_str(TASKS_WITHOUT_LABELS).unwrap();
+
+        assert_eq!(vscode_definitions.tasks.len(), 4);
+        assert_eq!(vscode_definitions.tasks[0].label, "npm: start");
+        assert_eq!(vscode_definitions.tasks[1].label, "Explicit Label");
+        assert_eq!(vscode_definitions.tasks[2].label, "gulp: build");
+        assert_eq!(vscode_definitions.tasks[3].label, "echo hello");
+    }
+
+    #[test]
+    fn test_generate_label() {
+        assert_eq!(
+            generate_label(&Some(Command::Npm {
+                script: "start".to_string(),
+                path: None,
+            })),
+            "npm: start"
+        );
+        assert_eq!(
+            generate_label(&Some(Command::Gulp {
+                task: "build".to_string()
+            })),
+            "gulp: build"
+        );
+        assert_eq!(
+            generate_label(&Some(Command::Shell {
+                command: "echo hello".to_string(),
+                args: vec![]
+            })),
+            "echo hello"
+        );
+        assert_eq!(
+            generate_label(&Some(Command::Shell {
+                command: "cargo build --release".to_string(),
+                args: vec![]
+            })),
+            "cargo build --release"
+        );
+        assert_eq!(
+            generate_label(&Some(Command::Shell {
+                command: "  ".to_string(),
+                args: vec![]
+            })),
+            "shell"
+        );
+        assert_eq!(
+            generate_label(&Some(Command::Shell {
+                command: "".to_string(),
+                args: vec![]
+            })),
+            "shell"
+        );
+        assert_eq!(generate_label(&None), "Untitled Task");
     }
 }

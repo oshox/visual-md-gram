@@ -1,39 +1,23 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
+source script/lib/blob-store.sh
 
 build_flag="--release"
+zed_features=""
+remote_server_features=""
 target_dir="release"
-do_build=true
 open_result=false
 local_install=false
 can_code_sign=false
 
-# The following environment variables
-# must be set:
-#
-# APPLE_ID
-# APPLE_PASSWORD_GRAM
-# APPLE_TEAM_ID
-# APPLE_SIGNING_KEY
-#
-# APPLE_PASSWORD_GRAM must be an App-specific password.
-# Create it by logging in to account.apple.com and
-# click the "App-specific Passwords" button.
-#
-# Get the signing certificate via XCode, and view
-# the signing key using:
-# security find-identity -p codesigning
-if [[ -f ~/.local.secrets ]]; then
-    . "$HOME/.local.secrets"
-    export APPLE_ID
-    export APPLE_PASSWORD_GRAM
-    export APPLE_TEAM_ID
-    export APPLE_SIGNING_KEY
-fi
+# This must match the team in the provisioning profile.
+IDENTITY="Zed Industries, Inc."
+APPLE_NOTARIZATION_TEAM="MQ55VZLNZQ"
 
 # Function for displaying help info
 help_info() {
-    echo "
+  echo "
 Usage: ${0##*/} [options] [architecture=host]
 Build the application bundle for macOS.
 
@@ -45,41 +29,40 @@ Options:
   "
 }
 
-while getopts 'bdloih' flag; do
+while getopts 'dloih' flag
+do
     case "${flag}" in
-    b) do_build=false ;;
-    o) open_result=true ;;
-    d)
-        export CARGO_INCREMENTAL=true
-        export CARGO_BUNDLE_SKIP_BUILD=true
-        build_flag=""
-        target_dir="debug"
-        ;;
-    i) local_install=true ;;
-    h)
-        help_info
-        exit 0
-        ;;
-    *)
-        echo "Error: Unexpected argument: $1" >&2
-        help_info
-        exit 1
-        ;;
+        o) open_result=true;;
+        d)
+            export CARGO_INCREMENTAL=true
+            build_flag="";
+            zed_features="--features util/debug-embed"
+            remote_server_features="--features debug-embed"
+            target_dir="debug"
+            ;;
+        i) local_install=true;;
+        h)
+           help_info
+           exit 0
+           ;;
     esac
 done
 
-shift $((OPTIND - 1))
+shift $((OPTIND-1))
+
 
 # Get release channel
-pushd crates/gram
+pushd crates/zed
 channel=$(<RELEASE_CHANNEL)
-export GRAM_RELEASE_CHANNEL="${channel}"
+export ZED_RELEASE_CHANNEL="${channel}"
 popd
 
-export GRAM_BUNDLE=true
+export ZED_BUNDLE=true
+export CARGO_BUNDLE_SKIP_BUILD=true
 
-if [[ "$do_build" = "true" ]]; then
-    cargo install --version 0.11.0 cargo-bundle
+cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
+if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
+    cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
 fi
 
 # Deal with versions of macOS that don't include libstdc++ headers
@@ -102,43 +85,67 @@ else
     exit 1
 fi
 
-if [[ "$do_build" = "true" ]]; then
+# Generate the licenses first, so they can be baked into the binaries
+script/generate-licenses
 
-    # Generate the licenses first, so they can be baked into the binaries
-    script/generate-licenses
+rustup target add $target_triple
 
-    rustup target add "$target_triple"
-
-    echo "Compiling gram binaries"
-    cargo build ${build_flag} --package gram --package cli --target "$target_triple"
-    # Build remote_server in separate invocation to prevent feature unification from other crates
-    # from influencing dynamic libraries required by it.
-    echo "Compiling remote_server for $target_triple"
-    cargo build ${build_flag} --package remote_server --target "$target_triple"
-
-fi
+echo "Compiling zed binaries"
+cargo --config .cargo/bundle-config.toml build ${build_flag} ${zed_features} --package zed --package cli --target $target_triple
+# Build remote_server in separate invocation to prevent feature unification from other crates
+# from influencing dynamic libraries required by it.
+cargo --config .cargo/bundle-config.toml build ${build_flag} ${remote_server_features} --package remote_server --target $target_triple
 
 echo "Creating application bundle"
-pushd crates/gram
+pushd crates/zed
 cp Cargo.toml Cargo.toml.backup
 sed \
     -i.backup \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(cargo bundle ${build_flag} --target "$target_triple" --format osx | xargs)
+app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
 
 mv Cargo.toml.backup Cargo.toml
 popd
 echo "Bundled ${app_path}"
 
-if [[ -n "${APPLE_ID:-}" && -n "${APPLE_PASSWORD_GRAM:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_SIGNING_KEY}" ]]; then
-    echo "Enabling code signing!"
-    can_code_sign=true
+# DocumentTypes.plist references CFBundleTypeIconFile "Document", so the bundle must contain Document.icns.
+# We use the app icon as a placeholder document icon for now.
+document_icon_source="crates/zed/resources/Document.icns"
+document_icon_target="${app_path}/Contents/Resources/Document.icns"
+if [[ -f "${document_icon_source}" ]]; then
+    mkdir -p "$(dirname "${document_icon_target}")"
+    cp "${document_icon_source}" "${document_icon_target}"
+else
+    echo "cargo::warning=Missing ${document_icon_source}; macOS document icons may not appear in Finder."
 fi
 
-GIT_VERSION="v2.53.0"
-GIT_VERSION_SHA="6981a1f"
+if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
+    can_code_sign=true
+
+    echo "Setting up keychain for code signing..."
+    security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" zed.keychain || echo ""
+    security default-keychain -s zed.keychain
+    security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" zed.keychain
+    # Calling set-keychain-settings without `-t` disables the auto-lock timeout
+    security set-keychain-settings zed.keychain
+    echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/zed-certificate.p12
+    security import /tmp/zed-certificate.p12 -k zed.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+    rm /tmp/zed-certificate.p12
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" zed.keychain
+
+    function cleanup() {
+        echo "Cleaning up keychain"
+        security default-keychain -s login.keychain
+        security delete-keychain zed.keychain
+    }
+
+    trap cleanup EXIT
+fi
+
+GIT_VERSION="v2.43.3"
+GIT_VERSION_SHA="fa29823"
 
 function download_and_unpack() {
     local url=$1
@@ -147,12 +154,12 @@ function download_and_unpack() {
 
     temp_dir=$(mktemp -d)
 
-    if ! command -v curl &>/dev/null; then
+    if ! command -v curl &> /dev/null; then
         echo "curl is not installed. Please install curl to continue."
         exit 1
     fi
 
-    curl --silent --fail --location "$url" | tar -xvz -C "$temp_dir" -f - "$path_to_unpack"
+    curl --silent --fail --location "$url" | tar -xvz -C "$temp_dir" -f - $path_to_unpack
 
     mv "$temp_dir/$path_to_unpack" "$target_path"
 
@@ -167,16 +174,16 @@ function download_git() {
     pushd "$tmp_dir"
 
     case "$architecture" in
-    aarch64-apple-darwin)
-        download_and_unpack "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_VERSION_SHA}-macOS-arm64.tar.gz" bin/git ./git
-        ;;
-    x86_64-apple-darwin)
-        download_and_unpack "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_VERSION_SHA}-macOS-x64.tar.gz" bin/git ./git
-        ;;
-    *)
-        echo "Unsupported architecture: $architecture"
-        exit 1
-        ;;
+        aarch64-apple-darwin)
+            download_and_unpack "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_VERSION_SHA}-macOS-arm64.tar.gz" bin/git ./git
+            ;;
+        x86_64-apple-darwin)
+            download_and_unpack "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_VERSION_SHA}-macOS-x64.tar.gz" bin/git ./git
+            ;;
+        *)
+            echo "Unsupported architecture: $architecture"
+            exit 1
+            ;;
     esac
 
     popd
@@ -192,23 +199,31 @@ function sign_app_binaries() {
     echo "Downloading git binary"
     download_git "${target_triple}" "${app_path}/Contents/MacOS/git"
 
-    cp crates/gram/contents/embedded.provisionprofile "${app_path}/Contents/"
+    # Note: The app identifier for our development builds is the same as the app identifier for nightly.
+    cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
 
     if [[ $can_code_sign = true ]]; then
         echo "Code signing binaries"
         # sequence of codesign commands modeled after this example: https://developer.apple.com/forums/thread/701514
-        /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$APPLE_SIGNING_KEY" "${app_path}/Contents/MacOS/cli" -v
-        /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$APPLE_SIGNING_KEY" "${app_path}/Contents/MacOS/git" -v
-        /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$APPLE_SIGNING_KEY" "${app_path}/Contents/Resources/Assets.car" -v
-        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/gram/resources/gram.entitlements --sign "$APPLE_SIGNING_KEY" "${app_path}/Contents/MacOS/gram" -v
-        /usr/bin/codesign --force --timestamp --options runtime --entitlements crates/gram/resources/gram.entitlements --sign "$APPLE_SIGNING_KEY" "${app_path}" -v
-    elif [[ -n "${APPLE_SIGNING_KEY:-}" ]]; then
-        echo "One or more of the following variables are missing: APPLE_ID, APPLE_PASSWORD_GRAM, APPLE_TEAM_ID"
-        echo "The binary will be signed without all entitlements, so universal links won't work for example."
+        /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/cli" -v
+        /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/git" -v
+        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/zed" -v
+        /usr/bin/codesign --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}" -v
+    else
+        echo "One or more of the following variables are missing: MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD, APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, APPLE_NOTARIZATION_ISSUER_ID"
 
-        cat crates/gram/resources/gram.entitlements | sed '/com.apple.developer.associated-domains/,+1d' >"${app_path}/Contents/Resources/gram.entitlements"
+        echo "====== WARNING ======"
+        echo "This bundle is being signed without all entitlements, some features (e.g. universal links) will not work"
+        echo "====== WARNING ======"
 
-        codesign --force --deep --entitlements "${app_path}/Contents/Resources/gram.entitlements" --sign "${APPLE_SIGNING_KEY}" "${app_path}" -v
+        # NOTE: if you need to test universal links you have a few paths forward:
+        # - create a PR and tag it with the `run-bundling` label, and download the .dmg file from there.
+        # - get a signing key for the MQ55VZLNZQ team from Nathan.
+        # - create your own signing key, and update references to MQ55VZLNZQ to your own team ID
+        # then comment out this line.
+        cat crates/zed/resources/zed.entitlements | sed '/com.apple.developer.associated-domains/,+1d' > "${app_path}/Contents/Resources/zed.entitlements"
+
+        codesign --force --deep --entitlements "${app_path}/Contents/Resources/zed.entitlements" --sign ${MACOS_SIGNING_KEY:- -} "${app_path}" -v
     fi
 
     bundle_name=$(basename "$app_path")
@@ -234,33 +249,40 @@ function sign_app_binaries() {
     else
         dmg_target_directory="target/${target_triple}/${target_dir}"
         dmg_source_directory="${dmg_target_directory}/dmg"
-        dmg_file_path="${dmg_target_directory}/Gram-${arch_suffix}.dmg"
+        dmg_file_path="${dmg_target_directory}/Zed-${arch_suffix}.dmg"
         xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
 
-        rm -rf "${dmg_source_directory}"
-        mkdir -p "${dmg_source_directory}"
+        rm -rf ${dmg_source_directory}
+        mkdir -p ${dmg_source_directory}
         mv "${app_path}" "${dmg_source_directory}"
+        notarization_key_file=$(mktemp)
 
         echo "Adding symlink to /Applications to ${dmg_source_directory}"
-        ln -s /Applications "${dmg_source_directory}"
+        ln -s /Applications ${dmg_source_directory}
 
         echo "Creating final DMG at ${dmg_file_path} using ${dmg_source_directory}"
-        hdiutil create -volname Gram -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
+        hdiutil create -volname Zed -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
 
         # If someone runs this bundle script locally, a symlink will be placed in `dmg_source_directory`.
-        # This symlink causes CPU issues with Gram if the Gram codebase is the project being worked on, so we simply remove it for now.
+        # This symlink causes CPU issues with Zed if the Zed codebase is the project being worked on, so we simply remove it for now.
         echo "Removing symlink to /Applications from ${dmg_source_directory}"
-        rm "${dmg_source_directory}"/Applications
+        rm ${dmg_source_directory}/Applications
+
+        echo "Adding license agreement to DMG"
+        npm install --global dmg-license minimist
+        dmg-license script/terms/terms.json "${dmg_file_path}"
 
         if [[ $can_code_sign = true ]]; then
             echo "Notarizing DMG with Apple"
-            /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$APPLE_SIGNING_KEY" "$(pwd)/${dmg_file_path}" -v
-            "${xcode_bin_dir_path}/notarytool" submit --wait --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_PASSWORD_GRAM" "${dmg_file_path}"
+            /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "$(pwd)/${dmg_file_path}" -v
+            echo "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
+            "${xcode_bin_dir_path}/notarytool" submit --wait --key "$notarization_key_file" --key-id "$APPLE_NOTARIZATION_KEY_ID" --issuer "$APPLE_NOTARIZATION_ISSUER_ID" "${dmg_file_path}"
+            rm "$notarization_key_file"
             "${xcode_bin_dir_path}/stapler" staple "${dmg_file_path}"
         fi
 
         if [ "$open_result" = true ]; then
-            open "$dmg_target_directory"
+            open $dmg_target_directory
         fi
     fi
 }
@@ -270,20 +292,69 @@ function sign_binary() {
 
     if [[ $can_code_sign = true ]]; then
         echo "Code signing executable $binary_path"
-        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/gram/resources/gram.entitlements --sign "$APPLE_SIGNING_KEY" "${binary_path}" -v
+        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${binary_path}" -v
     fi
 }
 
-cp target/"${target_triple}"/${target_dir}/gram "${app_path}/Contents/MacOS/gram"
-cp target/"${target_triple}"/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
-./script/mac-icon-to-car
-cp -r target/Assets.car "${app_path}/Contents/Resources/Assets.car"
-plist_file="${app_path}/Contents/Info.plist"
-cat "$plist_file" | sed 's|  \<key\>CFBundleIconFile\</key\>|  <key>CFBundleIconName</key>\n  <string>AppIcon</string>\n  <key>CFBundleIconFile</key>|' >"${plist_file}.tmp"
-mv "${plist_file}.tmp" "$plist_file"
+debug_symbols_extracted=false
+function extract_debug_symbols() {
+    if [ "$debug_symbols_extracted" = true ]; then
+        return
+    fi
+    debug_symbols_extracted=true
+    if ! dsymutil --flat "target/${target_triple}/${target_dir}/zed" 2> target/dsymutil.log; then
+        echo "dsymutil failed"
+        cat target/dsymutil.log
+        exit 1
+    fi
+    if ! dsymutil --flat "target/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
+        echo "dsymutil failed"
+        cat target/dsymutil.log
+        exit 1
+    fi
+}
 
+function upload_debug_symbols() {
+    if [ "$local_install" = true ]; then
+        echo "local install; skipping sentry upload."
+    elif [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
+        echo "Uploading zed debug symbols to sentry..."
+        extract_debug_symbols
+        # Try uploading up to 3 times
+        for attempt in 1 2 3; do
+            echo "Sentry upload attempt $attempt..."
+            if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
+                "target/${target_triple}/${target_dir}/zed.dwarf" \
+                "target/${target_triple}/${target_dir}/remote_server.dwarf"; then
+                break
+            else
+                echo "Sentry upload failed on attempt $attempt"
+                if [ $attempt -eq 3 ]; then
+                    echo "All sentry upload attempts failed"
+                    exit 1
+                fi
+            fi
+        done
+    else
+        echo "missing SENTRY_AUTH_TOKEN. skipping sentry upload."
+    fi
+}
+
+upload_debug_symbols
+
+# Sentry receives the extracted zed.dwarf, not the binary, so debug symbols
+# must be extracted before the binaries are stripped below. The .dwarf files
+# also keep symbols recoverable when the sentry upload is skipped.
+if [[ "$target_dir" == "release" && "$local_install" != true ]]; then
+    extract_debug_symbols
+    strip -x "target/${target_triple}/${target_dir}/zed"
+    strip -x "target/${target_triple}/${target_dir}/cli"
+    strip -x "target/${target_triple}/${target_dir}/remote_server"
+fi
+
+cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
+cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
 sign_binary "target/$target_triple/release/remote_server"
-gzip -9 -f --to-stdout "target/${target_triple}/release/remote_server" \
-    > "target/gram-remote_server-macos-${arch_suffix}.gz"
+gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz

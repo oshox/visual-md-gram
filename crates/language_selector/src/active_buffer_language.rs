@@ -1,9 +1,12 @@
 use editor::Editor;
-use gpui::{Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, WeakEntity, Window, div};
+use gpui::{
+    App, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, WeakEntity,
+    Window, div,
+};
 use language::LanguageName;
 use settings::Settings as _;
-use ui::{Button, ButtonCommon, Clickable, FluentBuilder, Tooltip};
-use workspace::{StatusBarSettings, StatusItemView, Workspace, item::ItemHandle};
+use ui::{Button, ButtonCommon, Clickable, FluentBuilder, LabelSize, Tooltip};
+use workspace::{HideStatusItem, StatusBarSettings, StatusItemView, Workspace, item::ItemHandle};
 
 use crate::{LanguageSelector, Toggle};
 
@@ -26,7 +29,7 @@ impl ActiveBufferLanguage {
         self.active_language = Some(None);
 
         let editor = editor.read(cx);
-        if let Some((_, buffer, _)) = editor.active_excerpt(cx)
+        if let Some(buffer) = editor.active_buffer(cx)
             && let Some(language) = buffer.read(cx).language()
         {
             self.active_language = Some(Some(language.name()));
@@ -48,14 +51,17 @@ impl Render for ActiveBufferLanguage {
             } else {
                 "Unknown".to_string()
             };
-            let icon_size = StatusBarSettings::get_global(cx).icon_size;
 
             el.child(
-                Button::new("change-language", active_language_text)
-                    .label_size(icon_size.label_size())
+                Button::new("change-language", active_language_text.clone())
+                    .label_size(LabelSize::Small)
+                    .tab_index(0isize)
+                    .aria_label(format!("Language: {active_language_text}"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(workspace) = this.workspace.upgrade() {
-                            workspace.update(cx, |workspace, cx| LanguageSelector::toggle(workspace, window, cx));
+                            workspace.update(cx, |workspace, cx| {
+                                LanguageSelector::toggle(workspace, window, cx)
+                            });
                         }
                     }))
                     .tooltip(|_window, cx| Tooltip::for_action("Select Language", &Toggle, cx)),
@@ -72,7 +78,8 @@ impl StatusItemView for ActiveBufferLanguage {
         cx: &mut Context<Self>,
     ) {
         if let Some(editor) = active_pane_item.and_then(|item| item.downcast::<Editor>()) {
-            self._observe_active_editor = Some(cx.observe_in(&editor, window, Self::update_language));
+            self._observe_active_editor =
+                Some(cx.observe_in(&editor, window, Self::update_language));
             self.update_language(editor, window, cx);
         } else {
             self.active_language = None;
@@ -80,5 +87,14 @@ impl StatusItemView for ActiveBufferLanguage {
         }
 
         cx.notify();
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        Some(HideStatusItem::new(|settings| {
+            settings
+                .status_bar
+                .get_or_insert_default()
+                .active_language_button = Some(false);
+        }))
     }
 }

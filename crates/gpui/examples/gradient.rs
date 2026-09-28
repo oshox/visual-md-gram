@@ -1,7 +1,13 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
+#[path = "example_support/fonts.rs"]
+mod example_support;
+
 use gpui::{
-    App, Application, Bounds, ColorSpace, Context, Half, Render, Window, WindowOptions, canvas, div, linear_color_stop,
-    linear_gradient, point, prelude::*, px, size,
+    App, Bounds, ColorSpace, Context, Half, Render, Window, WindowOptions, canvas, div,
+    linear_color_stop, linear_gradient, point, prelude::*, px, size,
 };
+use gpui_platform::application;
 
 struct GradientViewer {
     color_space: ColorSpace,
@@ -208,7 +214,10 @@ impl Render for GradientViewer {
                 move |bounds, _, window, _| {
                     let size = size(bounds.size.width * 0.8, px(80.));
                     let square_bounds = Bounds {
-                        origin: point(bounds.size.width.half() - size.width.half(), bounds.origin.y),
+                        origin: point(
+                            bounds.size.width.half() - size.width.half(),
+                            bounds.origin.y,
+                        ),
                         size,
                     };
                     let height = square_bounds.size.height;
@@ -216,8 +225,11 @@ impl Render for GradientViewer {
                     let vertical_offset = px(30.);
                     let mut builder = gpui::PathBuilder::fill();
                     builder.move_to(square_bounds.bottom_left());
-                    builder.line_to(square_bounds.origin + point(horizontal_offset, vertical_offset));
-                    builder.line_to(square_bounds.top_right() + point(-horizontal_offset, vertical_offset));
+                    builder
+                        .line_to(square_bounds.origin + point(horizontal_offset, vertical_offset));
+                    builder.line_to(
+                        square_bounds.top_right() + point(-horizontal_offset, vertical_offset),
+                    );
 
                     builder.line_to(square_bounds.bottom_right());
                     builder.line_to(square_bounds.bottom_left());
@@ -236,8 +248,11 @@ impl Render for GradientViewer {
     }
 }
 
-fn main() {
-    Application::new().run(|cx: &mut App| {
+fn run_example() {
+    application().run(|cx: &mut App| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         cx.open_window(
             WindowOptions {
                 focus: true,
@@ -246,6 +261,18 @@ fn main() {
             |_, cx| cx.new(|_| GradientViewer::new()),
         )
         .unwrap();
-        cx.activate();
+        cx.activate(true);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

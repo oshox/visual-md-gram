@@ -1,4 +1,3 @@
-use rand::RngExt;
 use std::fmt::Debug;
 
 use clock::ReplicaId;
@@ -28,8 +27,22 @@ impl<T: Clone, R: rand::Rng> Network<T, R> {
         self.inboxes.insert(id, Vec::new());
     }
 
+    pub fn disconnect_peer(&mut self, id: ReplicaId) {
+        self.disconnected_peers.insert(id);
+        self.inboxes.get_mut(&id).unwrap().clear();
+    }
+
+    pub fn reconnect_peer(&mut self, id: ReplicaId, replicate_from: ReplicaId) {
+        assert!(self.disconnected_peers.remove(&id));
+        self.replicate(replicate_from, id);
+    }
+
     pub fn is_disconnected(&self, id: ReplicaId) -> bool {
         self.disconnected_peers.contains(&id)
+    }
+
+    pub fn contains_disconnected_peers(&self) -> bool {
+        !self.disconnected_peers.is_empty()
     }
 
     pub fn replicate(&mut self, old_replica_id: ReplicaId, new_replica_id: ReplicaId) {
@@ -73,6 +86,9 @@ impl<T: Clone, R: rand::Rng> Network<T, R> {
     pub fn receive(&mut self, receiver: ReplicaId) -> Vec<T> {
         let inbox = self.inboxes.get_mut(&receiver).unwrap();
         let count = self.rng.random_range(0..inbox.len() + 1);
-        inbox.drain(0..count).map(|envelope| envelope.message).collect()
+        inbox
+            .drain(0..count)
+            .map(|envelope| envelope.message)
+            .collect()
     }
 }

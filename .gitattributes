@@ -1,32 +1,5 @@
-[attr]crlf eol=crlf
-[attr]rust text eol=lf whitespace=tab-in-indent,trailing-space,tabwidth=4
+# Prevent GitHub from displaying comments within JSON files as errors.
+*.json linguist-language=JSON-with-Comments
 
-*                 text=auto eol=lf
-*.entitlements    linguist-language=XML
-*.ico             binary
-*.in              linguist-language=Shell
-*.isl             linguist-vendored
-*.json            linguist-detectable
-*.jsonc           linguist-language=JSON
-*.md              linguist-detectable
-*.plist           linguist-language=XML
-*.png             binary
-*.prettierignore  linguist-language=Shell
-*.prettierrc      linguist-language=JSON
-*.ps1             crlf
-*.rs              rust diff=rust
-*.svg             linguist-detectable
-*.toml            linguist-detectable
-*.wit             linguist-language=WebAssembly
-*.xml             linguist-detectable
-*.yaml            linguist-detectable
-*.yml             linguist-language=YAML
-.git*             linguist-language=Shell
-.mailmap          linguist-language=Shell
-Cargo.lock        linguist-language=TOML linguist-generated
-/docs/**          linguist-documentation
-/script/**        linguist-language=Shell
-/script/**/*.hbs  linguist-language=Handlebars
-/script/**/*.ps1  linguist-language=PowerShell
-/script/**/*.py   linguist-language=Python
-/script/**/*.toml linguist-language=TOML
+# Ensure the WSL script always has LF line endings, even on Windows
+crates/zed/resources/windows/zed.sh text eol=lf

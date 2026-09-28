@@ -1,125 +1,171 @@
-#!/usr/bin/env bash
-# shellcheck shell=bash
+#!/usr/bin/env sh
 set -eu
 
-err() {
-  echo "$1" >&2
-  exit 1
-}
+# Downloads a tarball from https://zed.dev/releases and unpacks it
+# into ~/.local/. If you'd prefer to do this manually, instructions are at
+# https://zed.dev/docs/linux.
 
-has_command() {
-  if ! command -v $1; then
-    err "Required command not found: $1"
-  fi
-}
+main() {
+    platform="$(uname -s)"
+    arch="$(uname -m)"
+    channel="${ZED_CHANNEL:-stable}"
+    ZED_VERSION="${ZED_VERSION:-latest}"
+    # Use TMPDIR if available (for environments with non-standard temp directories)
+    if [ -n "${TMPDIR:-}" ] && [ -d "${TMPDIR}" ]; then
+        temp="$(mktemp -d "$TMPDIR/zed-XXXXXX")"
+    else
+        temp="$(mktemp -d "/tmp/zed-XXXXXX")"
+    fi
 
-usage() {
-  echo "
-Usage: ${0##*/} [options] [BUNDLE]
-Install Gram on Linux from a tar bundle.
+    if [ "$platform" = "Darwin" ]; then
+        platform="macos"
+    elif [ "$platform" = "Linux" ]; then
+        platform="linux"
+    else
+        echo "Unsupported platform $platform"
+        exit 1
+    fi
 
-Options:
-  -h, --help          Display this help and exit.
-  --build             Build the tar bundle before installation.
-  --build-remote      Build the `remote_server` binary
-  --prefix PREFIX     Install into PREFIX (default ~/.local).
-  "
-}
-
-GRAM_BUILD_TARBALL=false
-GRAM_BUILD_REMOTE=false
-GRAM_INSTALL_PREFIX="$HOME/.local"
-GRAM_BUNDLE_FILE=""
-
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -h|--help)
-            usage
-            exit 0
+    case "$platform-$arch" in
+        macos-arm64* | linux-arm64* | linux-aarch64)
+            arch="aarch64"
             ;;
-        --build)
-            GRAM_BUILD_TARBALL=true
-            shift
-            ;;
-        --build-remote)
-            GRAM_BUILD_REMOTE=true
-            shift
-            ;;
-        --prefix)
-            shift
-            [[ $# -lt 1 ]] && err "Expected PREFIX"
-            GRAM_INSTALL_PREFIX="$1"
-            shift
-            ;;
-        --)
-            shift
-            break
-            ;;
-        -*)
-            echo "Unknown option: $1" >&2
-            help_info
-            exit 1
+        macos-x86* | linux-x86*)
+            arch="x86_64"
             ;;
         *)
-            if [[ $# -gt 1 ]]; then
-              err "Too many arguments, expected [BUNDLE]"
-            fi
-            if [[ $# -eq 1 ]]; then
-              GRAM_BUNDLE_FILE="$1"
-              shift
-            fi
+            echo "Unsupported platform or architecture"
+            exit 1
             ;;
     esac
-done
 
-version=$(
-  curl -s -X GET -H 'accept: application/json' https://codeberg.org/api/v1/repos/GramEditor/gram/releases/latest \
-    | grep -o '"tag_name":"[^"]\+"' \
-    | sed -e 's,"tag_name":"\([^"]\+\)",\1,g'
-)
+    if command -v curl >/dev/null 2>&1; then
+        curl () {
+            command curl -fL "$@"
+        }
+    elif command -v wget >/dev/null 2>&1; then
+        curl () {
+            wget -O- "$@"
+        }
+    else
+        echo "Could not find 'curl' or 'wget' in your path"
+        exit 1
+    fi
 
-host_line="$(rustc --version --verbose | grep "host")"
-target_triple=${host_line#*: }
-arch="$(echo $target_triple | awk -F - '{print $1}')"
+    "$platform" "$@"
 
-target_dir="${CARGO_TARGET_DIR:-target}"
+    if [ "$(command -v zed)" = "$HOME/.local/bin/zed" ]; then
+        echo "Zed has been installed. Run with 'zed'"
+    else
+        echo "To run Zed from your terminal, you must add ~/.local/bin to your PATH"
+        echo "Run:"
 
-if [[ "$GRAM_BUILD_TARBALL" = "true" ]]; then
-  no_build_flag=""
-  if [ "$GRAM_BUILD_REMOTE" = false ]; then
-    no_build_flag="--no-build-remote"
-  fi
+        case "$SHELL" in
+            *zsh)
+                echo "   echo 'export PATH=\$HOME/.local/bin:\$PATH' >> ~/.zshrc"
+                echo "   source ~/.zshrc"
+                ;;
+            *fish)
+                echo "   fish_add_path -U $HOME/.local/bin"
+                ;;
+            *)
+                echo "   echo 'export PATH=\$HOME/.local/bin:\$PATH' >> ~/.bashrc"
+                echo "   source ~/.bashrc"
+                ;;
+        esac
 
-  ./script/bundle-linux --tarball $no_build_flag
-  GRAM_BUNDLE_FILE="${target_dir}/release/gram-linux-$arch.tar.gz"
-elif [ "$GRAM_BUNDLE_FILE" = "" ]; then
-  GRAM_BUNDLE_FILE="gram-linux-$arch-$version.tar.gz"
-  curl --skip-existing -L -O https://codeberg.org/GramEditor/gram/releases/download/"$version"/"$GRAM_BUNDLE_FILE"
-fi
-[[ ! -f "$GRAM_BUNDLE_FILE" ]] && err "$GRAM_BUNDLE_FILE not found, exiting..."
+        echo "To run Zed now, '~/.local/bin/zed'"
+    fi
+}
 
-channel=stable
-if tar ztf "$GRAM_BUNDLE_FILE" | head -1 | grep -q "dev"; then
-  channel=dev
-fi
-appid="app.liten.Gram"
-suffix=""
-if [ "$channel" != "stable" ]; then
-  suffix="-$channel"
-  appid="app.liten.Gram-Dev"
-fi
-mkdir -p "$GRAM_INSTALL_PREFIX/gram$suffix.app"
-mkdir -p "$GRAM_INSTALL_PREFIX/bin" "$GRAM_INSTALL_PREFIX/share/applications"
-tar -xzf "$GRAM_BUNDLE_FILE" -C "$GRAM_INSTALL_PREFIX/"
+linux() {
+    if [ -n "${ZED_BUNDLE_PATH:-}" ]; then
+        cp "$ZED_BUNDLE_PATH" "$temp/zed-linux-$arch.tar.gz"
+    else
+        echo "Downloading Zed version: $ZED_VERSION"
+        curl "https://cloud.zed.dev/releases/$channel/$ZED_VERSION/download?asset=zed&arch=$arch&os=linux&source=install.sh" > "$temp/zed-linux-$arch.tar.gz"
+    fi
 
-ln -sf "$GRAM_INSTALL_PREFIX/gram$suffix.app/bin/gram" "$HOME/.local/bin/gram"
+    suffix=""
+    if [ "$channel" != "stable" ]; then
+        suffix="-$channel"
+    fi
 
-desktop_file_path="$GRAM_INSTALL_PREFIX/share/applications/${appid}.desktop"
-src_dir="$GRAM_INSTALL_PREFIX/gram$suffix.app/share/applications"
-cp "$src_dir/gram${suffix}.desktop" "${desktop_file_path}"
+    appid=""
+    case "$channel" in
+      stable)
+        appid="dev.zed.Zed"
+        ;;
+      nightly)
+        appid="dev.zed.Zed-Nightly"
+        ;;
+      preview)
+        appid="dev.zed.Zed-Preview"
+        ;;
+      dev)
+        appid="dev.zed.Zed-Dev"
+        ;;
+      *)
+        echo "Unknown release channel: ${channel}. Using stable app ID."
+        appid="dev.zed.Zed"
+        ;;
+    esac
 
-sed -i -e "s|Icon=gram|Icon=$GRAM_INSTALL_PREFIX/gram$suffix.app/share/icons/hicolor/512x512/apps/gram.png|g" "${desktop_file_path}"
-sed -i -e "s|Exec=gram|Exec=$GRAM_INSTALL_PREFIX/gram$suffix.app/bin/gram|g" "${desktop_file_path}"
+    # Unpack
+    rm -rf "$HOME/.local/zed$suffix.app"
+    mkdir -p "$HOME/.local/zed$suffix.app"
+    tar -xzf "$temp/zed-linux-$arch.tar.gz" -C "$HOME/.local/"
 
-echo "Installation to $GRAM_INSTALL_PREFIX complete."
+    zed_editor="$HOME/.local/zed$suffix.app/libexec/zed-editor"
+    if [ -f "$zed_editor" ] && command -v ldd >/dev/null 2>&1; then
+        missing="$(ldd "$zed_editor" 2>/dev/null | sed -n 's/^[[:space:]]*\(.*\) => not found$/\1/p')"
+        if [ -n "$missing" ]; then
+            echo "Warning: your system is missing libraries that Zed needs:"
+            echo "$missing" | sed 's/^/    /'
+            echo "Install them with your package manager, or Zed will fail to start."
+        fi
+    fi
 
+    # Setup ~/.local directories
+    mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+
+    # Link the binary
+    if [ -f "$HOME/.local/zed$suffix.app/bin/zed" ]; then
+        ln -sf "$HOME/.local/zed$suffix.app/bin/zed" "$HOME/.local/bin/zed"
+    else
+        # support for versions before 0.139.x.
+        ln -sf "$HOME/.local/zed$suffix.app/bin/cli" "$HOME/.local/bin/zed"
+    fi
+
+    # Copy .desktop file
+    desktop_file_path="$HOME/.local/share/applications/${appid}.desktop"
+    src_dir="$HOME/.local/zed$suffix.app/share/applications"
+    if [ -f "$src_dir/${appid}.desktop" ]; then
+        cp "$src_dir/${appid}.desktop" "${desktop_file_path}"
+    else
+        # Fallback for older tarballs
+        cp "$src_dir/zed$suffix.desktop" "${desktop_file_path}"
+    fi
+    sed -i "s|Icon=zed|Icon=$HOME/.local/zed$suffix.app/share/icons/hicolor/512x512/apps/zed.png|g" "${desktop_file_path}"
+    sed -i "s|Exec=zed|Exec=$HOME/.local/zed$suffix.app/bin/zed|g" "${desktop_file_path}"
+}
+
+macos() {
+    echo "Downloading Zed version: $ZED_VERSION"
+    curl "https://cloud.zed.dev/releases/$channel/$ZED_VERSION/download?asset=zed&os=macos&arch=$arch&source=install.sh" > "$temp/Zed-$arch.dmg"
+    hdiutil attach -quiet "$temp/Zed-$arch.dmg" -mountpoint "$temp/mount"
+    app="$(cd "$temp/mount/"; echo *.app)"
+    echo "Installing $app"
+    if [ -d "/Applications/$app" ]; then
+        echo "Removing existing $app"
+        rm -rf "/Applications/$app"
+    fi
+    ditto "$temp/mount/$app" "/Applications/$app"
+    hdiutil detach -quiet "$temp/mount"
+
+    mkdir -p "$HOME/.local/bin"
+    # Link the binary
+    ln -sf "/Applications/$app/Contents/MacOS/cli" "$HOME/.local/bin/zed"
+}
+
+main "$@"

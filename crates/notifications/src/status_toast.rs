@@ -1,45 +1,17 @@
 use std::rc::Rc;
 
-use app_actions::toast;
 use gpui::{DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, IntoElement};
 use ui::{Tooltip, prelude::*};
 use workspace::{ToastAction, ToastView};
-
-#[derive(Clone, Copy)]
-pub struct ToastIcon {
-    icon: IconName,
-    color: Color,
-}
-
-impl ToastIcon {
-    pub fn new(icon: IconName) -> Self {
-        Self {
-            icon,
-            color: Color::default(),
-        }
-    }
-
-    pub fn color(mut self, color: Color) -> Self {
-        self.color = color;
-        self
-    }
-}
-
-impl From<IconName> for ToastIcon {
-    fn from(icon: IconName) -> Self {
-        Self {
-            icon,
-            color: Color::default(),
-        }
-    }
-}
+use zed_actions::toast;
 
 #[derive(RegisterComponent)]
 pub struct StatusToast {
-    icon: Option<ToastIcon>,
+    icon: Option<Icon>,
     text: SharedString,
     action: Option<ToastAction>,
     show_dismiss: bool,
+    auto_dismiss: bool,
     this_handle: Entity<Self>,
     focus_handle: FocusHandle,
 }
@@ -59,6 +31,7 @@ impl StatusToast {
                     icon: None,
                     action: None,
                     show_dismiss: false,
+                    auto_dismiss: true,
                     this_handle: cx.entity(),
                     focus_handle,
                 },
@@ -67,12 +40,21 @@ impl StatusToast {
         })
     }
 
-    pub fn icon(mut self, icon: ToastIcon) -> Self {
+    pub fn icon(mut self, icon: Icon) -> Self {
         self.icon = Some(icon);
         self
     }
 
-    pub fn action(mut self, label: impl Into<SharedString>, f: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+    pub fn auto_dismiss(mut self, auto_dismiss: bool) -> Self {
+        self.auto_dismiss = auto_dismiss;
+        self
+    }
+
+    pub fn action(
+        mut self,
+        label: impl Into<SharedString>,
+        f: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
         let this_handle = self.this_handle.clone();
         self.action = Some(ToastAction::new(
             label.into(),
@@ -112,14 +94,15 @@ impl Render for StatusToast {
             .flex_none()
             .bg(cx.theme().colors().surface_background)
             .shadow_lg()
-            .when_some(self.icon.as_ref(), |this, icon| {
-                this.child(Icon::new(icon.icon).color(icon.color))
-            })
+            .when_some(self.icon.clone(), |this, icon| this.child(icon))
             .child(Label::new(self.text.clone()).color(Color::Default))
             .when_some(self.action.as_ref(), |this, action| {
                 this.child(
                     Button::new(action.id.clone(), action.label.clone())
-                        .tooltip(Tooltip::for_action_title(action.label.clone(), &toast::RunAction))
+                        .tooltip(Tooltip::for_action_title(
+                            action.label.clone(),
+                            &toast::RunAction,
+                        ))
                         .color(Color::Muted)
                         .when_some(action.on_click.clone(), |el, handler| {
                             el.on_click(move |_click_event, window, cx| handler(window, cx))
@@ -148,6 +131,10 @@ impl ToastView for StatusToast {
     fn action(&self) -> Option<ToastAction> {
         self.action.clone()
     }
+
+    fn auto_dismiss(&self) -> bool {
+        self.auto_dismiss
+    }
 }
 
 impl Focusable for StatusToast {
@@ -163,68 +150,103 @@ impl Component for StatusToast {
         ComponentScope::Notification
     }
 
-    fn preview(_window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    fn description() -> &'static str {
+        "A compact, transient toast used to surface status updates \
+        such as completed operations or pending updates, with optional icon, \
+        action, and dismiss affordances."
+    }
+
+    fn preview(_window: &mut Window, cx: &mut App) -> AnyElement {
         let text_example = StatusToast::new("Operation completed", cx, |this, _| this);
 
         let action_example = StatusToast::new("Update ready to install", cx, |this, _cx| {
             this.action("Restart", |_, _| {})
         });
 
-        let dismiss_button_example = StatusToast::new("Dismiss Button", cx, |this, _| this.dismiss_button(true));
+        let dismiss_button_example =
+            StatusToast::new("Dismiss Button", cx, |this, _| this.dismiss_button(true));
 
-        let icon_example = StatusToast::new("A grumpy toad accepted your contact request", cx, |this, _| {
-            this.icon(ToastIcon::new(IconName::Check).color(Color::Muted))
-        });
+        let icon_example = StatusToast::new(
+            "Nathan Sobo accepted your contact request",
+            cx,
+            |this, _| {
+                this.icon(
+                    Icon::new(IconName::Check)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+            },
+        );
 
-        let success_example = StatusToast::new("Pushed 4 changes to `gram/main`", cx, |this, _| {
-            this.icon(ToastIcon::new(IconName::Check).color(Color::Success))
+        let success_example = StatusToast::new("Pushed 4 changes to `zed/main`", cx, |this, _| {
+            this.icon(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Success),
+            )
         });
 
         let error_example = StatusToast::new(
-            "git push: Couldn't find remote origin `GramEditor/gram`",
+            "git push: Couldn't find remote origin `iamnbutler/zed`",
             cx,
             |this, _cx| {
-                this.icon(ToastIcon::new(IconName::XCircle).color(Color::Error))
-                    .action("More Info", |_, _| {})
+                this.icon(
+                    Icon::new(IconName::XCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Error),
+                )
+                .action("More Info", |_, _| {})
             },
         );
 
         let warning_example = StatusToast::new("You have outdated settings", cx, |this, _cx| {
-            this.icon(ToastIcon::new(IconName::Warning).color(Color::Warning))
-                .action("More Info", |_, _| {})
+            this.icon(
+                Icon::new(IconName::Warning)
+                    .size(IconSize::Small)
+                    .color(Color::Warning),
+            )
+            .action("More Info", |_, _| {})
         });
 
-        let pr_example = StatusToast::new("`gram/new-notification-system` created!", cx, |this, _cx| {
-            this.icon(ToastIcon::new(IconName::GitBranchAlt).color(Color::Muted))
-                .action("Open Pull Request", |_, cx| cx.open_url("https://github.com/"))
-        });
+        let pr_example =
+            StatusToast::new("`zed/new-notification-system` created!", cx, |this, _cx| {
+                this.icon(
+                    Icon::new(IconName::GitBranch)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .action("Open Pull Request", |_, cx| {
+                    cx.open_url("https://github.com/")
+                })
+            });
 
-        Some(
-            v_flex()
-                .gap_6()
-                .p_4()
-                .children(vec![
-                    example_group_with_title(
-                        "Basic Toast",
-                        vec![
-                            single_example("Text", div().child(text_example).into_any_element()),
-                            single_example("Action", div().child(action_example).into_any_element()),
-                            single_example("Icon", div().child(icon_example).into_any_element()),
-                            single_example("Dismiss Button", div().child(dismiss_button_example).into_any_element()),
-                        ],
-                    ),
-                    example_group_with_title(
-                        "Examples",
-                        vec![
-                            single_example("Success", div().child(success_example).into_any_element()),
-                            single_example("Error", div().child(error_example).into_any_element()),
-                            single_example("Warning", div().child(warning_example).into_any_element()),
-                            single_example("Create PR", div().child(pr_example).into_any_element()),
-                        ],
-                    )
-                    .vertical(),
-                ])
-                .into_any_element(),
-        )
+        v_flex()
+            .gap_6()
+            .p_4()
+            .children(vec![
+                example_group_with_title(
+                    "Basic Toast",
+                    vec![
+                        single_example("Text", div().child(text_example).into_any_element()),
+                        single_example("Action", div().child(action_example).into_any_element()),
+                        single_example("Icon", div().child(icon_example).into_any_element()),
+                        single_example(
+                            "Dismiss Button",
+                            div().child(dismiss_button_example).into_any_element(),
+                        ),
+                    ],
+                ),
+                example_group_with_title(
+                    "Examples",
+                    vec![
+                        single_example("Success", div().child(success_example).into_any_element()),
+                        single_example("Error", div().child(error_example).into_any_element()),
+                        single_example("Warning", div().child(warning_example).into_any_element()),
+                        single_example("Create PR", div().child(pr_example).into_any_element()),
+                    ],
+                )
+                .vertical(),
+            ])
+            .into_any_element()
     }
 }

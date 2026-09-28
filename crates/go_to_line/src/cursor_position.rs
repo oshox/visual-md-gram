@@ -1,13 +1,14 @@
-use editor::{Editor, EditorEvent, MBTextSummary, display_map::DisplaySnapshot};
+use editor::{Editor, EditorEvent, MBTextSummary, MultiBufferSnapshot};
 use gpui::{App, Entity, FocusHandle, Focusable, Styled, Subscription, Task, WeakEntity};
 use settings::{RegisterSetting, Settings};
 use std::{fmt::Write, num::NonZeroU32, time::Duration};
-use text::{Bias, Point, Selection};
+use text::{Point, Selection};
 use ui::{
-    Button, ButtonCommon, Clickable, Context, FluentBuilder, IntoElement, ParentElement, Render, Tooltip, Window, div,
+    Button, ButtonCommon, Clickable, Context, FluentBuilder, IntoElement, LabelSize, ParentElement,
+    Render, Tooltip, Window, div,
 };
 use util::paths::FILE_ROW_COLUMN_DELIMITER;
-use workspace::{StatusBarSettings, StatusItemView, Workspace, item::ItemHandle};
+use workspace::{HideStatusItem, StatusBarSettings, StatusItemView, Workspace, item::ItemHandle};
 
 #[derive(Copy, Clone, Debug, Default, PartialOrd, PartialEq)]
 pub(crate) struct SelectionStats {
@@ -33,15 +34,16 @@ pub struct CursorPosition {
 pub struct UserCaretPosition {
     pub line: NonZeroU32,
     pub character: NonZeroU32,
-    pub column: NonZeroU32,
 }
 
 impl UserCaretPosition {
-    pub(crate) fn at_selection_end(selection: &Selection<Point>, snapshot: &DisplaySnapshot) -> Self {
-        let buffer_snapshot = snapshot.buffer_snapshot();
+    pub(crate) fn at_selection_end(
+        selection: &Selection<Point>,
+        snapshot: &MultiBufferSnapshot,
+    ) -> Self {
         let selection_end = selection.head();
         let (line, character) =
-            if let Some((buffer_snapshot, point, _)) = buffer_snapshot.point_to_buffer_point(selection_end) {
+            if let Some((buffer_snapshot, point)) = snapshot.point_to_buffer_point(selection_end) {
                 let line_start = Point::new(point.row, 0);
 
                 let chars_to_last_position = buffer_snapshot
@@ -51,21 +53,15 @@ impl UserCaretPosition {
             } else {
                 let line_start = Point::new(selection_end.row, 0);
 
-                let chars_to_last_position = buffer_snapshot
+                let chars_to_last_position = snapshot
                     .text_summary_for_range::<MBTextSummary, _>(line_start..selection_end)
                     .chars as u32;
                 (selection_end.row, chars_to_last_position)
             };
 
-        let column = snapshot
-            .tab_snapshot()
-            .point_to_tab_point(selection_end, Bias::Left)
-            .column();
-
         Self {
             line: NonZeroU32::new(line + 1).expect("added 1"),
             character: NonZeroU32::new(character + 1).expect("added 1"),
-            column: NonZeroU32::new(column + 1).expect("added 1"),
         }
     }
 }
@@ -119,8 +115,11 @@ impl CursorPosition {
                                     for selection in editor.selections.all_adjusted(&snapshot) {
                                         let selection_summary = snapshot
                                             .buffer_snapshot()
-                                            .text_summary_for_range::<MBTextSummary, _>(selection.start..selection.end);
-                                        cursor_position.selected_count.characters += selection_summary.chars;
+                                            .text_summary_for_range::<MBTextSummary, _>(
+                                            selection.start..selection.end,
+                                        );
+                                        cursor_position.selected_count.characters +=
+                                            selection_summary.chars;
                                         if selection.end != selection.start {
                                             cursor_position.selected_count.lines +=
                                                 (selection.end.row - selection.start.row) as usize;
@@ -128,16 +127,19 @@ impl CursorPosition {
                                                 cursor_position.selected_count.lines += 1;
                                             }
                                         }
-                                        if last_selection
-                                            .as_ref()
-                                            .is_none_or(|last_selection| selection.id > last_selection.id)
-                                        {
+                                        if last_selection.as_ref().is_none_or(|last_selection| {
+                                            selection.id > last_selection.id
+                                        }) {
                                             last_selection = Some(selection);
                                         }
                                     }
                                 }
-                                cursor_position.position =
-                                    last_selection.map(|s| UserCaretPosition::at_selection_end(&s, &snapshot));
+                                cursor_position.position = last_selection.map(|s| {
+                                    UserCaretPosition::at_selection_end(
+                                        &s,
+                                        snapshot.buffer_snapshot(),
+                                    )
+                                });
                                 cursor_position.context = Some(editor.focus_handle(cx));
                             }
                         }
@@ -183,7 +185,11 @@ impl CursorPosition {
                 write!(text, ", ").unwrap();
             }
             let name = if is_short_format { &name[..1] } else { name };
-            let plural_suffix = if count > 1 && !is_short_format { "s" } else { "" };
+            let plural_suffix = if count > 1 && !is_short_format {
+                "s"
+            } else {
+                ""
+            };
             write!(text, "{count} {name}{plural_suffix}").unwrap();
             wrote_once = true;
         }
@@ -206,23 +212,31 @@ impl Render for CursorPosition {
         if !StatusBarSettings::get_global(cx).cursor_position_button {
             return div().hidden();
         }
-        let icon_size = StatusBarSettings::get_global(cx).icon_size;
 
         div().when_some(self.position, |el, position| {
-            let mut text = format!("{}{FILE_ROW_COLUMN_DELIMITER}{}", position.line, position.column,);
+            let mut text = format!(
+                "{}{FILE_ROW_COLUMN_DELIMITER}{}",
+                position.line, position.character,
+            );
             self.write_position(&mut text, cx);
 
             let context = self.context.clone();
 
             el.child(
                 Button::new("go-to-line-column", text)
-                    .label_size(icon_size.label_size())
+                    .label_size(LabelSize::Small)
+                    .tab_index(0isize)
+                    .aria_label(format!(
+                        "Line {}, column {}",
+                        position.line, position.character
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(workspace) = this.workspace.upgrade() {
                             workspace.update(cx, |workspace, cx| {
-                                if let Some(editor) =
-                                    workspace.active_item(cx).and_then(|item| item.act_as::<Editor>(cx))
-                                    && let Some((_, buffer, _)) = editor.read(cx).active_excerpt(cx)
+                                if let Some(editor) = workspace
+                                    .active_item(cx)
+                                    .and_then(|item| item.act_as::<Editor>(cx))
+                                    && let Some(buffer) = editor.read(cx).active_buffer(cx)
                                 {
                                     workspace.toggle_modal(window, cx, |window, cx| {
                                         crate::GoToLine::new(editor, buffer, window, cx)
@@ -232,10 +246,17 @@ impl Render for CursorPosition {
                         }
                     }))
                     .tooltip(move |_window, cx| match context.as_ref() {
-                        Some(context) => {
-                            Tooltip::for_action_in("Go to Line/Column", &editor::actions::ToggleGoToLine, context, cx)
-                        }
-                        None => Tooltip::for_action("Go to Line/Column", &editor::actions::ToggleGoToLine, cx),
+                        Some(context) => Tooltip::for_action_in(
+                            "Go to Line/Column",
+                            &editor::actions::ToggleGoToLine,
+                            context,
+                            cx,
+                        ),
+                        None => Tooltip::for_action(
+                            "Go to Line/Column",
+                            &editor::actions::ToggleGoToLine,
+                            cx,
+                        ),
                     }),
             )
         })
@@ -256,9 +277,13 @@ impl StatusItemView for CursorPosition {
                 &editor,
                 window,
                 |cursor_position, editor, event, window, cx| match event {
-                    EditorEvent::SelectionsChanged { .. } => {
-                        Self::update_position(cursor_position, editor, Some(UPDATE_DEBOUNCE), window, cx)
-                    }
+                    EditorEvent::SelectionsChanged { .. } => Self::update_position(
+                        cursor_position,
+                        editor,
+                        Some(UPDATE_DEBOUNCE),
+                        window,
+                        cx,
+                    ),
                     _ => {}
                 },
             ));
@@ -269,6 +294,15 @@ impl StatusItemView for CursorPosition {
         }
 
         cx.notify();
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        Some(HideStatusItem::new(|settings| {
+            settings
+                .status_bar
+                .get_or_insert_default()
+                .cursor_position_button = Some(false);
+        }))
     }
 }
 

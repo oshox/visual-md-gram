@@ -1,10 +1,10 @@
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use collections::HashMap;
-use dap::{StartDebuggingRequestArguments, adapters::DebugTaskDefinition, settings::DapSettings};
+use dap::{StartDebuggingRequestArguments, adapters::DebugTaskDefinition};
 use gpui::AsyncApp;
 use std::ffi::OsStr;
-use task::{DebugScenario, GramDebugConfig};
+use task::{DebugScenario, ZedDebugConfig};
 
 use crate::*;
 
@@ -29,10 +29,10 @@ impl DebugAdapter for GdbDebugAdapter {
         DebugAdapterName(Self::ADAPTER_NAME.into())
     }
 
-    async fn config_from_gram_format(&self, gram_scenario: GramDebugConfig) -> Result<DebugScenario> {
+    async fn config_from_zed_format(&self, zed_scenario: ZedDebugConfig) -> Result<DebugScenario> {
         let mut obj = serde_json::Map::default();
 
-        match &gram_scenario.request {
+        match &zed_scenario.request {
             dap::DebugRequest::Attach(attach) => {
                 obj.insert("request".into(), "attach".into());
                 obj.insert("pid".into(), attach.process_id.into());
@@ -50,8 +50,11 @@ impl DebugAdapter for GdbDebugAdapter {
                     obj.insert("env".into(), launch.env_json());
                 }
 
-                if let Some(stop_on_entry) = gram_scenario.stop_on_entry {
-                    obj.insert("stopAtBeginningOfMainSubprogram".into(), stop_on_entry.into());
+                if let Some(stop_on_entry) = zed_scenario.stop_on_entry {
+                    obj.insert(
+                        "stopAtBeginningOfMainSubprogram".into(),
+                        stop_on_entry.into(),
+                    );
                 }
                 if let Some(cwd) = launch.cwd.as_ref() {
                     obj.insert("cwd".into(), cwd.to_string_lossy().into_owned().into());
@@ -60,8 +63,8 @@ impl DebugAdapter for GdbDebugAdapter {
         }
 
         Ok(DebugScenario {
-            adapter: gram_scenario.adapter,
-            label: gram_scenario.label,
+            adapter: zed_scenario.adapter,
+            label: zed_scenario.label,
             build: None,
             config: serde_json::Value::Object(obj),
             tcp_connection: None,
@@ -178,7 +181,6 @@ impl DebugAdapter for GdbDebugAdapter {
         user_installed_path: Option<std::path::PathBuf>,
         user_args: Option<Vec<String>>,
         user_env: Option<HashMap<String, String>>,
-        settings: &DapSettings,
         _: &mut AsyncApp,
     ) -> Result<DebugAdapterBinary> {
         // Try to get gdb_path from config
@@ -195,10 +197,6 @@ impl DebugAdapter for GdbDebugAdapter {
             let user_setting_path = user_installed_path
                 .filter(|p| p.exists())
                 .and_then(|p| p.to_str().map(|s| s.to_string()));
-
-            if user_setting_path.is_none() && settings.ignore_system_version {
-                bail!("No user provided gdb path and ignore_system_version set");
-            }
 
             let gdb_path_result = delegate
                 .which(OsStr::new("gdb"))

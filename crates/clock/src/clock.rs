@@ -18,8 +18,12 @@ impl ReplicaId {
     pub const LOCAL: ReplicaId = ReplicaId(0);
     /// The remote replica of the connected remote server.
     pub const REMOTE_SERVER: ReplicaId = ReplicaId(1);
+    /// The agent's unique identifier.
+    pub const AGENT: ReplicaId = ReplicaId(2);
     /// A local branch.
     pub const LOCAL_BRANCH: ReplicaId = ReplicaId(3);
+    /// The first collaborative replica ID, any replica equal or greater than this is a collaborative replica.
+    pub const FIRST_COLLAB_ID: ReplicaId = ReplicaId(8);
 
     pub fn new(id: u16) -> Self {
         ReplicaId(id)
@@ -30,7 +34,7 @@ impl ReplicaId {
     }
 
     pub fn is_remote(self) -> bool {
-        self == ReplicaId::REMOTE_SERVER
+        self == ReplicaId::REMOTE_SERVER || self >= ReplicaId::FIRST_COLLAB_ID
     }
 }
 
@@ -40,6 +44,8 @@ impl fmt::Debug for ReplicaId {
             write!(f, "<local>")
         } else if *self == ReplicaId::REMOTE_SERVER {
             write!(f, "<remote>")
+        } else if *self == ReplicaId::AGENT {
+            write!(f, "<agent>")
         } else if *self == ReplicaId::LOCAL_BRANCH {
             write!(f, "<branch>")
         } else {
@@ -55,16 +61,30 @@ pub type Seq = u32;
 /// used to determine the ordering of events in the editor.
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Lamport {
-    pub replica_id: ReplicaId,
     pub value: Seq,
+    pub replica_id: ReplicaId,
 }
 
 /// A [version vector](https://en.wikipedia.org/wiki/Version_vector).
-#[derive(Clone, Default, Hash, Eq, PartialEq)]
+#[derive(Default, Hash, Eq, PartialEq)]
 pub struct Global {
     // 4 is chosen as it is the biggest count that does not increase the size of the field itself.
     // Coincidentally, it also covers all the important non-collab replica ids.
     values: SmallVec<[u32; 4]>,
+}
+
+impl Clone for Global {
+    fn clone(&self) -> Self {
+        // We manually implement clone to avoid the overhead of SmallVec's clone implementation.
+        // Using `from_slice` is faster than `clone` for SmallVec as we can use our `Copy` implementation of u32.
+        Self {
+            values: SmallVec::from_slice(&self.values),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.values.clone_from(&source.values);
+    }
 }
 
 impl Global {
@@ -171,10 +191,13 @@ impl Global {
 
     /// Iterates all replicas observed by this global as well as any unobserved replicas whose ID is lower than the highest observed replica.
     pub fn iter(&self) -> impl Iterator<Item = Lamport> + '_ {
-        self.values.iter().enumerate().map(|(replica_id, seq)| Lamport {
-            replica_id: ReplicaId(replica_id as u16),
-            value: *seq,
-        })
+        self.values
+            .iter()
+            .enumerate()
+            .map(|(replica_id, seq)| Lamport {
+                replica_id: ReplicaId(replica_id as u16),
+                value: *seq,
+            })
     }
 }
 
@@ -215,7 +238,10 @@ impl Lamport {
     };
 
     pub fn new(replica_id: ReplicaId) -> Self {
-        Self { value: 1, replica_id }
+        Self {
+            value: 1,
+            replica_id,
+        }
     }
 
     pub fn as_u64(self) -> u64 {

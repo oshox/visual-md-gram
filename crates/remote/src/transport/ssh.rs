@@ -1,6 +1,6 @@
 use crate::{
-    RemoteClientDelegate, RemotePlatform,
-    remote_client::{CommandTemplate, RemoteConnection, RemoteConnectionOptions},
+    RemoteArch, RemoteClientDelegate, RemoteOs, RemotePlatform,
+    remote_client::{CommandTemplate, Interactive, RemoteConnection, RemoteConnectionOptions},
     transport::{parse_platform, parse_shell},
 };
 use anyhow::{Context as _, Result, anyhow};
@@ -11,36 +11,43 @@ use futures::{
     channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
     select_biased,
 };
-use gpui::{App, AppContext as _, AsyncApp, SemanticVersion, Task};
+use gpui::{App, AppContext as _, AsyncApp, Task};
 use parking_lot::Mutex;
+use paths::remote_server_dir_relative;
 use release_channel::{AppVersion, ReleaseChannel};
 use rpc::proto::Envelope;
+use semver::Version;
 pub use settings::SshPortForwardOption;
-#[cfg(debug_assertions)]
 use smol::fs;
-
-use smol::process::{self, Child, Stdio};
 use std::{
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
-
-#[cfg(debug_assertions)]
-use std::time::Instant;
-
 use tempfile::TempDir;
+use util::command::{Child, Stdio};
 use util::{
     paths::{PathStyle, RemotePathBuf},
     rel_path::RelPath,
     shell::ShellKind,
 };
 
+/// How long to wait for SSH to connect when no askpass prompt has opened.
+const SSH_CONNECTION_PROMPT_TIMEOUT: Duration = Duration::from_secs(17);
+
 pub(crate) struct SshRemoteConnection {
     socket: SshSocket,
     master_process: Mutex<Option<MasterProcess>>,
+    /// Whether `kill()` has been called. Separate from `master_process` because
+    /// reused ControlMaster sessions start with `master_process` as `None`.
+    killed: AtomicBool,
     remote_binary_path: Option<Arc<RelPath>>,
     ssh_platform: RemotePlatform,
+    ssh_os_version: Option<String>,
     ssh_path_style: PathStyle,
     ssh_shell: String,
     ssh_shell_kind: ShellKind,
@@ -48,16 +55,10 @@ pub(crate) struct SshRemoteConnection {
     _temp_dir: TempDir,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SshConnectionHost {
     IpAddr(IpAddr),
     Hostname(String),
-}
-
-enum ServerBinaryStatus {
-    Found,
-    NotExecutable,
-    NotFound,
 }
 
 impl SshConnectionHost {
@@ -103,7 +104,36 @@ impl Default for SshConnectionHost {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+fn bracket_ipv6(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    }
+}
+
+// Quote paths for sftp batch parsing and double backslashes for POSIX glob();
+// Win32-OpenSSH accepts the same encoding.
+fn escape_sftp_path(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len() + 2);
+    escaped.push('"');
+    for character in path.chars() {
+        if character == '"' || character == '\\' {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped.push('"');
+    escaped
+}
+
+fn sftp_put_command(source_path: &str, destination_path: &str) -> String {
+    let source = escape_sftp_path(source_path);
+    let destination = escape_sftp_path(destination_path);
+    format!("put {source} {destination}\n")
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SshConnectionOptions {
     pub host: SshConnectionHost,
     pub username: Option<String>,
@@ -135,10 +165,11 @@ impl From<settings::SshConnection> for SshConnectionOptions {
 
 struct SshSocket {
     connection_options: SshConnectionOptions,
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(windows))]
     socket_path: std::path::PathBuf,
+    /// Extra environment variables needed for the ssh process
     envs: HashMap<String, String>,
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     _proxy: askpass::PasswordProxy,
 }
 
@@ -146,7 +177,7 @@ struct MasterProcess {
     process: Child,
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(windows))]
 impl MasterProcess {
     pub fn new(
         askpass_script_path: &std::ffi::OsStr,
@@ -154,9 +185,16 @@ impl MasterProcess {
         socket_path: &std::path::Path,
         destination: &str,
     ) -> Result<Self> {
-        let args = ["-N", "-o", "ControlPersist=no", "-o", "ControlMaster=yes", "-o"];
+        let args = [
+            "-N",
+            "-o",
+            "ControlPersist=no",
+            "-o",
+            "ControlMaster=yes",
+            "-o",
+        ];
 
-        let mut master_process = util::command::new_smol_command("ssh");
+        let mut master_process = util::command::new_command("ssh");
         master_process
             .kill_on_drop(true)
             .stdin(Stdio::null())
@@ -185,20 +223,28 @@ impl MasterProcess {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 impl MasterProcess {
-    const CONNECTION_ESTABLISHED_MAGIC: &str = "GRAM_SSH_CONNECTION_ESTABLISHED";
+    const CONNECTION_ESTABLISHED_MAGIC: &str = "ZED_SSH_CONNECTION_ESTABLISHED";
 
-    pub fn new(askpass_script_path: &std::ffi::OsStr, additional_args: Vec<String>, destination: &str) -> Result<Self> {
+    pub fn new(
+        askpass_script_path: &std::ffi::OsStr,
+        askpass_socket_path: &std::ffi::OsStr,
+        additional_args: Vec<String>,
+        destination: &str,
+    ) -> Result<Self> {
         // On Windows, `ControlMaster` and `ControlPath` are not supported:
         // https://github.com/PowerShell/Win32-OpenSSH/issues/405
         // https://github.com/PowerShell/Win32-OpenSSH/wiki/Project-Scope
         //
         // Using an ugly workaround to detect connection establishment
         // -N doesn't work with JumpHosts as windows openssh never closes stdin in that case
-        let args = ["-t", &format!("echo '{}'; exec $0", Self::CONNECTION_ESTABLISHED_MAGIC)];
+        let args = [
+            "-t",
+            &format!("echo '{}'; exec $0", Self::CONNECTION_ESTABLISHED_MAGIC),
+        ];
 
-        let mut master_process = util::command::new_smol_command("ssh");
+        let mut master_process = util::command::new_command("ssh");
         master_process
             .kill_on_drop(true)
             .stdin(Stdio::null())
@@ -206,6 +252,7 @@ impl MasterProcess {
             .stderr(Stdio::piped())
             .env("SSH_ASKPASS_REQUIRE", "force")
             .env("SSH_ASKPASS", askpass_script_path)
+            .env("ZED_ASKPASS_SOCKET", askpass_socket_path)
             .args(additional_args)
             .arg(destination)
             .args(args);
@@ -254,7 +301,9 @@ impl AsMut<Child> for MasterProcess {
 #[async_trait(?Send)]
 impl RemoteConnection for SshRemoteConnection {
     async fn kill(&self) -> Result<()> {
+        self.killed.store(true, Ordering::Release);
         let Some(mut process) = self.master_process.lock().take() else {
+            log::debug!("no master process to kill (external ControlMaster session)");
             return Ok(());
         };
         process.as_mut().kill().ok();
@@ -263,7 +312,7 @@ impl RemoteConnection for SshRemoteConnection {
     }
 
     fn has_been_killed(&self) -> bool {
-        self.master_process.lock().is_none()
+        self.killed.load(Ordering::Acquire)
     }
 
     fn connection_options(&self) -> RemoteConnectionOptions {
@@ -285,6 +334,7 @@ impl RemoteConnection for SshRemoteConnection {
         input_env: &HashMap<String, String>,
         working_dir: Option<String>,
         port_forward: Option<(u16, String, u16)>,
+        interactive: Interactive,
     ) -> Result<CommandTemplate> {
         let Self {
             ssh_path_style,
@@ -294,28 +344,57 @@ impl RemoteConnection for SshRemoteConnection {
             ..
         } = self;
         let env = socket.envs.clone();
-        build_command(
-            input_program,
-            input_args,
-            input_env,
-            working_dir,
-            port_forward,
-            env,
-            *ssh_path_style,
-            ssh_shell,
-            *ssh_shell_kind,
-            socket.ssh_args(),
-        )
+
+        if self.ssh_platform.os.is_windows() {
+            build_command_windows(
+                input_program,
+                input_args,
+                input_env,
+                working_dir,
+                port_forward,
+                env,
+                *ssh_path_style,
+                ssh_shell,
+                *ssh_shell_kind,
+                socket.ssh_command_options(),
+                &socket.connection_options.ssh_destination(),
+                interactive,
+            )
+        } else {
+            build_command_posix(
+                input_program,
+                input_args,
+                input_env,
+                working_dir,
+                port_forward,
+                env,
+                *ssh_path_style,
+                ssh_shell,
+                *ssh_shell_kind,
+                socket.ssh_command_options(),
+                &socket.connection_options.ssh_destination(),
+                interactive,
+            )
+        }
     }
 
-    fn build_forward_ports_command(&self, forwards: Vec<(u16, String, u16)>) -> Result<CommandTemplate> {
+    fn build_forward_ports_command(
+        &self,
+        forwards: Vec<(u16, String, u16)>,
+    ) -> Result<CommandTemplate> {
         let Self { socket, .. } = self;
-        let mut args = socket.ssh_args();
+        let mut args = socket.ssh_command_options();
         args.push("-N".into());
         for (local_port, host, remote_port) in forwards {
             args.push("-L".into());
-            args.push(format!("{local_port}:{host}:{remote_port}"));
+            args.push(format!(
+                "{}:{}:{}",
+                local_port,
+                bracket_ipv6(&host),
+                remote_port
+            ));
         }
+        args.push(socket.connection_options.ssh_destination());
         Ok(CommandTemplate {
             program: "ssh".into(),
             args,
@@ -323,12 +402,20 @@ impl RemoteConnection for SshRemoteConnection {
         })
     }
 
-    fn upload_directory(&self, src_path: PathBuf, dest_path: RemotePathBuf, cx: &App) -> Task<Result<()>> {
+    fn upload_directory(
+        &self,
+        src_path: PathBuf,
+        dest_path: RemotePathBuf,
+        cx: &App,
+    ) -> Task<Result<()>> {
         let dest_path_str = dest_path.to_string();
         let src_path_display = src_path.display().to_string();
 
         let mut sftp_command = self.build_sftp_command();
-        let mut scp_command = self.build_scp_command(&src_path, &dest_path_str, Some(&["-C", "-r"]));
+        sftp_command.kill_on_drop(true);
+        let mut scp_command =
+            self.build_scp_command(&src_path, &dest_path_str, Some(&["-C", "-r"]));
+        scp_command.kill_on_drop(true);
 
         cx.background_spawn(async move {
             // We will try SFTP first, and if that fails, we will fall back to SCP.
@@ -385,37 +472,59 @@ impl RemoteConnection for SshRemoteConnection {
         delegate: Arc<dyn RemoteClientDelegate>,
         cx: &mut AsyncApp,
     ) -> Task<Result<i32>> {
+        const VARS: [&str; 3] = ["RUST_LOG", "RUST_BACKTRACE", "ZED_GENERATE_MINIDUMPS"];
         delegate.set_status(Some("Starting proxy"), cx);
 
         let Some(remote_binary_path) = self.remote_binary_path.clone() else {
             return Task::ready(Err(anyhow!("Remote binary path not set")));
         };
 
-        let mut proxy_args = vec![];
-        for env_var in ["RUST_LOG", "RUST_BACKTRACE", "GRAM_GENERATE_MINIDUMPS"] {
-            if let Some(value) = std::env::var(env_var).ok() {
-                proxy_args.push(format!("{}='{}'", env_var, value));
+        let mut ssh_command = if self.ssh_platform.os.is_windows() {
+            // TODO: Set the `VARS` environment variables, we do not have `env` on windows
+            // so this needs a different approach
+            let mut proxy_args = vec![];
+            proxy_args.push("proxy".to_owned());
+            proxy_args.push("--identifier".to_owned());
+            proxy_args.push(unique_identifier);
+
+            if reconnect {
+                proxy_args.push("--reconnect".to_owned());
             }
-        }
-        proxy_args.push(remote_binary_path.display(self.path_style()).into_owned());
-        proxy_args.push("proxy".to_owned());
-        proxy_args.push("--identifier".to_owned());
-        proxy_args.push(unique_identifier);
+            self.socket.ssh_command(
+                self.ssh_shell_kind,
+                &remote_binary_path.display(self.path_style()),
+                &proxy_args,
+                false,
+            )
+        } else {
+            let mut proxy_args = vec![];
+            for env_var in VARS {
+                if let Some(value) = std::env::var(env_var).ok() {
+                    proxy_args.push(format!("{env_var}={value}"));
+                }
+            }
+            proxy_args.push(remote_binary_path.display(self.path_style()).into_owned());
+            proxy_args.push("proxy".to_owned());
+            proxy_args.push("--identifier".to_owned());
+            proxy_args.push(unique_identifier);
 
-        if reconnect {
-            proxy_args.push("--reconnect".to_owned());
-        }
+            if reconnect {
+                proxy_args.push("--reconnect".to_owned());
+            }
+            self.socket
+                .ssh_command(self.ssh_shell_kind, "env", &proxy_args, false)
+        };
 
-        let ssh_proxy_process = match self
-            .socket
-            .ssh_command(self.ssh_shell_kind, "env", &proxy_args, false)
+        let ssh_proxy_process = match ssh_command
             // IMPORTANT: we kill this process when we drop the task that uses it.
             .kill_on_drop(true)
             .spawn()
         {
             Ok(process) => process,
             Err(error) => {
-                return Task::ready(Err(anyhow!("failed to spawn remote server: {}", error)));
+                return Task::ready(Err(
+                    anyhow::Error::new(error).context("failed to spawn remote server")
+                ));
             }
         };
 
@@ -432,8 +541,92 @@ impl RemoteConnection for SshRemoteConnection {
         self.ssh_path_style
     }
 
+    fn remote_platform(&self) -> RemotePlatform {
+        self.ssh_platform
+    }
+
+    fn remote_os_version(&self) -> Option<String> {
+        self.ssh_os_version.clone()
+    }
+
     fn has_wsl_interop(&self) -> bool {
         false
+    }
+}
+
+/// Check if the user already has an active SSH ControlMaster session for the
+/// given destination. See: https://github.com/zed-industries/zed/issues/45271
+#[cfg(not(windows))]
+async fn find_existing_control_master(
+    destination: &str,
+    additional_args: &[String],
+) -> Option<PathBuf> {
+    // Use `ssh -G` to resolve the user's effective SSH config for this host.
+    // This expands ControlPath tokens (%h, %p, %r, %C, etc.) into actual paths.
+    let output = match util::command::new_command("ssh")
+        .args(additional_args)
+        .arg("-G")
+        .arg(destination)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            log::debug!("failed to run ssh -G: {e}");
+            return None;
+        }
+    };
+
+    if !output.status.success() {
+        log::debug!("ssh -G failed for {destination}, skipping ControlMaster reuse");
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let control_path = stdout.lines().find_map(|line| {
+        let path = line.strip_prefix("controlpath ")?.trim();
+        if path == "none" || path.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(path))
+        }
+    })?;
+
+    // Verify the master is actually alive by sending a control command.
+    let check = match util::command::new_command("ssh")
+        .args(additional_args)
+        .args(["-O", "check"])
+        .arg("-o")
+        .arg(format!("ControlPath={}", control_path.display()))
+        .arg(destination)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            log::debug!("failed to run ssh -O check: {e}");
+            return None;
+        }
+    };
+
+    if check.status.success() {
+        log::info!(
+            "reusing existing SSH ControlMaster at {}",
+            control_path.display()
+        );
+        Some(control_path)
+    } else {
+        log::debug!(
+            "ControlMaster socket at {} is not alive, creating new connection",
+            control_path.display()
+        );
+        None
     }
 }
 
@@ -447,111 +640,188 @@ impl SshRemoteConnection {
 
         let destination = connection_options.ssh_destination();
 
-        let temp_dir = tempfile::Builder::new().prefix("gram-ssh-session").tempdir()?;
-        let askpass_delegate = askpass::AskPassDelegate::new(cx, {
-            let delegate = delegate.clone();
-            move |prompt, tx, cx| delegate.ask_password(prompt, tx, cx)
-        });
+        let temp_dir = tempfile::Builder::new()
+            .prefix("zed-ssh-session")
+            .tempdir()?;
 
-        let mut askpass = askpass::AskPassSession::new(cx.background_executor(), askpass_delegate).await?;
+        // On non-Windows, check if the user already has an active ControlMaster
+        // session for this host. If so, reuse it instead of prompting for auth.
+        #[cfg(not(windows))]
+        let reused_socket =
+            find_existing_control_master(&destination, &connection_options.additional_args()).await;
 
-        delegate.set_status(Some("Connecting"), cx);
+        #[cfg(not(windows))]
+        let (socket, master_process_option) = if let Some(reused_path) = reused_socket {
+            delegate.set_status(Some("Connecting (reusing session)"), cx);
+            log::info!("reusing existing ControlMaster, skipping authentication");
+            let socket = SshSocket::new(connection_options, reused_path).await?;
+            (socket, None)
+        } else {
+            let askpass_delegate = askpass::AskPassDelegate::new_with_cancellation(cx, {
+                let delegate = delegate.clone();
+                move |prompt, tx, cancellation, cx| {
+                    delegate.ask_password(prompt, tx, cancellation, cx)
+                }
+            });
 
-        // Start the master SSH process, which does not do anything except for establish
-        // the connection and keep it open, allowing other ssh commands to reuse it
-        // via a control socket.
-        #[cfg(not(target_os = "windows"))]
-        let socket_path = temp_dir.path().join("ssh.sock");
+            let mut askpass =
+                askpass::AskPassSession::new(cx.background_executor().clone(), askpass_delegate)
+                    .await?;
 
-        let mut master_process = cfg_select! {
-            windows => MasterProcess::new(
-                askpass.script_path().as_ref(),
-                connection_options.additional_args(),
-                &destination,
-            ),
-            _ => MasterProcess::new(
+            delegate.set_status(Some("Connecting"), cx);
+
+            // Start the master SSH process, which does not do anything except
+            // for establish the connection and keep it open, allowing other ssh
+            // commands to reuse it via a control socket.
+            let socket_path = temp_dir.path().join("ssh.sock");
+            let mut master_process = MasterProcess::new(
                 askpass.script_path().as_ref(),
                 connection_options.additional_args(),
                 &socket_path,
                 &destination,
-            ),
-        }?;
+            )?;
 
-        let result = select_biased! {
-            result = askpass.run().fuse() => {
-                match result {
-                    AskPassResult::CancelledByUser => {
-                        master_process.as_mut().kill().ok();
-                        anyhow::bail!("SSH connection canceled")
-                    }
-                    AskPassResult::Timedout => {
-                        anyhow::bail!("connecting to host timed out")
+            let result = select_biased! {
+                result = askpass.run(Some(SSH_CONNECTION_PROMPT_TIMEOUT)).fuse() => {
+                    match result {
+                        AskPassResult::CancelledByUser => {
+                            master_process.as_mut().kill().ok();
+                            anyhow::bail!("SSH connection canceled")
+                        }
+                        AskPassResult::Timedout => {
+                            anyhow::bail!("connecting to host timed out")
+                        }
                     }
                 }
+                _ = master_process.wait_connected().fuse() => {
+                    anyhow::Ok(())
+                }
+            };
+
+            if let Err(e) = result {
+                return Err(e.context("Failed to connect to host"));
             }
-            _ = master_process.wait_connected().fuse() => {
-                anyhow::Ok(())
+
+            if master_process.as_mut().try_status()?.is_some() {
+                let mut output = Vec::new();
+                let mut stderr = master_process.as_mut().stderr.take().unwrap();
+                stderr.read_to_end(&mut output).await?;
+
+                let error_message = format!(
+                    "failed to connect: {}",
+                    String::from_utf8_lossy(&output).trim()
+                );
+                anyhow::bail!(error_message);
             }
+
+            let socket = SshSocket::new(connection_options, socket_path).await?;
+            drop(askpass);
+            (socket, Some(master_process))
         };
 
-        if let Err(e) = result {
-            return Err(e.context("Failed to connect to host"));
-        }
+        #[cfg(windows)]
+        let (socket, master_process_option) = {
+            let askpass_delegate = askpass::AskPassDelegate::new_with_cancellation(cx, {
+                let delegate = delegate.clone();
+                move |prompt, tx, cancellation, cx| {
+                    delegate.ask_password(prompt, tx, cancellation, cx)
+                }
+            });
 
-        if master_process.as_mut().try_status()?.is_some() {
-            let mut output = Vec::new();
-            output.clear();
-            let mut stderr = master_process.as_mut().stderr.take().unwrap();
-            stderr.read_to_end(&mut output).await?;
+            let mut askpass =
+                askpass::AskPassSession::new(cx.background_executor().clone(), askpass_delegate)
+                    .await?;
 
-            let error_message = format!("failed to connect: {}", String::from_utf8_lossy(&output).trim());
-            anyhow::bail!(error_message);
-        }
+            delegate.set_status(Some("Connecting"), cx);
 
-        let socket = cfg_select! {
-            windows => SshSocket::new(
+            let mut master_process = MasterProcess::new(
+                askpass.script_path().as_ref(),
+                askpass.socket_path().as_ref(),
+                connection_options.additional_args(),
+                &destination,
+            )?;
+
+            let result = select_biased! {
+                result = askpass.run(Some(SSH_CONNECTION_PROMPT_TIMEOUT)).fuse() => {
+                    match result {
+                        AskPassResult::CancelledByUser => {
+                            master_process.as_mut().kill().ok();
+                            anyhow::bail!("SSH connection canceled")
+                        }
+                        AskPassResult::Timedout => {
+                            anyhow::bail!("connecting to host timed out")
+                        }
+                    }
+                }
+                _ = master_process.wait_connected().fuse() => {
+                    anyhow::Ok(())
+                }
+            };
+
+            if let Err(e) = result {
+                return Err(e.context("Failed to connect to host"));
+            }
+
+            if master_process.as_mut().try_status()?.is_some() {
+                let mut output = Vec::new();
+                let mut stderr = master_process.as_mut().stderr.take().unwrap();
+                stderr.read_to_end(&mut output).await?;
+
+                let error_message = format!(
+                    "failed to connect: {}",
+                    String::from_utf8_lossy(&output).trim()
+                );
+                anyhow::bail!(error_message);
+            }
+
+            let socket = SshSocket::new(
                 connection_options,
                 askpass
                     .get_password()
                     .or_else(|| askpass::EncryptedPassword::try_from("").ok())
                     .context("Failed to fetch askpass password")?,
                 cx.background_executor().clone(),
-            ),
-            _ => SshSocket::new(connection_options, socket_path),
-        }
-        .await?;
-        drop(askpass);
+            )
+            .await?;
+            drop(askpass);
 
-        let ssh_shell = socket.shell().await;
-        log::info!("Remote shell discovered: {}", ssh_shell);
-        let ssh_platform = socket.platform(ShellKind::new(&ssh_shell, false)).await?;
-        log::info!("Remote platform discovered: {:?}", ssh_platform);
-        let ssh_path_style = match ssh_platform.os {
-            "windows" => PathStyle::Windows,
-            _ => PathStyle::Posix,
+            (socket, Some(master_process))
         };
-        let ssh_default_system_shell = String::from("/bin/sh");
-        let ssh_shell_kind = ShellKind::new(
-            &ssh_shell,
-            match ssh_platform.os {
-                "windows" => true,
-                _ => false,
-            },
-        );
+
+        let is_windows = socket.probe_is_windows().await;
+        log::info!("Remote is windows: {}", is_windows);
+
+        let ssh_shell = socket.shell(is_windows).await;
+        log::info!("Remote shell discovered: {}", ssh_shell);
+
+        let ssh_shell_kind = ShellKind::new(&ssh_shell, is_windows);
+        let ssh_platform = socket.platform(ssh_shell_kind, is_windows).await?;
+        log::info!("Remote platform discovered: {:?}", ssh_platform);
+
+        let ssh_os_version = socket.os_version(ssh_platform.os, ssh_shell_kind).await;
+        log::info!("Remote OS version discovered: {:?}", ssh_os_version);
+
+        let (ssh_path_style, ssh_default_system_shell) = match ssh_platform.os {
+            RemoteOs::Windows => (PathStyle::Windows, ssh_shell.clone()),
+            _ => (PathStyle::Unix, String::from("/bin/sh")),
+        };
 
         let mut this = Self {
             socket,
-            master_process: Mutex::new(Some(master_process)),
+            master_process: Mutex::new(master_process_option),
+            killed: AtomicBool::new(false),
             _temp_dir: temp_dir,
             remote_binary_path: None,
             ssh_path_style,
             ssh_platform,
+            ssh_os_version,
             ssh_shell,
             ssh_shell_kind,
             ssh_default_system_shell,
         };
 
-        let (release_channel, version) = cx.update(|cx| (ReleaseChannel::global(cx), AppVersion::global(cx)))?;
+        let (release_channel, version) =
+            cx.update(|cx| (ReleaseChannel::global(cx), AppVersion::global(cx)));
         this.remote_binary_path = Some(
             this.ensure_server_binary(&delegate, release_channel, version, cx)
                 .await?,
@@ -564,175 +834,277 @@ impl SshRemoteConnection {
         &self,
         delegate: &Arc<dyn RemoteClientDelegate>,
         release_channel: ReleaseChannel,
-        version: SemanticVersion,
+        version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
         let version_str = match release_channel {
             ReleaseChannel::Dev => "build".to_string(),
             _ => version.to_string(),
         };
-        let binary_name = format!("gram-remote-server-{}-{}", release_channel.dev_name(), version_str);
-
-        // is there a valid version in $PATH
-        let relative_binary_path = RelPath::unix(&binary_name).unwrap();
-        if matches!(
-            self.try_server_binary(relative_binary_path).await?,
-            ServerBinaryStatus::Found
-        ) {
-            return Ok(relative_binary_path.into());
-        }
-
-        let abs_binary_path = paths::remote_server_dir_relative().join(relative_binary_path);
-
-        cfg_select! {
-            debug_assertions => {
-                if let Some(remote_server_path) =
-                    super::build_remote_server_from_source(&self.ssh_platform, delegate.as_ref(), cx).await?
-                {
-                    let tmp_path = paths::remote_server_dir_relative().join(
-                        RelPath::unix(&format!(
-                            "download-{}-{}",
-                            std::process::id(),
-                            remote_server_path.file_name().unwrap().to_string_lossy()
-                        ))
-                        .unwrap(),
-                    );
-                    self.upload_local_server_binary(&remote_server_path, &tmp_path, delegate, cx)
-                        .await?;
-                    self.extract_server_binary(&abs_binary_path, &tmp_path, delegate, cx).await?;
-                    return Ok(abs_binary_path);
-                }
-            },
-            _ => {
-                let _ = delegate;
-                let _ = cx;
-                let _ = &self.ssh_platform;
+        let binary_name = format!(
+            "zed-remote-server-{}-{}{}",
+            release_channel.dev_name(),
+            version_str,
+            if self.ssh_platform.os.is_windows() {
+                ".exe"
+            } else {
+                ""
             }
-        }
-
-        let abs_result = self.try_server_binary(&abs_binary_path).await?;
-        if matches!(abs_result, ServerBinaryStatus::Found) {
-            return Ok(abs_binary_path);
-        }
-
-        let has_pre_built_binary = release_channel == ReleaseChannel::Stable
-            && matches!(self.ssh_platform.os, "linux" | "macos")
-            && matches!(self.ssh_platform.arch, "aarch64" | "x86_64");
-        if has_pre_built_binary {
-            let quote = |v| self.ssh_shell_kind.try_quote(v).context("shell quoting");
-
-            let download_url = format!(
-                "\
-                https://codeberg.org/GramEditor/gram/releases/download/{version}/\
-                gram-remote-server-{}-{}-{version}.gz",
-                self.ssh_platform.os, self.ssh_platform.arch,
-            );
-
-            let quoted_dir = quote(paths::remote_server_dir_relative().as_unix_str())?;
-            let quoted_path = quote(abs_binary_path.as_unix_str())?;
-            let quoted_download_url = quote(&download_url)?;
-            let command = format!(
-                "\
-                mkdir -p {quoted_dir} && \
-                wget -O- {quoted_download_url} | gunzip >{quoted_path} && \
-                chmod +x {quoted_path} && \
-                echo Done.\
-            "
-            );
-            let quoted_command = quote(&command)?;
-
-            let host = self.socket.connection_options.host.to_string();
-            let quoted_host = quote(&host)?;
-            // The space between the colon and the newline in 'the following command: \n\n'
-            // exists in order to work around a bug in Gram's Markdown renderer's selection logic.
-            // Without that space, double-clicking the word 'ssh' selects the phrase
-            // 'command:ssh' even though they're in different Markdown paragraphs.
-            anyhow::bail!(
-                "\
-                Could not find remote server at {0:?}. \
-                You can install the server using the following command:\n\n\
-                ssh {quoted_host} {quoted_command}\n",
-                abs_binary_path.display(self.path_style())
-            );
-        }
-
-        match abs_result {
-            ServerBinaryStatus::NotExecutable => {
-                anyhow::bail!(
-                    "Could not run remote server at {:?}: Permission Denied",
-                    abs_binary_path.display(self.path_style())
-                );
-            }
-            ServerBinaryStatus::NotFound => {
-                anyhow::bail!(
-                    "Could not find remote server at {:?}",
-                    abs_binary_path.display(self.path_style())
-                );
-            }
-            ServerBinaryStatus::Found => unreachable!(),
-        }
-    }
-
-    async fn try_server_binary(&self, path: &RelPath) -> Result<ServerBinaryStatus> {
-        let path_str = path.display(self.path_style());
-        let script = format!(
-            "if [ ! -f {path_str} ]; then echo NOT_FOUND; \
-             elif [ ! -x {path_str} ]; then echo NOT_EXECUTABLE; \
-             else {path_str} version; fi"
         );
+        let dst_path =
+            paths::remote_server_dir_relative().join(RelPath::from_unix_str(&binary_name).unwrap());
 
-        let output = self
+        let binary_exists_on_server = self
             .socket
-            .run_command(self.ssh_shell_kind, "sh", &["-c", &script], true)
+            .run_command(
+                self.ssh_shell_kind,
+                &dst_path.display(self.path_style()),
+                &["version"],
+                true,
+            )
             .await
-            .context("Failed to check remote server binary")?;
+            .is_ok();
 
-        if output.contains("NOT_FOUND") {
-            Ok(ServerBinaryStatus::NotFound)
-        } else if output.contains("NOT_EXECUTABLE") {
-            Ok(ServerBinaryStatus::NotExecutable)
-        } else {
-            Ok(ServerBinaryStatus::Found)
+        #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+        if let Some(remote_server_path) = super::build_remote_server_from_source(
+            &self.ssh_platform,
+            delegate.as_ref(),
+            binary_exists_on_server,
+            cx,
+        )
+        .await?
+        {
+            let tmp_path = paths::remote_server_dir_relative().join(
+                RelPath::from_unix_str(&format!(
+                    "download-{}-{}",
+                    std::process::id(),
+                    remote_server_path.file_name().unwrap().to_string_lossy()
+                ))
+                .unwrap(),
+            );
+            self.upload_local_server_binary(&remote_server_path, &tmp_path, delegate, cx)
+                .await?;
+            self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)
+                .await?;
+            return Ok(dst_path.into());
         }
+
+        if binary_exists_on_server {
+            return Ok(dst_path.into());
+        }
+
+        let wanted_version = cx.update(|cx| match release_channel {
+            ReleaseChannel::Nightly => Ok(None),
+            ReleaseChannel::Dev => {
+                anyhow::bail!(
+                    "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
+                    dst_path
+                )
+            }
+            _ => Ok(Some(AppVersion::global(cx))),
+        })?;
+
+        let tmp_path_compressed = remote_server_dir_relative().join(
+            RelPath::from_unix_str(&format!(
+                "{}-download-{}.{}",
+                binary_name,
+                std::process::id(),
+                if self.ssh_platform.os.is_windows() {
+                    "zip"
+                } else {
+                    "gz"
+                }
+            ))
+            .unwrap(),
+        );
+        if !self.socket.connection_options.upload_binary_over_ssh
+            && let Some(url) = delegate
+                .get_download_url(
+                    self.ssh_platform,
+                    release_channel,
+                    wanted_version.clone(),
+                    cx,
+                )
+                .await?
+        {
+            match self
+                .download_binary_on_server(&url, &tmp_path_compressed, delegate, cx)
+                .await
+            {
+                Ok(_) => {
+                    self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
+                        .await
+                        .context("extracting server binary")?;
+                    return Ok(dst_path.into());
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to download binary on server, attempting to download locally and then upload it the server: {e:#}",
+                    )
+                }
+            }
+        }
+
+        let src_path = delegate
+            .download_server_binary_locally(
+                self.ssh_platform,
+                release_channel,
+                wanted_version.clone(),
+                cx,
+            )
+            .await
+            .context("downloading server binary locally")?;
+        self.upload_local_server_binary(&src_path, &tmp_path_compressed, delegate, cx)
+            .await
+            .context("uploading server binary")?;
+        self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
+            .await
+            .context("extracting server binary")?;
+        Ok(dst_path.into())
     }
 
-    #[cfg(debug_assertions)]
-    async fn upload_local_server_binary(
+    async fn download_binary_on_server(
         &self,
-        src_path: &Path,
-        tmp_path_gz: &RelPath,
+        url: &str,
+        tmp_path: &RelPath,
         delegate: &Arc<dyn RemoteClientDelegate>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
-        if let Some(parent) = tmp_path_gz.parent() {
-            self.socket
+        if let Some(parent) = tmp_path.parent() {
+            let res = self
+                .socket
                 .run_command(
                     self.ssh_shell_kind,
                     "mkdir",
                     &["-p", parent.display(self.path_style()).as_ref()],
                     true,
                 )
-                .await?;
+                .await;
+            if !self.ssh_platform.os.is_windows() {
+                // mkdir fails on windows if the path already exists ...
+                res?;
+            }
         }
 
-        let src_stat = fs::metadata(&src_path).await?;
+        delegate.set_status(Some("Downloading remote development server on host"), cx);
+
+        let connection_timeout = self
+            .socket
+            .connection_options
+            .connection_timeout
+            .unwrap_or(10)
+            .to_string();
+
+        match self
+            .socket
+            .run_command(
+                self.ssh_shell_kind,
+                "curl",
+                &[
+                    "-f",
+                    "-L",
+                    "--connect-timeout",
+                    &connection_timeout,
+                    url,
+                    "-o",
+                    &tmp_path.display(self.path_style()),
+                ],
+                true,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                if self
+                    .socket
+                    .run_command(self.ssh_shell_kind, "which", &["curl"], true)
+                    .await
+                    .is_ok()
+                {
+                    return Err(e);
+                }
+
+                log::info!("curl is not available, trying wget");
+                match self
+                    .socket
+                    .run_command(
+                        self.ssh_shell_kind,
+                        "wget",
+                        &[
+                            "--connect-timeout",
+                            &connection_timeout,
+                            "--tries",
+                            "1",
+                            url,
+                            "-O",
+                            &tmp_path.display(self.path_style()),
+                        ],
+                        true,
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        if self
+                            .socket
+                            .run_command(self.ssh_shell_kind, "which", &["wget"], true)
+                            .await
+                            .is_ok()
+                        {
+                            return Err(e);
+                        } else {
+                            anyhow::bail!("Neither curl nor wget is available");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn upload_local_server_binary(
+        &self,
+        src_path: &Path,
+        tmp_path: &RelPath,
+        delegate: &Arc<dyn RemoteClientDelegate>,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        if let Some(parent) = tmp_path.parent() {
+            let res = self
+                .socket
+                .run_command(
+                    self.ssh_shell_kind,
+                    "mkdir",
+                    &["-p", parent.display(self.path_style()).as_ref()],
+                    true,
+                )
+                .await;
+            if !self.ssh_platform.os.is_windows() {
+                // mkdir fails on windows if the path already exists ...
+                res?;
+            }
+        }
+
+        let src_stat = fs::metadata(&src_path)
+            .await
+            .with_context(|| format!("failed to get metadata for {:?}", src_path))?;
         let size = src_stat.len();
 
         let t0 = Instant::now();
         delegate.set_status(Some("Uploading remote development server"), cx);
         log::info!(
             "uploading remote development server to {:?} ({}kb)",
-            tmp_path_gz,
+            tmp_path,
             size / 1024
         );
-        self.upload_file(src_path, tmp_path_gz)
+        self.upload_file(src_path, tmp_path)
             .await
             .context("failed to upload server binary")?;
         log::info!("uploaded remote development server in {:?}", t0.elapsed());
         Ok(())
     }
 
-    #[cfg(debug_assertions)]
     async fn extract_server_binary(
         &self,
         dst_path: &RelPath,
@@ -741,37 +1113,105 @@ impl SshRemoteConnection {
         cx: &mut AsyncApp,
     ) -> Result<()> {
         delegate.set_status(Some("Extracting remote development server"), cx);
-        let server_mode = 0o755;
 
+        if self.ssh_platform.os.is_windows() {
+            self.extract_server_binary_windows(dst_path, tmp_path).await
+        } else {
+            self.extract_server_binary_posix(dst_path, tmp_path).await
+        }
+    }
+
+    async fn extract_server_binary_posix(
+        &self,
+        dst_path: &RelPath,
+        tmp_path: &RelPath,
+    ) -> Result<()> {
         let shell_kind = ShellKind::Posix;
+        let server_mode = 0o755;
         let orig_tmp_path = tmp_path.display(self.path_style());
         let server_mode = format!("{:o}", server_mode);
-        let server_mode = shell_kind.try_quote(&server_mode).context("shell quoting")?;
+        let server_mode = shell_kind
+            .try_quote(&server_mode)
+            .context("shell quoting")?;
         let dst_path = dst_path.display(self.path_style());
         let dst_path = shell_kind.try_quote(&dst_path).context("shell quoting")?;
         let script = if let Some(tmp_path) = orig_tmp_path.strip_suffix(".gz") {
-            let orig_tmp_path = shell_kind.try_quote(&orig_tmp_path).context("shell quoting")?;
+            let orig_tmp_path = shell_kind
+                .try_quote(&orig_tmp_path)
+                .context("shell quoting")?;
             let tmp_path = shell_kind.try_quote(&tmp_path).context("shell quoting")?;
-            format!("gunzip -f {orig_tmp_path} && chmod {server_mode} {tmp_path} && mv {tmp_path} {dst_path}",)
+            format!(
+                "gunzip -f {orig_tmp_path} && chmod {server_mode} {tmp_path} && mv {tmp_path} {dst_path}",
+            )
         } else {
-            let orig_tmp_path = shell_kind.try_quote(&orig_tmp_path).context("shell quoting")?;
+            let orig_tmp_path = shell_kind
+                .try_quote(&orig_tmp_path)
+                .context("shell quoting")?;
             format!("chmod {server_mode} {orig_tmp_path} && mv {orig_tmp_path} {dst_path}",)
         };
         let args = shell_kind.args_for_shell(false, script.to_string());
-        self.socket.run_command(shell_kind, "sh", &args, true).await?;
+        self.socket
+            .run_command(self.ssh_shell_kind, "sh", &args, true)
+            .await?;
         Ok(())
     }
 
-    fn build_scp_command(&self, src_path: &Path, dest_path_str: &str, args: Option<&[&str]>) -> process::Command {
-        let mut command = util::command::new_smol_command("scp");
-        self.socket.ssh_options(&mut command, false).args(
-            self.socket
-                .connection_options
-                .port
-                .map(|port| vec!["-P".to_string(), port.to_string()])
-                .unwrap_or_default(),
-        );
-        if let Some(args) = args {
+    async fn extract_server_binary_windows(
+        &self,
+        dst_path: &RelPath,
+        tmp_path: &RelPath,
+    ) -> Result<()> {
+        let shell_kind = ShellKind::Pwsh;
+        let orig_tmp_path = tmp_path.display(self.path_style());
+        let dst_path = dst_path.display(self.path_style());
+        let dst_path = shell_kind.try_quote(&dst_path).context("shell quoting")?;
+
+        let script = if let Some(tmp_path) = orig_tmp_path.strip_suffix(".zip") {
+            let orig_tmp_path = shell_kind
+                .try_quote(&orig_tmp_path)
+                .context("shell quoting")?;
+            let tmp_path = shell_kind.try_quote(tmp_path).context("shell quoting")?;
+            let tmp_exe_path = format!("{tmp_path}\\remote_server.exe");
+            let tmp_exe_path = shell_kind
+                .try_quote(&tmp_exe_path)
+                .context("shell quoting")?;
+            format!(
+                "Expand-Archive -Force -Path {orig_tmp_path} -DestinationPath {tmp_path} -ErrorAction Stop; Move-Item -Force {tmp_exe_path} {dst_path}; Remove-Item -Force {tmp_path} -Recurse; Remove-Item -Force {orig_tmp_path}",
+            )
+        } else {
+            let orig_tmp_path = shell_kind
+                .try_quote(&orig_tmp_path)
+                .context("shell quoting")?;
+            format!("Move-Item -Force {orig_tmp_path} {dst_path}")
+        };
+
+        let args = shell_kind.args_for_shell(false, script);
+        self.socket
+            .run_command(self.ssh_shell_kind, "powershell", &args, true)
+            .await?;
+        Ok(())
+    }
+
+    fn build_scp_command(
+        &self,
+        src_path: &Path,
+        dest_path_str: &str,
+        additional_args: Option<&[&str]>,
+    ) -> util::command::Command {
+        /// These arguments exist for `ssh` but don't exist / don't have the same semantic for `scp`.
+        const SSH_DENY_ARGS_FOR_SCP: &[&str] = &["-X", "-Y"];
+
+        let mut command = util::command::new_command("scp");
+        self.socket
+            .ssh_options(&mut command, false, Some(SSH_DENY_ARGS_FOR_SCP))
+            .args(
+                self.socket
+                    .connection_options
+                    .port
+                    .map(|port| vec!["-P".to_string(), port.to_string()])
+                    .unwrap_or_default(),
+            );
+        if let Some(args) = additional_args {
             command.args(args);
         }
         command.arg(src_path).arg(format!(
@@ -782,22 +1222,26 @@ impl SshRemoteConnection {
         command
     }
 
-    fn build_sftp_command(&self) -> process::Command {
-        let mut command = util::command::new_smol_command("sftp");
-        self.socket.ssh_options(&mut command, false).args(
-            self.socket
-                .connection_options
-                .port
-                .map(|port| vec!["-P".to_string(), port.to_string()])
-                .unwrap_or_default(),
-        );
+    fn build_sftp_command(&self) -> util::command::Command {
+        // these arguments exist for "ssh" but don't exist / don't have the same semantic for "sftp"
+        const SSH_DENY_ARGS_FOR_SFTP: &[&str] = &["-X", "-Y"];
+
+        let mut command = util::command::new_command("sftp");
+        self.socket
+            .ssh_options(&mut command, false, Some(SSH_DENY_ARGS_FOR_SFTP))
+            .args(
+                self.socket
+                    .connection_options
+                    .port
+                    .map(|port| vec!["-P".to_string(), port.to_string()])
+                    .unwrap_or_default(),
+            );
         command.arg("-b").arg("-");
         command.arg(self.socket.connection_options.scp_destination());
         command.stdin(Stdio::piped());
         command
     }
 
-    #[cfg(debug_assertions)]
     async fn upload_file(&self, src_path: &Path, dest_path: &RelPath) -> Result<()> {
         log::debug!("uploading file {:?} to {:?}", src_path, dest_path);
 
@@ -813,7 +1257,7 @@ impl SshRemoteConnection {
         if Self::is_sftp_available().await {
             log::debug!("using SFTP for file upload");
             let mut command = self.build_sftp_command();
-            let sftp_batch = format!("put {src_path_display} {dest_path_str}\n");
+            let sftp_batch = sftp_put_command(&src_path_display, &dest_path_str);
 
             let mut child = command.spawn()?;
             if let Some(mut stdin) = child.stdin.take() {
@@ -828,7 +1272,9 @@ impl SshRemoteConnection {
             }
 
             let stderr = String::from_utf8_lossy(&output.stderr);
-            log::debug!("failed to upload file via SFTP {src_path_display} -> {dest_path_str}: {stderr}");
+            log::debug!(
+                "failed to upload file via SFTP {src_path_display} -> {dest_path_str}: {stderr}"
+            );
         }
 
         log::debug!("using SCP for file upload");
@@ -840,7 +1286,9 @@ impl SshRemoteConnection {
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        log::debug!("failed to upload file via SCP {src_path_display} -> {dest_path_str}: {stderr}",);
+        log::debug!(
+            "failed to upload file via SCP {src_path_display} -> {dest_path_str}: {stderr}",
+        );
         anyhow::bail!(
             "failed to upload file via STFP/SCP {} -> {}: {}",
             src_path_display,
@@ -855,7 +1303,7 @@ impl SshRemoteConnection {
 }
 
 impl SshSocket {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(windows))]
     async fn new(options: SshConnectionOptions, socket_path: PathBuf) -> Result<Self> {
         Ok(Self {
             connection_options: options,
@@ -864,20 +1312,25 @@ impl SshSocket {
         })
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     async fn new(
         options: SshConnectionOptions,
         password: askpass::EncryptedPassword,
         executor: gpui::BackgroundExecutor,
     ) -> Result<Self> {
         let mut envs = HashMap::default();
-        let get_password = move |_| Task::ready(std::ops::ControlFlow::Continue(Ok(password.clone())));
+        let get_password =
+            move |_| Task::ready(std::ops::ControlFlow::Continue(Ok(password.clone())));
 
-        let _proxy = askpass::PasswordProxy::new(get_password, executor).await?;
+        let _proxy = askpass::PasswordProxy::new(Box::new(get_password), executor).await?;
         envs.insert("SSH_ASKPASS_REQUIRE".into(), "force".into());
         envs.insert(
             "SSH_ASKPASS".into(),
             _proxy.script_path().as_ref().display().to_string(),
+        );
+        envs.insert(
+            "ZED_ASKPASS_SOCKET".into(),
+            _proxy.socket_path().as_ref().display().to_string(),
         );
 
         Ok(Self {
@@ -899,8 +1352,8 @@ impl SshSocket {
         program: &str,
         args: &[impl AsRef<str>],
         allow_pseudo_tty: bool,
-    ) -> process::Command {
-        let mut command = util::command::new_smol_command("ssh");
+    ) -> util::command::Command {
+        let mut command = util::command::new_command("ssh");
         let program = shell_kind.prepend_command_prefix(program);
         let mut to_run = shell_kind
             .try_quote_prefix_aware(&program)
@@ -915,9 +1368,13 @@ impl SshSocket {
             to_run.push(' ');
             to_run.push_str(&shell_kind.try_quote(arg.as_ref()).expect("shell quoting"));
         }
-        let separator = shell_kind.sequential_commands_separator();
-        let to_run = format!("cd{separator} {to_run}");
-        self.ssh_options(&mut command, true)
+        let to_run = if shell_kind == ShellKind::Cmd {
+            to_run // 'cd' prints the current directory in CMD
+        } else {
+            let separator = shell_kind.sequential_commands_separator();
+            format!("cd{separator} {to_run}")
+        };
+        self.ssh_options(&mut command, true, None)
             .arg(self.connection_options.ssh_destination());
         if !allow_pseudo_tty {
             command.arg("-T");
@@ -936,6 +1393,7 @@ impl SshSocket {
     ) -> Result<String> {
         let mut command = self.ssh_command(shell_kind, program, args, allow_pseudo_tty);
         let output = command.output().await?;
+        log::debug!("{:?}: {:?}", command, output);
         anyhow::ensure!(
             output.status.success(),
             "failed to run command {command:?}: {}",
@@ -946,74 +1404,168 @@ impl SshSocket {
 
     fn ssh_options<'a>(
         &self,
-        command: &'a mut process::Command,
+        command: &'a mut util::command::Command,
         include_port_forwards: bool,
-    ) -> &'a mut process::Command {
-        cfg_select! {
-            windows => {
-                let args = if include_port_forwards {
-                    self.connection_options.additional_args()
-                } else {
-                    self.connection_options.additional_args_for_scp()
-                };
+        deny_args: Option<&[&str]>,
+    ) -> &'a mut util::command::Command {
+        let mut args = if include_port_forwards {
+            self.connection_options.additional_args()
+        } else {
+            self.connection_options.additional_args_for_scp()
+        };
 
-                command
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .args(args)
-                    .envs(self.envs.clone())
-            }
-            _ => {
-                let args = if include_port_forwards {
-                    self.connection_options.additional_args()
-                } else {
-                    self.connection_options.additional_args_for_scp()
-                };
+        // draining all arguments that are explicitly denied
+        if let Some(deny_args) = deny_args {
+            args.retain(|x| !deny_args.contains(&x.as_str()));
+        }
 
-                command
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .args(args)
-                    .args(["-o", "ControlMaster=no", "-o"])
-                    .arg(format!("ControlPath={}", self.socket_path.display()))
-            },
+        let cmd = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .args(args);
+
+        if cfg!(windows) {
+            cmd.envs(self.envs.clone());
+        }
+        #[cfg(not(windows))]
+        {
+            cmd.args(["-o", "ControlMaster=no", "-o"])
+                .arg(format!("ControlPath={}", self.socket_path.display()));
+        }
+        cmd
+    }
+
+    // Returns the SSH command-line options (without the destination) for building commands.
+    // On Linux, this includes the ControlPath option to reuse the existing connection.
+    // Note: The destination must be added separately after all options to ensure proper
+    // SSH command structure: ssh [options] destination [command]
+    fn ssh_command_options(&self) -> Vec<String> {
+        let arguments = self.connection_options.additional_args();
+        #[cfg(not(windows))]
+        let arguments = {
+            let mut args = arguments;
+            args.extend(vec![
+                "-o".to_string(),
+                "ControlMaster=no".to_string(),
+                "-o".to_string(),
+                format!("ControlPath={}", self.socket_path.display()),
+            ]);
+            args
+        };
+        arguments
+    }
+
+    async fn platform(&self, shell: ShellKind, is_windows: bool) -> Result<RemotePlatform> {
+        if is_windows {
+            self.platform_windows(shell).await
+        } else {
+            self.platform_posix(shell).await
         }
     }
 
-    // On Windows, we need to use `SSH_ASKPASS` to provide the password to ssh.
-    // On Linux, we use the `ControlPath` option to create a socket file that ssh can use to
-    fn ssh_args(&self) -> Vec<String> {
-        cfg_select! {
-            windows => {
-                let mut arguments = self.connection_options.additional_args();
-                arguments.push(self.connection_options.ssh_destination());
-                arguments
-            }
-            _ => {
-                let mut arguments = self.connection_options.additional_args();
-                arguments.extend(vec![
-                    "-o".to_string(),
-                    "ControlMaster=no".to_string(),
-                    "-o".to_string(),
-                    format!("ControlPath={}", self.socket_path.display()),
-                    self.connection_options.ssh_destination(),
-                ]);
-                arguments
-            }
-        }
-    }
-
-    async fn platform(&self, shell: ShellKind) -> Result<RemotePlatform> {
-        let output = self.run_command(shell, "uname", &["-sm"], false).await?;
+    async fn platform_posix(&self, shell: ShellKind) -> Result<RemotePlatform> {
+        let output = self
+            .run_command(shell, "uname", &["-sm"], false)
+            .await
+            .context("Failed to run 'uname -sm' to determine platform")?;
         parse_platform(&output)
     }
 
-    async fn shell(&self) -> String {
+    /// Best-effort detection of the remote OS version. Failures are logged and
+    /// result in `None` rather than failing the connection, since this is only
+    /// used for telemetry.
+    async fn os_version(&self, os: RemoteOs, shell: ShellKind) -> Option<String> {
+        let (program, args) = super::os_version_command(os);
+        match self.run_command(shell, program, args, false).await {
+            Ok(output) => super::parse_os_version(os, &output),
+            Err(error) => {
+                log::warn!("Failed to determine remote OS version: {error:#}");
+                None
+            }
+        }
+    }
+
+    async fn platform_windows(&self, shell: ShellKind) -> Result<RemotePlatform> {
+        let output = self
+            .run_command(
+                shell,
+                "cmd.exe",
+                &["/c", "echo", "%PROCESSOR_ARCHITECTURE%"],
+                false,
+            )
+            .await
+            .context(
+                "Failed to run 'echo %PROCESSOR_ARCHITECTURE%' to determine Windows architecture",
+            )?;
+
+        Ok(RemotePlatform {
+            os: RemoteOs::Windows,
+            arch: match output.trim() {
+                "AMD64" => RemoteArch::X86_64,
+                "ARM64" => RemoteArch::Aarch64,
+                arch => anyhow::bail!(
+                    "Prebuilt remote servers are not yet available for windows-{arch}. See https://zed.dev/docs/remote-development"
+                ),
+            },
+        })
+    }
+
+    /// Probes whether the remote host is running Windows.
+    ///
+    /// This is done by attempting to run a simple Windows-specific command.
+    /// If it succeeds and returns Windows-like output, we assume it's Windows.
+    async fn probe_is_windows(&self) -> bool {
+        match self
+            .run_command(ShellKind::Cmd, "cmd.exe", &["/c", "ver"], false)
+            .await
+        {
+            // Windows 'ver' command outputs something like "Microsoft Windows [Version 10.0.19045.5011]"
+            Ok(output) => output.trim().contains("indows"),
+            Err(_) => false,
+        }
+    }
+
+    async fn shell(&self, is_windows: bool) -> String {
+        if is_windows {
+            self.shell_windows().await
+        } else {
+            self.shell_posix().await
+        }
+    }
+
+    async fn shell_posix(&self) -> String {
         const DEFAULT_SHELL: &str = "sh";
         match self
             .run_command(ShellKind::Posix, "sh", &["-c", "echo $SHELL"], false)
+            .await
+        {
+            Ok(output) => parse_shell(&output, DEFAULT_SHELL),
+            Err(e) => {
+                log::error!("Failed to detect remote shell: {e}");
+                DEFAULT_SHELL.to_owned()
+            }
+        }
+    }
+
+    async fn shell_windows(&self) -> String {
+        const DEFAULT_SHELL: &str = "cmd.exe";
+
+        // We detect the shell used by the SSH session by running the following command in PowerShell:
+        // (Get-CimInstance Win32_Process -Filter "ProcessId = $((Get-CimInstance Win32_Process -Filter ProcessId=$PID).ParentProcessId)").Name
+        // This prints the name of PowerShell's parent process (which will be the shell that SSH launched).
+        // We pass it as a Base64 encoded string since we don't yet know how to correctly quote that command.
+        // (We'd need to know what the shell is to do that...)
+        match self
+            .run_command(
+                ShellKind::Cmd,
+                "powershell",
+                &[
+                    "-E",
+                    "KABHAGUAdAAtAEMAaQBtAEkAbgBzAHQAYQBuAGMAZQAgAFcAaQBuADMAMgBfAFAAcgBvAGMAZQBzAHMAIAAtAEYAaQBsAHQAZQByACAAIgBQAHIAbwBjAGUAcwBzAEkAZAAgAD0AIAAkACgAKABHAGUAdAAtAEMAaQBtAEkAbgBzAHQAYQBuAGMAZQAgAFcAaQBuADMAMgBfAFAAcgBvAGMAZQBzAHMAIAAtAEYAaQBsAHQAZQByACAAUAByAG8AYwBlAHMAcwBJAGQAPQAkAFAASQBEACkALgBQAGEAcgBlAG4AdABQAHIAbwBjAGUAcwBzAEkAZAApACIAKQAuAE4AYQBtAGUA",
+                ],
+                false,
+            )
             .await
         {
             Ok(output) => parse_shell(&output, DEFAULT_SHELL),
@@ -1031,33 +1583,71 @@ fn parse_port_number(port_str: &str) -> Result<u16> {
         .with_context(|| format!("parsing port number: {port_str}"))
 }
 
-fn parse_port_forward_spec(spec: &str) -> Result<SshPortForwardOption> {
-    let parts: Vec<&str> = spec.split(':').collect();
+fn split_port_forward_tokens(spec: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut chars = spec.chars().peekable();
 
-    match parts.len() {
+    while chars.peek().is_some() {
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            let mut bracket_content = String::new();
+            loop {
+                match chars.next() {
+                    Some(']') => break,
+                    Some(ch) => bracket_content.push(ch),
+                    None => anyhow::bail!("Unmatched '[' in port forward spec: {spec}"),
+                }
+            }
+            tokens.push(bracket_content);
+            if chars.peek() == Some(&':') {
+                chars.next();
+            }
+        } else {
+            let mut token = String::new();
+            for ch in chars.by_ref() {
+                if ch == ':' {
+                    break;
+                }
+                token.push(ch);
+            }
+            tokens.push(token);
+        }
+    }
+
+    Ok(tokens)
+}
+
+fn parse_port_forward_spec(spec: &str) -> Result<SshPortForwardOption> {
+    let tokens = if spec.contains('[') {
+        split_port_forward_tokens(spec)?
+    } else {
+        spec.split(':').map(String::from).collect()
+    };
+
+    match tokens.len() {
         4 => {
-            let local_port = parse_port_number(parts[1])?;
-            let remote_port = parse_port_number(parts[3])?;
+            let local_port = parse_port_number(&tokens[1])?;
+            let remote_port = parse_port_number(&tokens[3])?;
 
             Ok(SshPortForwardOption {
-                local_host: Some(parts[0].to_string()),
+                local_host: Some(tokens[0].clone()),
                 local_port,
-                remote_host: Some(parts[2].to_string()),
+                remote_host: Some(tokens[2].clone()),
                 remote_port,
             })
         }
         3 => {
-            let local_port = parse_port_number(parts[0])?;
-            let remote_port = parse_port_number(parts[2])?;
+            let local_port = parse_port_number(&tokens[0])?;
+            let remote_port = parse_port_number(&tokens[2])?;
 
             Ok(SshPortForwardOption {
                 local_host: None,
                 local_port,
-                remote_host: Some(parts[1].to_string()),
+                remote_host: Some(tokens[1].clone()),
                 remote_port,
             })
         }
-        _ => anyhow::bail!("Invalid port forward format"),
+        _ => anyhow::bail!("Invalid port forward format: {spec}"),
     }
 }
 
@@ -1071,12 +1661,18 @@ impl SshConnectionOptions {
         let mut port_forwards: Vec<SshPortForwardOption> = Vec::new();
 
         // disallowed: -E, -e, -F, -f, -G, -g, -M, -N, -n, -O, -q, -S, -s, -T, -t, -V, -v, -W
-        const ALLOWED_OPTS: &[&str] = &["-4", "-6", "-A", "-a", "-C", "-K", "-k", "-X", "-x", "-Y", "-y"];
+        const ALLOWED_OPTS: &[&str] = &[
+            "-4", "-6", "-A", "-a", "-C", "-K", "-k", "-X", "-x", "-Y", "-y",
+        ];
         const ALLOWED_ARGS: &[&str] = &[
-            "-B", "-b", "-c", "-D", "-F", "-I", "-i", "-J", "-l", "-m", "-o", "-P", "-p", "-R", "-w",
+            "-B", "-b", "-c", "-D", "-F", "-I", "-i", "-J", "-l", "-m", "-o", "-P", "-p", "-R",
+            "-w",
         ];
 
-        let mut tokens = ShellKind::Posix.split(input).context("invalid input")?.into_iter();
+        let mut tokens = ShellKind::Posix
+            .split(input)
+            .context("invalid input")?
+            .into_iter();
 
         'outer: while let Some(arg) = tokens.next() {
             if ALLOWED_OPTS.contains(&(&arg as &str)) {
@@ -1215,7 +1811,13 @@ impl SshConnectionOptions {
                     None => "localhost",
                 };
 
-                format!("-L{}:{}:{}:{}", local_host, pf.local_port, remote_host, pf.remote_port)
+                format!(
+                    "-L{}:{}:{}:{}",
+                    bracket_ipv6(local_host),
+                    pf.local_port,
+                    bracket_ipv6(remote_host),
+                    pf.remote_port
+                )
             }));
         }
 
@@ -1245,7 +1847,7 @@ impl SshConnectionOptions {
     }
 }
 
-fn build_command(
+fn build_command_posix(
     input_program: Option<String>,
     input_args: &[String],
     input_env: &HashMap<String, String>,
@@ -1255,7 +1857,9 @@ fn build_command(
     ssh_path_style: PathStyle,
     ssh_shell: &str,
     ssh_shell_kind: ShellKind,
-    ssh_args: Vec<String>,
+    ssh_options: Vec<String>,
+    ssh_destination: &str,
+    interactive: Interactive,
 ) -> Result<CommandTemplate> {
     use std::fmt::Write as _;
 
@@ -1263,30 +1867,53 @@ fn build_command(
     if let Some(working_dir) = working_dir {
         let working_dir = RemotePathBuf::new(working_dir, ssh_path_style).to_string();
 
-        // shlex will wrap the command in single quotes (''), disabling ~ expansion,
-        // replace with something that works
-        const TILDE_PREFIX: &'static str = "~/";
+        // For paths starting with ~/, we need $HOME to expand, but the remainder
+        // must be properly quoted to prevent command injection.
+        // Pattern: cd "$HOME"/'quoted/remainder' - $HOME expands, rest is single-quoted
+        const TILDE_PREFIX: &str = "~/";
         if working_dir.starts_with(TILDE_PREFIX) {
-            let working_dir = working_dir.trim_start_matches("~").trim_start_matches("/");
-            write!(
-                exec,
-                "cd \"$HOME/{working_dir}\" {} ",
-                ssh_shell_kind.sequential_and_commands_separator()
-            )?;
+            let remainder = working_dir.trim_start_matches(TILDE_PREFIX);
+            if remainder.is_empty() {
+                write!(
+                    exec,
+                    "cd \"$HOME\" {} ",
+                    ssh_shell_kind.sequential_and_commands_separator()
+                )?;
+            } else {
+                let quoted_remainder = ssh_shell_kind
+                    .try_quote(remainder)
+                    .context("shell quoting")?;
+                write!(
+                    exec,
+                    "cd \"$HOME\"/{quoted_remainder} {} ",
+                    ssh_shell_kind.sequential_and_commands_separator()
+                )?;
+            }
         } else {
+            let quoted_dir = ssh_shell_kind
+                .try_quote(&working_dir)
+                .context("shell quoting")?;
             write!(
                 exec,
-                "cd \"{working_dir}\" {} ",
+                "cd {quoted_dir} {} ",
                 ssh_shell_kind.sequential_and_commands_separator()
             )?;
         }
     } else {
-        write!(exec, "cd {} ", ssh_shell_kind.sequential_and_commands_separator())?;
+        write!(
+            exec,
+            "cd {} ",
+            ssh_shell_kind.sequential_and_commands_separator()
+        )?;
     };
     write!(exec, "exec env ")?;
 
     for (k, v) in input_env.iter() {
-        write!(exec, "{}={} ", k, ssh_shell_kind.try_quote(v).context("shell quoting")?)?;
+        let assignment = format!("{k}={v}");
+        let assignment = ssh_shell_kind
+            .try_quote(&assignment)
+            .context("shell quoting")?;
+        write!(exec, "{assignment} ")?;
     }
 
     if let Some(input_program) = input_program {
@@ -1299,25 +1926,141 @@ fn build_command(
         )?;
         for arg in input_args {
             let arg = ssh_shell_kind.try_quote(&arg).context("shell quoting")?;
-            write!(exec, " {}", arg)?;
+            write!(exec, " {arg}")?;
         }
     } else {
         write!(exec, "{ssh_shell} -l")?;
     };
 
     let mut args = Vec::new();
-    args.extend(ssh_args);
+    args.extend(ssh_options);
 
     if let Some((local_port, host, remote_port)) = port_forward {
         args.push("-L".into());
-        args.push(format!("{local_port}:{host}:{remote_port}"));
+        args.push(format!(
+            "{}:{}:{}",
+            local_port,
+            bracket_ipv6(&host),
+            remote_port
+        ));
     }
 
-    // -q suppresses the "Connection to ... closed." message that SSH prints when
-    // the connection terminates with -t (pseudo-terminal allocation)
-    args.push("-q".into());
-    args.push("-t".into());
+    // LogLevel=ERROR suppresses the "Connection to ... closed." message while
+    // preserving SSH errors.
+    args.extend(["-o".into(), "LogLevel=ERROR".into()]);
+    match interactive {
+        // -t forces pseudo-TTY allocation (for interactive use)
+        Interactive::Yes => args.push("-t".into()),
+        // -T disables pseudo-TTY allocation (for non-interactive piped stdio)
+        Interactive::No => args.push("-T".into()),
+    }
+    // The destination must come after all options but before the command
+    args.push(ssh_destination.into());
     args.push(exec);
+
+    Ok(CommandTemplate {
+        program: "ssh".into(),
+        args,
+        env: ssh_env,
+    })
+}
+
+fn build_command_windows(
+    input_program: Option<String>,
+    input_args: &[String],
+    _input_env: &HashMap<String, String>,
+    working_dir: Option<String>,
+    port_forward: Option<(u16, String, u16)>,
+    ssh_env: HashMap<String, String>,
+    ssh_path_style: PathStyle,
+    ssh_shell: &str,
+    _ssh_shell_kind: ShellKind,
+    ssh_options: Vec<String>,
+    ssh_destination: &str,
+    interactive: Interactive,
+) -> Result<CommandTemplate> {
+    use base64::Engine as _;
+    use std::fmt::Write as _;
+
+    let mut exec = String::new();
+    let shell_kind = ShellKind::PowerShell;
+
+    if let Some(working_dir) = working_dir {
+        let working_dir = RemotePathBuf::new(working_dir, ssh_path_style).to_string();
+
+        write!(
+            exec,
+            "Set-Location -Path {} {} ",
+            shell_kind
+                .try_quote(&working_dir)
+                .context("shell quoting")?,
+            shell_kind.sequential_and_commands_separator()
+        )?;
+    }
+
+    // Windows OpenSSH has an 8K character limit for command lines. Sending a lot of environment variables easily puts us over the limit.
+    // Until we have a better solution for this, we just won't set environment variables for now.
+    // for (k, v) in input_env.iter() {
+    //     write!(
+    //         exec,
+    //         "$env:{}={} {} ",
+    //         k,
+    //         shell_kind.try_quote(v).context("shell quoting")?,
+    //         shell_kind.sequential_and_commands_separator()
+    //     )?;
+    // }
+
+    if let Some(input_program) = input_program {
+        write!(
+            exec,
+            "{}",
+            shell_kind
+                .try_quote_prefix_aware(&shell_kind.prepend_command_prefix(&input_program))
+                .context("shell quoting")?
+        )?;
+        for arg in input_args {
+            let arg = shell_kind.try_quote(arg).context("shell quoting")?;
+            write!(exec, " {arg}")?;
+        }
+    } else {
+        // Launch an interactive shell session
+        write!(exec, "{ssh_shell}")?;
+    };
+
+    let mut args = Vec::new();
+    args.extend(ssh_options);
+
+    if let Some((local_port, host, remote_port)) = port_forward {
+        args.push("-L".into());
+        args.push(format!(
+            "{}:{}:{}",
+            local_port,
+            bracket_ipv6(&host),
+            remote_port
+        ));
+    }
+
+    // LogLevel=ERROR suppresses the "Connection to ... closed." message while
+    // preserving SSH errors.
+    args.extend(["-o".into(), "LogLevel=ERROR".into()]);
+    match interactive {
+        // -t forces pseudo-TTY allocation (for interactive use)
+        Interactive::Yes => args.push("-t".into()),
+        // -T disables pseudo-TTY allocation (for non-interactive piped stdio)
+        Interactive::No => args.push("-T".into()),
+    }
+
+    // The destination must come after all options but before the command
+    args.push(ssh_destination.into());
+
+    // Windows OpenSSH server incorrectly escapes the command string when the PTY is used.
+    // The simplest way to work around this is to use a base64 encoded command, which doesn't require escaping.
+    let utf16_bytes: Vec<u16> = exec.encode_utf16().collect();
+    let byte_slice: Vec<u8> = utf16_bytes.iter().flat_map(|&u| u.to_le_bytes()).collect();
+    let base64_encoded = base64::engine::general_purpose::STANDARD.encode(&byte_slice);
+
+    args.push(format!("powershell.exe -E {}", base64_encoded));
+
     Ok(CommandTemplate {
         program: "ssh".into(),
         args,
@@ -1336,17 +2079,40 @@ mod tests {
         let mut env = HashMap::default();
         env.insert("SSH_VAR".to_string(), "ssh-val".to_string());
 
-        let command = build_command(
+        // Test non-interactive command (interactive=false should use -T)
+        let command = build_command_posix(
             Some("remote_program".to_string()),
             &["arg1".to_string(), "arg2".to_string()],
             &input_env,
             Some("~/work".to_string()),
             None,
             env.clone(),
-            PathStyle::Posix,
+            PathStyle::Unix,
+            "/bin/bash",
+            ShellKind::Posix,
+            vec!["-o".to_string(), "ControlMaster=auto".to_string()],
+            "user@host",
+            Interactive::No,
+        )?;
+        assert_eq!(command.program, "ssh");
+        // Should contain -T for non-interactive
+        assert!(command.args.iter().any(|arg| arg == "-T"));
+        assert!(!command.args.iter().any(|arg| arg == "-t"));
+
+        // Test interactive command (interactive=true should use -t)
+        let command = build_command_posix(
+            Some("remote_program".to_string()),
+            &["arg1".to_string(), "arg2".to_string()],
+            &input_env,
+            Some("~/work".to_string()),
+            None,
+            env.clone(),
+            PathStyle::Unix,
             "/bin/fish",
             ShellKind::Fish,
             vec!["-p".to_string(), "2222".to_string()],
+            "user@host",
+            Interactive::Yes,
         )?;
 
         assert_eq!(command.program, "ssh");
@@ -1355,9 +2121,11 @@ mod tests {
             [
                 "-p",
                 "2222",
-                "-q",
+                "-o",
+                "LogLevel=ERROR",
                 "-t",
-                "cd \"$HOME/work\" && exec env INPUT_VA=val remote_program arg1 arg2"
+                "user@host",
+                "cd \"$HOME\"/work && exec env 'INPUT_VA=val' remote_program arg1 arg2"
             ]
         );
         assert_eq!(command.env, env);
@@ -1367,17 +2135,19 @@ mod tests {
         let mut env = HashMap::default();
         env.insert("SSH_VAR".to_string(), "ssh-val".to_string());
 
-        let command = build_command(
+        let command = build_command_posix(
             None,
-            &["arg1".to_string(), "arg2".to_string()],
+            &[],
             &input_env,
             None,
             Some((1, "foo".to_owned(), 2)),
             env.clone(),
-            PathStyle::Posix,
+            PathStyle::Unix,
             "/bin/fish",
             ShellKind::Fish,
             vec!["-p".to_string(), "2222".to_string()],
+            "user@host",
+            Interactive::Yes,
         )?;
 
         assert_eq!(command.program, "ssh");
@@ -1388,14 +2158,100 @@ mod tests {
                 "2222",
                 "-L",
                 "1:foo:2",
-                "-q",
+                "-o",
+                "LogLevel=ERROR",
                 "-t",
-                "cd && exec env INPUT_VA=val /bin/fish -l"
+                "user@host",
+                "cd && exec env 'INPUT_VA=val' /bin/fish -l"
             ]
         );
         assert_eq!(command.env, env);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_build_command_quotes_env_assignment() -> Result<()> {
+        let mut input_env = HashMap::default();
+        input_env.insert("ZED$(echo foo)".to_string(), "value".to_string());
+
+        let command = build_command_posix(
+            Some("remote_program".to_string()),
+            &[],
+            &input_env,
+            None,
+            None,
+            HashMap::default(),
+            PathStyle::Unix,
+            "/bin/bash",
+            ShellKind::Posix,
+            vec![],
+            "user@host",
+            Interactive::No,
+        )?;
+
+        let remote_command = command
+            .args
+            .last()
+            .context("missing remote command argument")?;
+        assert!(
+            remote_command.contains("exec env 'ZED$(echo foo)=value' remote_program"),
+            "expected env assignment to be quoted, got: {remote_command}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sftp_put_command_quotes_paths() {
+        assert_eq!(
+            sftp_put_command(
+                "/tmp/Zed Repro/remote_server",
+                ".zed_server/downloaded server",
+            ),
+            "put \"/tmp/Zed Repro/remote_server\" \".zed_server/downloaded server\"\n"
+        );
+    }
+
+    #[test]
+    fn test_sftp_put_command_escapes_quotes_in_paths() {
+        assert_eq!(
+            sftp_put_command(
+                r#"/tmp/Zed "Nightly"/remote_server"#,
+                ".zed_server/remote_server",
+            ),
+            "put \"/tmp/Zed \\\"Nightly\\\"/remote_server\" \".zed_server/remote_server\"\n"
+        );
+    }
+
+    #[test]
+    fn test_sftp_put_command_doubles_trailing_destination_backslash_before_closing_quote() {
+        assert_eq!(
+            sftp_put_command("/tmp/remote_server", r"C:\zed server\"),
+            "put \"/tmp/remote_server\" \"C:\\\\zed server\\\\\"\n"
+        );
+    }
+
+    #[test]
+    fn test_sftp_put_command_doubles_source_backslashes_for_posix_glob() {
+        assert_eq!(
+            sftp_put_command(
+                r"/tmp/zed\server/remote_server",
+                ".zed_server/remote_server",
+            ),
+            "put \"/tmp/zed\\\\server/remote_server\" \".zed_server/remote_server\"\n"
+        );
+    }
+
+    #[test]
+    fn test_sftp_put_command_doubles_windows_source_backslashes_on_all_platforms() {
+        assert_eq!(
+            sftp_put_command(
+                r"C:\Users\Smit\Zed Repro\remote_server",
+                ".zed_server/remote_server",
+            ),
+            "put \"C:\\\\Users\\\\Smit\\\\Zed Repro\\\\remote_server\" \".zed_server/remote_server\"\n"
+        );
     }
 
     #[test]
@@ -1471,6 +2327,81 @@ mod tests {
         assert_eq!(opts.host, "192.168.1.1".into());
         assert_eq!(opts.username, Some("user".to_string()));
         assert_eq!(opts.port, Some(2222));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_port_forward_spec_ipv6() -> Result<()> {
+        let pf = parse_port_forward_spec("[::1]:8080:[::1]:80")?;
+        assert_eq!(pf.local_host, Some("::1".to_string()));
+        assert_eq!(pf.local_port, 8080);
+        assert_eq!(pf.remote_host, Some("::1".to_string()));
+        assert_eq!(pf.remote_port, 80);
+
+        let pf = parse_port_forward_spec("8080:[::1]:80")?;
+        assert_eq!(pf.local_host, None);
+        assert_eq!(pf.local_port, 8080);
+        assert_eq!(pf.remote_host, Some("::1".to_string()));
+        assert_eq!(pf.remote_port, 80);
+
+        let pf = parse_port_forward_spec("[2001:db8::1]:3000:[fe80::1]:4000")?;
+        assert_eq!(pf.local_host, Some("2001:db8::1".to_string()));
+        assert_eq!(pf.local_port, 3000);
+        assert_eq!(pf.remote_host, Some("fe80::1".to_string()));
+        assert_eq!(pf.remote_port, 4000);
+
+        let pf = parse_port_forward_spec("127.0.0.1:8080:localhost:80")?;
+        assert_eq!(pf.local_host, Some("127.0.0.1".to_string()));
+        assert_eq!(pf.local_port, 8080);
+        assert_eq!(pf.remote_host, Some("localhost".to_string()));
+        assert_eq!(pf.remote_port, 80);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_port_forward_ipv6_formatting() {
+        let options = SshConnectionOptions {
+            host: "example.com".into(),
+            port_forwards: Some(vec![SshPortForwardOption {
+                local_host: Some("::1".to_string()),
+                local_port: 8080,
+                remote_host: Some("::1".to_string()),
+                remote_port: 80,
+            }]),
+            ..Default::default()
+        };
+
+        let args = options.additional_args();
+        assert!(
+            args.iter().any(|arg| arg == "-L[::1]:8080:[::1]:80"),
+            "expected bracketed IPv6 in -L flag: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_command_with_ipv6_port_forward() -> Result<()> {
+        let command = build_command_posix(
+            None,
+            &[],
+            &HashMap::default(),
+            None,
+            Some((8080, "::1".to_owned(), 80)),
+            HashMap::default(),
+            PathStyle::Unix,
+            "/bin/bash",
+            ShellKind::Posix,
+            vec![],
+            "user@host",
+            Interactive::No,
+        )?;
+
+        assert!(
+            command.args.iter().any(|arg| arg == "8080:[::1]:80"),
+            "expected bracketed IPv6 in port forward arg: {:?}",
+            command.args
+        );
 
         Ok(())
     }

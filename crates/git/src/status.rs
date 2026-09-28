@@ -143,7 +143,9 @@ impl FileStatus {
 
     pub fn staging(self) -> StageStatus {
         match self {
-            FileStatus::Untracked | FileStatus::Ignored | FileStatus::Unmerged { .. } => StageStatus::Unstaged,
+            FileStatus::Untracked | FileStatus::Ignored | FileStatus::Unmerged { .. } => {
+                StageStatus::Unstaged
+            }
             FileStatus::Tracked(tracked) => match (tracked.index_status, tracked.worktree_status) {
                 (StatusCode::Unmodified, _) => StageStatus::Unstaged,
                 (_, StatusCode::Unmodified) => StageStatus::Staged,
@@ -161,7 +163,11 @@ impl FileStatus {
     }
 
     pub fn has_changes(&self) -> bool {
-        self.is_modified() || self.is_created() || self.is_deleted() || self.is_untracked() || self.is_conflicted()
+        self.is_modified()
+            || self.is_created()
+            || self.is_deleted()
+            || self.is_untracked()
+            || self.is_conflicted()
     }
 
     pub fn is_modified(self) -> bool {
@@ -244,7 +250,9 @@ impl StatusCode {
                 deleted: 1,
                 ..TrackedSummary::UNCHANGED
             },
-            StatusCode::Renamed | StatusCode::Copied | StatusCode::Unmodified => TrackedSummary::UNCHANGED,
+            StatusCode::Renamed | StatusCode::Copied | StatusCode::Unmodified => {
+                TrackedSummary::UNCHANGED
+            }
         }
     }
 
@@ -446,7 +454,7 @@ impl FromStr for GitStatus {
                 let status = entry.as_bytes()[0..2].try_into().unwrap();
                 let status = FileStatus::from_bytes(status).log_err()?;
                 // git-status outputs `/`-delimited repo paths, even on Windows.
-                let path = RepoPath::from_rel_path(RelPath::unix(path).log_err()?);
+                let path = RepoPath::from_rel_path(RelPath::from_unix_str(path).log_err()?);
                 Some((path, status))
             })
             .collect::<Vec<_>>();
@@ -467,7 +475,12 @@ impl FromStr for GitStatus {
                     }
                     .into();
                 }
-                _ => panic!("Unexpected duplicated status entries: {a_status:?} and {b_status:?}"),
+                (x, y) if x == y => {}
+                _ => {
+                    log::warn!(
+                        "Unexpected duplicated status entries: {a_status:?} and {b_status:?}"
+                    );
+                }
             }
             true
         });
@@ -479,29 +492,24 @@ impl FromStr for GitStatus {
 
 impl Default for GitStatus {
     fn default() -> Self {
-        Self { entries: Arc::new([]) }
+        Self {
+            entries: Arc::new([]),
+        }
     }
 }
 
 pub enum DiffTreeType {
-    MergeBase { base: SharedString, head: SharedString },
-    Since { base: SharedString, head: SharedString },
-}
-
-impl DiffTreeType {
-    pub fn base(&self) -> &SharedString {
-        match self {
-            DiffTreeType::MergeBase { base, .. } => base,
-            DiffTreeType::Since { base, .. } => base,
-        }
-    }
-
-    pub fn head(&self) -> &SharedString {
-        match self {
-            DiffTreeType::MergeBase { head, .. } => head,
-            DiffTreeType::Since { head, .. } => head,
-        }
-    }
+    MergeBase {
+        base: SharedString,
+        head: SharedString,
+    },
+    MergeBaseWithWorktree {
+        base: SharedString,
+    },
+    Since {
+        base: SharedString,
+        head: SharedString,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -523,7 +531,7 @@ impl FromStr for TreeDiff {
         let mut fields = s.split('\0');
         let mut parsed = HashMap::default();
         while let Some((status, path)) = fields.next().zip(fields.next()) {
-            let path = RepoPath::from_rel_path(RelPath::unix(path)?);
+            let path = RepoPath::from_rel_path(RelPath::from_unix_str(path)?);
 
             let mut fields = status.split(" ").skip(2);
             let old_sha = fields
@@ -531,10 +539,18 @@ impl FromStr for TreeDiff {
                 .ok_or_else(|| anyhow!("expected to find old_sha"))?
                 .to_owned()
                 .parse()?;
-            let _new_sha = fields.next().ok_or_else(|| anyhow!("expected to find new_sha"))?;
+            let _new_sha = fields
+                .next()
+                .ok_or_else(|| anyhow!("expected to find new_sha"))?;
             let status = fields
                 .next()
-                .and_then(|s| if s.len() == 1 { s.as_bytes().first() } else { None })
+                .and_then(|s| {
+                    if s.len() == 1 {
+                        s.as_bytes().first()
+                    } else {
+                        None
+                    }
+                })
                 .ok_or_else(|| anyhow!("expected to find status"))?;
 
             let result = match StatusCode::from_byte(*status)? {
@@ -562,15 +578,11 @@ pub struct GitDiffStat {
     pub entries: Arc<[(RepoPath, DiffStat)]>,
 }
 
-impl GitDiffStat {
-    pub fn get(&self, path: &RepoPath) -> Option<DiffStat> {
-        self.entries
-            .binary_search_by(|(entry_path, _)| entry_path.cmp(path))
-            .ok()
-            .map(|ix| self.entries[ix].1)
-    }
-}
-
+/// Parses the output of `git diff --numstat` where output looks like:
+///
+/// ```text
+/// 24   12   dir/file.txt
+/// ```
 pub fn parse_numstat(output: &str) -> GitDiffStat {
     let mut entries = Vec::new();
     for line in output.lines() {
@@ -579,7 +591,9 @@ pub fn parse_numstat(output: &str) -> GitDiffStat {
             continue;
         }
         let mut parts = line.splitn(3, '\t');
-        let (Some(added_str), Some(deleted_str), Some(path_str)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(added_str), Some(deleted_str), Some(path_str)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
         let Ok(added) = added_str.parse::<u32>() else {
@@ -593,7 +607,7 @@ pub fn parse_numstat(output: &str) -> GitDiffStat {
         };
         entries.push((path, DiffStat { added, deleted }));
     }
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     entries.dedup_by(|(a, _), (b, _)| a == b);
 
     GitDiffStat {
@@ -606,7 +620,7 @@ mod tests {
 
     use crate::{
         repository::RepoPath,
-        status::{TreeDiff, TreeDiffStatus},
+        status::{FileStatus, GitStatus, TreeDiff, TreeDiffStatus},
     };
 
     use super::{DiffStat, parse_numstat};
@@ -623,23 +637,33 @@ mod tests {
         assert_eq!(result.entries.len(), 2);
         assert_eq!(
             lookup(&result.entries, "src/main.rs"),
-            Some(&DiffStat { added: 10, deleted: 5 })
+            Some(&DiffStat {
+                added: 10,
+                deleted: 5
+            })
         );
         assert_eq!(
             lookup(&result.entries, "README.md"),
-            Some(&DiffStat { added: 3, deleted: 1 })
+            Some(&DiffStat {
+                added: 3,
+                deleted: 1
+            })
         );
     }
 
     #[test]
     fn test_parse_numstat_binary_files_skipped() {
+        // git diff --numstat outputs "-\t-\tpath" for binary files
         let input = "-\t-\timage.png\n5\t2\tsrc/lib.rs\n";
         let result = parse_numstat(input);
         assert_eq!(result.entries.len(), 1);
         assert!(lookup(&result.entries, "image.png").is_none());
         assert_eq!(
             lookup(&result.entries, "src/lib.rs"),
-            Some(&DiffStat { added: 5, deleted: 2 })
+            Some(&DiffStat {
+                added: 5,
+                deleted: 2
+            })
         );
     }
 
@@ -657,18 +681,25 @@ mod tests {
         assert_eq!(result.entries.len(), 1);
         assert_eq!(
             lookup(&result.entries, "valid.rs"),
-            Some(&DiffStat { added: 10, deleted: 5 })
+            Some(&DiffStat {
+                added: 10,
+                deleted: 5
+            })
         );
     }
 
     #[test]
     fn test_parse_numstat_incomplete_lines_skipped() {
+        // Lines with fewer than 3 tab-separated fields are skipped
         let input = "10\t5\n7\t3\tok.rs\n";
         let result = parse_numstat(input);
         assert_eq!(result.entries.len(), 1);
         assert_eq!(
             lookup(&result.entries, "ok.rs"),
-            Some(&DiffStat { added: 7, deleted: 3 })
+            Some(&DiffStat {
+                added: 7,
+                deleted: 3
+            })
         );
     }
 
@@ -678,13 +709,26 @@ mod tests {
         let result = parse_numstat(input);
         assert_eq!(
             lookup(&result.entries, "unchanged_but_present.rs"),
-            Some(&DiffStat { added: 0, deleted: 0 })
+            Some(&DiffStat {
+                added: 0,
+                deleted: 0
+            })
         );
     }
 
     #[test]
+    fn test_duplicate_untracked_entries() {
+        // Regression test for ZED-2XA: git can produce duplicate untracked entries
+        // for the same path. This should deduplicate them instead of panicking.
+        let input = "?? file.txt\0?? file.txt";
+        let status: GitStatus = input.parse().unwrap();
+        assert_eq!(status.entries.len(), 1);
+        assert_eq!(status.entries[0].1, FileStatus::Untracked);
+    }
+
+    #[test]
     fn test_tree_diff_parsing() {
-        let input = ":000000 100644 0000000000000000000000000000000000000000 0062c311b8727c3a2e3cd7a41bc9904feacf8f98 A\x00.gram/settings.jsonc\x00".to_owned() +
+        let input = ":000000 100644 0000000000000000000000000000000000000000 0062c311b8727c3a2e3cd7a41bc9904feacf8f98 A\x00.zed/settings.json\x00".to_owned() +
             ":100644 000000 bb3e9ed2e97a8c02545bae243264d342c069afb3 0000000000000000000000000000000000000000 D\x00README.md\x00" +
             ":100644 100644 42f097005a1f21eb2260fad02ec8c991282beee8 a437d85f63bb8c62bd78f83f40c506631fabf005 M\x00parallel.go\x00";
 
@@ -693,7 +737,10 @@ mod tests {
             output,
             TreeDiff {
                 entries: [
-                    (RepoPath::new(".gram/settings.jsonc").unwrap(), TreeDiffStatus::Added,),
+                    (
+                        RepoPath::new(".zed/settings.json").unwrap(),
+                        TreeDiffStatus::Added,
+                    ),
                     (
                         RepoPath::new("README.md").unwrap(),
                         TreeDiffStatus::Deleted {

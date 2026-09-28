@@ -3,11 +3,11 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use dap::{DapLocator, DebugRequest, adapters::DebugAdapterName};
-use gpui::SharedString;
+use gpui::{BackgroundExecutor, SharedString};
 
 use task::{DebugScenario, SpawnInTerminal, TaskTemplate, VariableName};
 
-pub(crate) struct PythonLocator;
+pub struct PythonLocator;
 
 #[async_trait]
 impl DapLocator for PythonLocator {
@@ -25,7 +25,7 @@ impl DapLocator for PythonLocator {
         if adapter.0.as_ref() != "Debugpy" {
             return None;
         }
-        let valid_program = build_config.command.starts_with("$GRAM_")
+        let valid_program = build_config.command.starts_with("$ZED_")
             || Path::new(&build_config.command)
                 .file_name()
                 .is_some_and(|name| name.to_str().is_some_and(|path| path.starts_with("python")));
@@ -51,8 +51,8 @@ impl DapLocator for PythonLocator {
         let program_position = mod_name
             .is_none()
             .then(|| {
-                let file = VariableName::File.template_value_with_whitespace();
-                build_config.args.iter().position(|arg| *arg == file)
+                let zed_file = VariableName::File.template_value_with_whitespace();
+                build_config.args.iter().position(|arg| *arg == zed_file)
             })
             .flatten();
         let args = if let Some(position) = program_position {
@@ -67,14 +67,18 @@ impl DapLocator for PythonLocator {
             "request": "launch",
             "python": command,
             "args": args,
-            "cwd": build_config.cwd.clone()
+            "cwd": build_config.cwd.clone(),
+            "env": build_config.env.clone(),
         });
         if let Some(config_obj) = config.as_object_mut() {
             if let Some(module) = mod_name {
                 config_obj.insert("module".to_string(), module.clone().into());
             }
             if let Some(program) = program_position {
-                config_obj.insert("program".to_string(), build_config.args[program].clone().into());
+                config_obj.insert(
+                    "program".to_string(),
+                    build_config.args[program].clone().into(),
+                );
             }
         }
 
@@ -87,59 +91,7 @@ impl DapLocator for PythonLocator {
         })
     }
 
-    async fn run(&self, _: SpawnInTerminal) -> Result<DebugRequest> {
+    async fn run(&self, _: SpawnInTerminal, _executor: BackgroundExecutor) -> Result<DebugRequest> {
         bail!("Python locator should not require DapLocator::run to be ran");
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use serde_json::json;
-    use task::SaveStrategy;
-
-    use super::*;
-
-    #[gpui::test]
-    async fn test_python_locator() {
-        let adapter = DebugAdapterName("Debugpy".into());
-        let build_task = TaskTemplate {
-            label: "run module '$GRAM_FILE'".into(),
-            command: "$GRAM_CUSTOM_PYTHON_ACTIVE_GRAM_TOOLCHAIN".into(),
-            args: vec!["-m".into(), "$GRAM_CUSTOM_PYTHON_MODULE_NAME".into()],
-            env: Default::default(),
-            cwd: Some("$GRAM_WORKTREE_ROOT".into()),
-            use_new_terminal: false,
-            allow_concurrent_runs: false,
-            reveal: task::RevealStrategy::Always,
-            reveal_target: task::RevealTarget::Dock,
-            hide: task::HideStrategy::Never,
-            tags: vec!["python-module-main-method".into()],
-            shell: task::Shell::System,
-            show_summary: false,
-            show_command: false,
-            save: SaveStrategy::default(),
-        };
-
-        let expected_scenario = DebugScenario {
-            adapter: "Debugpy".into(),
-            label: "run module 'main.py'".into(),
-            build: None,
-            config: json!({
-                "request": "launch",
-                "python": "$GRAM_CUSTOM_PYTHON_ACTIVE_GRAM_TOOLCHAIN",
-                "args": [],
-                "cwd": "$GRAM_WORKTREE_ROOT",
-                "module": "$GRAM_CUSTOM_PYTHON_MODULE_NAME",
-            }),
-            tcp_connection: None,
-        };
-
-        assert_eq!(
-            PythonLocator
-                .create_scenario(&build_task, "run module 'main.py'", &adapter)
-                .await
-                .expect("Failed to create a scenario"),
-            expected_scenario
-        );
     }
 }

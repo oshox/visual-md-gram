@@ -1,14 +1,16 @@
 [package]
 name = "command_palette_hooks"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
 
 [lib]
-doctest = false
 path = "src/command_palette_hooks.rs"
+doctest = false
 test = false
 
 [dependencies]
@@ -16,6 +18,3 @@ collections.workspace = true
 derive_more.workspace = true
 gpui.workspace = true
 workspace.workspace = true
-
-[lints]
-workspace = true

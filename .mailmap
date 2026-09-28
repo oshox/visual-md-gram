@@ -1,12 +1,13 @@
+# Canonical author names and emails.
+#
 # Use this to provide a canonical name and email for an author when their
 # name is not always written the same way and/or they have commits authored
 # under different email addresses.
 #
 # Reference: https://git-scm.com/docs/gitmailmap
-#
+
 # Keep these entries sorted alphabetically.
-# In Gram: `editor: sort lines case insensitive`
-# Or `grep -v '^#' .mailmap | LC_ALL=en_US.utf-8 sort`.
+# In Zed: `editor: sort lines case insensitive`
 
 Agus Zubiaga <agus@zed.dev>
 Agus Zubiaga <agus@zed.dev> <hi@aguz.me>
@@ -65,8 +66,6 @@ Kaylee Simmons <kay@the-simmons.net> <keith@the-simmons.net>
 Kaylee Simmons <kay@the-simmons.net> <keith@zed.dev>
 Kirill Bulatov <kirill@zed.dev>
 Kirill Bulatov <kirill@zed.dev> <mail4score@gmail.com>
-koru <koru@cock.li>
-koru <koru@cock.li> <koru@noreply.codeberg.org>
 Kyle Caverly <kylebcaverly@gmail.com>
 Kyle Caverly <kylebcaverly@gmail.com> <kyle@zed.dev>
 Lilith Iris <itslirissama@gmail.com>
@@ -122,8 +121,9 @@ Sebastijan Kelnerič <sebastijan.kelneric@sebba.dev> <sebastijan.kelneric@vichav
 Sergey Onufrienko <sergey@onufrienko.com>
 Shish <webmaster@shishnet.org>
 Shish <webmaster@shishnet.org> <shish@shishnet.org>
-Smit Barmase <0xtimsb@gmail.com>
-Smit Barmase <0xtimsb@gmail.com> <smit@zed.dev>
+Smit Barmase <heysmitbarmase@gmail.com>
+Smit Barmase <heysmitbarmase@gmail.com> <0xtimsb@gmail.com>
+Smit Barmase <heysmitbarmase@gmail.com> <smit@zed.dev>
 Thomas <github.thomaub@gmail.com>
 Thomas <github.thomaub@gmail.com> <thomas.aubry94@gmail.com>
 Thomas <github.thomaub@gmail.com> <thomas.aubry@paylead.fr>

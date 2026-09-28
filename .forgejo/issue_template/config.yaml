@@ -1,9 +1,0 @@
-# yaml-language-server: $schema=https://www.schemastore.org/gitea-issue-config.json
-blank_issues_enabled: false
-contact_links:
-  - name: Chat
-    url: https://slidge.im/gram/#/guest?join=gram@rooms.slidge.im
-    about: XMPP chat room for Gram
-  - name: Docs
-    url: https://gram-editor.com/docs
-    about: Documentation

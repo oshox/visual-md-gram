@@ -1,11 +1,12 @@
-use editor::{Editor, SelectionEffects, movement};
-use gpui::{Context, Window, actions};
-use language::Point;
+use std::sync::Arc;
 
 use crate::{
     Mode, Vim,
     motion::{Motion, MotionKind},
 };
+use editor::{Editor, SelectionEffects, movement};
+use gpui::{Context, Window, actions};
+use language::Point;
 
 actions!(
     vim,
@@ -37,16 +38,28 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 }
 
 impl Vim {
-    pub fn substitute(&mut self, count: Option<usize>, line_mode: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn substitute(
+        &mut self,
+        count: Option<usize>,
+        line_mode: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.store_visual_marks(window, cx);
         self.update_editor(cx, |vim, editor, cx| {
             editor.set_clip_at_line_ends(false, cx);
             editor.transact(window, cx, |editor, window, cx| {
-                let text_layout_details = editor.text_layout_details(window);
+                let text_layout_details = editor.text_layout_details(window, cx);
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         if selection.start == selection.end {
-                            Motion::Right.expand_selection(map, selection, count, &text_layout_details, false);
+                            Motion::Right.expand_selection(
+                                map,
+                                selection,
+                                count,
+                                &text_layout_details,
+                                false,
+                            );
                         }
                         if line_mode {
                             // in Visual mode when the selection contains the newline at the end
@@ -54,8 +67,17 @@ impl Vim {
                             if !selection.is_empty() && selection.end.column() == 0 {
                                 selection.end = movement::left(map, selection.end);
                             }
-                            Motion::CurrentLine.expand_selection(map, selection, None, &text_layout_details, false);
-                            if let Some((point, _)) = (Motion::FirstNonWhitespace { display_lines: false }).move_point(
+                            Motion::CurrentLine.expand_selection(
+                                map,
+                                selection,
+                                None,
+                                &text_layout_details,
+                                false,
+                            );
+                            if let Some((point, _)) = (Motion::FirstNonWhitespace {
+                                display_lines: false,
+                            })
+                            .move_point(
                                 map,
                                 selection.start,
                                 selection.goal,
@@ -73,9 +95,14 @@ impl Vim {
                     MotionKind::Exclusive
                 };
                 vim.copy_selections_content(editor, kind, window, cx);
-                let selections = editor.selections.all::<Point>(&editor.display_snapshot(cx)).into_iter();
+                let linked_edits = editor.linked_edits_for_selections(Arc::from(""), cx);
+                let selections = editor
+                    .selections
+                    .all::<Point>(&editor.display_snapshot(cx))
+                    .into_iter();
                 let edits = selections.map(|selection| (selection.start..selection.end, ""));
                 editor.edit(edits, cx);
+                linked_edits.apply(cx);
             });
         });
         self.switch_mode(Mode::Insert, true, window, cx);
@@ -84,7 +111,10 @@ impl Vim {
 
 #[cfg(test)]
 mod test {
-    use crate::{state::Mode, test::VimTestContext};
+    use crate::{
+        state::Mode,
+        test::{NeovimBackedTestContext, VimTestContext},
+    };
     use indoc::indoc;
 
     #[gpui::test]
@@ -139,5 +169,147 @@ mod test {
             alpha
               ˇ
             gamma"});
+    }
+
+    #[gpui::test]
+    async fn test_visual_change(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("The quick ˇbrown").await;
+        cx.simulate_shared_keystrokes("v w c").await;
+        cx.shared_state().await.assert_eq("The quick ˇ");
+
+        cx.set_shared_state(indoc! {"
+            The ˇquick brown
+            fox jumps over
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("v w j c").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The ˇver
+            the lazy dog"});
+
+        cx.simulate_at_each_offset(
+            "v w j c",
+            indoc! {"
+                    The ˇquick brown
+                    fox jumps ˇover
+                    the ˇlazy dog"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate_at_each_offset(
+            "v w k c",
+            indoc! {"
+                    The ˇquick brown
+                    fox jumps ˇover
+                    the ˇlazy dog"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_visual_line_change(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "shift-v c",
+            indoc! {"
+            The quˇick brown
+            fox jumps over
+            the lazy dog"},
+        )
+        .await
+        .assert_matches();
+        // Test pasting code copied on change
+        cx.simulate_shared_keystrokes("escape j p").await;
+        cx.shared_state().await.assert_matches();
+
+        cx.simulate_at_each_offset(
+            "shift-v c",
+            indoc! {"
+            The quick brown
+            fox juˇmps over
+            the laˇzy dog"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "shift-v j c",
+            indoc! {"
+            The quˇick brown
+            fox jumps over
+            the lazy dog"},
+        )
+        .await
+        .assert_matches();
+        // Test pasting code copied on delete
+        cx.simulate_shared_keystrokes("escape j p").await;
+        cx.shared_state().await.assert_matches();
+
+        cx.simulate_at_each_offset(
+            "shift-v j c",
+            indoc! {"
+            The quick brown
+            fox juˇmps over
+            the laˇzy dog"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_substitute_line(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        let initial_state = indoc! {"
+                    The quick brown
+                    fox juˇmps over
+                    the lazy dog
+                    "};
+
+        // normal mode
+        cx.set_shared_state(initial_state).await;
+        cx.simulate_shared_keystrokes("shift-s o").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            oˇ
+            the lazy dog
+            "});
+
+        // visual mode
+        cx.set_shared_state(initial_state).await;
+        cx.simulate_shared_keystrokes("v k shift-s o").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            oˇ
+            the lazy dog
+            "});
+
+        // visual block mode
+        cx.set_shared_state(initial_state).await;
+        cx.simulate_shared_keystrokes("ctrl-v j shift-s o").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            oˇ
+            "});
+
+        // visual mode including newline
+        cx.set_shared_state(initial_state).await;
+        cx.simulate_shared_keystrokes("v $ shift-s o").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            oˇ
+            the lazy dog
+            "});
+
+        // indentation
+        cx.set_neovim_option("shiftwidth=4").await;
+        cx.set_shared_state(initial_state).await;
+        cx.simulate_shared_keystrokes("> > shift-s o").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+                oˇ
+            the lazy dog
+            "});
     }
 }

@@ -1,17 +1,20 @@
 use gpui::{
-    App, Entity, EventEmitter, FocusHandle, Focusable, PromptButton, PromptHandle, PromptLevel, PromptResponse,
-    RenderablePromptHandle, SharedString, TextStyleRefinement, Window, div, prelude::*,
+    App, Decorations, Entity, EventEmitter, FocusHandle, Focusable, PromptButton, PromptHandle,
+    PromptLevel, PromptResponse, RenderablePromptHandle, SharedString, TextStyleRefinement, Window,
+    div, prelude::*,
 };
-use markdown::{Markdown, MarkdownElement, style::MarkdownStyle};
+use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::{Settings, SettingsStore};
-use theme::ThemeSettings;
+use theme::ClientDecorationsExt;
+use theme_settings::ThemeSettings;
 use ui::{FluentBuilder, TintColor, prelude::*};
 use workspace::WorkspaceSettings;
 
 pub fn init(cx: &mut App) {
     process_settings(cx);
 
-    cx.observe_global::<SettingsStore>(process_settings).detach();
+    cx.observe_global::<SettingsStore>(process_settings)
+        .detach();
 }
 
 fn process_settings(cx: &mut App) {
@@ -19,13 +22,13 @@ fn process_settings(cx: &mut App) {
     if settings.use_system_prompts && cfg!(not(any(target_os = "linux", target_os = "freebsd"))) {
         cx.reset_prompt_builder();
     } else {
-        cx.set_prompt_builder(gram_prompt_renderer);
+        cx.set_prompt_builder(zed_prompt_renderer);
     }
 }
 
 /// Use this function in conjunction with [App::set_prompt_builder] to force
 /// GPUI to use the internal prompt system.
-fn gram_prompt_renderer(
+fn zed_prompt_renderer(
     level: PromptLevel,
     message: &str,
     detail: Option<&str>,
@@ -35,22 +38,22 @@ fn gram_prompt_renderer(
     cx: &mut App,
 ) -> RenderablePromptHandle {
     let renderer = cx.new({
-        |cx| GramPromptRenderer {
+        |cx| ZedPromptRenderer {
             _level: level,
-            message: cx.new(|cx| Markdown::new_text(SharedString::new(message), cx)),
+            message: cx.new(|cx| Markdown::new(SharedString::new(message), None, None, cx)),
             actions: actions.iter().map(|a| a.label().to_string()).collect(),
             focus: cx.focus_handle(),
             active_action_id: 0,
             detail: detail
                 .filter(|text| !text.is_empty())
-                .map(|text| cx.new(|cx| Markdown::new_text(SharedString::new(text), cx))),
+                .map(|text| cx.new(|cx| Markdown::new(SharedString::new(text), None, None, cx))),
         }
     });
 
     handle.with_view(renderer, window, cx)
 }
 
-pub struct GramPromptRenderer {
+pub struct ZedPromptRenderer {
     _level: PromptLevel,
     message: Entity<Markdown>,
     actions: Vec<String>,
@@ -59,7 +62,7 @@ pub struct GramPromptRenderer {
     detail: Option<Entity<Markdown>>,
 }
 
-impl GramPromptRenderer {
+impl ZedPromptRenderer {
     fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(PromptResponse(self.active_action_id));
     }
@@ -70,7 +73,12 @@ impl GramPromptRenderer {
         }
     }
 
-    fn select_first(&mut self, _: &menu::SelectFirst, _window: &mut Window, cx: &mut Context<Self>) {
+    fn select_first(
+        &mut self,
+        _: &menu::SelectFirst,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.active_action_id = self.actions.len().saturating_sub(1);
         cx.notify();
     }
@@ -85,7 +93,12 @@ impl GramPromptRenderer {
         cx.notify();
     }
 
-    fn select_previous(&mut self, _: &menu::SelectPrevious, _window: &mut Window, cx: &mut Context<Self>) {
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_action_id > 0 {
             self.active_action_id -= 1;
         } else {
@@ -95,7 +108,7 @@ impl GramPromptRenderer {
     }
 }
 
-impl Render for GramPromptRenderer {
+impl Render for ZedPromptRenderer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = ThemeSettings::get_global(cx);
 
@@ -120,10 +133,10 @@ impl Render for GramPromptRenderer {
                 markdown_style(true, window, cx),
             )))
             .children(self.detail.clone().map(|detail| {
-                div()
-                    .w_full()
-                    .text_xs()
-                    .child(MarkdownElement::new(detail, markdown_style(false, window, cx)))
+                div().w_full().text_xs().child(MarkdownElement::new(
+                    detail,
+                    markdown_style(false, window, cx),
+                ))
             }))
             .child(
                 v_flex()
@@ -142,12 +155,24 @@ impl Render for GramPromptRenderer {
                     })),
             );
 
-        div().size_full().occlude().bg(gpui::black().opacity(0.2)).child(
+        let decorations = window.window_decorations();
+        let inset = window.client_inset().unwrap_or(Pixels::ZERO);
+
+        div().size_full().child(
             v_flex()
-                .size_full()
+                .occlude()
                 .absolute()
-                .top_0()
-                .left_0()
+                .inset_0()
+                .bg(gpui::black().opacity(0.2))
+                .map(|this| match decorations {
+                    Decorations::Server => this,
+                    Decorations::Client { tiling } => this
+                        .when(!tiling.top, |this| this.top(inset))
+                        .when(!tiling.bottom, |this| this.bottom(inset))
+                        .when(!tiling.left, |this| this.left(inset))
+                        .when(!tiling.right, |this| this.right(inset))
+                        .rounded_client_corners(tiling),
+                })
                 .items_center()
                 .justify_center()
                 .child(dialog),
@@ -180,9 +205,9 @@ fn markdown_style(main_message: bool, window: &Window, cx: &App) -> MarkdownStyl
     }
 }
 
-impl EventEmitter<PromptResponse> for GramPromptRenderer {}
+impl EventEmitter<PromptResponse> for ZedPromptRenderer {}
 
-impl Focusable for GramPromptRenderer {
+impl Focusable for ZedPromptRenderer {
     fn focus_handle(&self, _: &crate::App) -> FocusHandle {
         self.focus.clone()
     }

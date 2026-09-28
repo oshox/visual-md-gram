@@ -1,16 +1,18 @@
 mod active_toolchain;
 
 pub use active_toolchain::ActiveToolchain;
+use anyhow::Context as _;
 use convert_case::Casing as _;
 use editor::Editor;
-use file_finder::OpenPathDelegate;
 use futures::channel::oneshot;
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
-    Action, Animation, AnimationExt, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyContext, ParentElement, Render, Styled, Subscription, Task, WeakEntity, Window, actions, pulsating_between,
+    Action, Animation, AnimationExt, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, KeyContext, ParentElement, Render, Styled, Subscription, Task, WeakEntity, Window,
+    actions, pulsating_between,
 };
 use language::{Language, LanguageName, Toolchain, ToolchainScope};
+use open_path_prompt::OpenPathDelegate;
 use picker::{Picker, PickerDelegate};
 use project::{DirectoryLister, Project, ProjectPath, Toolchains, WorktreeId};
 use std::{
@@ -20,7 +22,8 @@ use std::{
     time::Duration,
 };
 use ui::{
-    Divider, HighlightedLabel, KeyBinding, List, ListItem, ListItemSpacing, Navigable, NavigableEntry, prelude::*,
+    Divider, HighlightedLabel, KeyBinding, List, ListItem, ListItemSpacing, Navigable,
+    NavigableEntry, prelude::*,
 };
 use util::{ResultExt, maybe, paths::PathStyle, rel_path::RelPath};
 use workspace::{ModalView, Workspace};
@@ -60,6 +63,7 @@ struct AddToolchainState {
     language_name: LanguageName,
     root_path: ProjectPath,
     weak: WeakEntity<ToolchainSelector>,
+    worktree_root_path: Arc<Path>,
 }
 
 struct ScopePickerState {
@@ -67,7 +71,10 @@ struct ScopePickerState {
     selected_scope: ToolchainScope,
 }
 
-#[expect(dead_code, reason = "These tasks have to be kept alive to run to completion")]
+#[expect(
+    dead_code,
+    reason = "These tasks have to be kept alive to run to completion"
+)]
 enum PathInputState {
     WaitingForPath(Task<()>),
     Resolving(Task<()>),
@@ -75,7 +82,7 @@ enum PathInputState {
 
 enum AddState {
     Path {
-        picker: Entity<Picker<file_finder::OpenPathDelegate>>,
+        picker: Entity<Picker<open_path_prompt::OpenPathDelegate>>,
         error: Option<Arc<str>>,
         input_state: PathInputState,
         _subscription: Subscription,
@@ -94,12 +101,24 @@ impl AddToolchainState {
         root_path: ProjectPath,
         window: &mut Window,
         cx: &mut Context<ToolchainSelector>,
-    ) -> Entity<Self> {
+    ) -> anyhow::Result<Entity<Self>> {
         let weak = cx.weak_entity();
-
-        cx.new(|cx| {
+        let worktree_root_path = project
+            .read(cx)
+            .worktree_for_id(root_path.worktree_id, cx)
+            .map(|worktree| worktree.read(cx).abs_path())
+            .context("Could not find worktree")?;
+        Ok(cx.new(|cx| {
             let (lister, rx) = Self::create_path_browser_delegate(project.clone(), cx);
-            let picker = cx.new(|cx| Picker::uniform_list(lister, window, cx));
+            let path_style = project.read(cx).path_style(cx);
+            let picker = cx.new(|cx| {
+                let picker = Picker::uniform_list(lister, window, cx);
+                let mut worktree_root = worktree_root_path.to_string_lossy().into_owned();
+                worktree_root.push_str(path_style.primary_separator());
+                picker.set_query(&worktree_root, window, cx);
+                picker
+            });
+
             Self {
                 state: AddState::Path {
                     _subscription: cx.subscribe(&picker, |_, _, _: &DismissEvent, cx| {
@@ -113,8 +132,9 @@ impl AddToolchainState {
                 language_name,
                 root_path,
                 weak,
+                worktree_root_path,
             }
-        })
+        }))
     }
 
     fn create_path_browser_delegate(
@@ -155,21 +175,25 @@ impl AddToolchainState {
                                 .p_1()
                                 .justify_between()
                                 .gap_2()
-                                .child(Label::new("Select Toolchain Path").color(Color::Muted).map(|this| {
-                                    if is_loading {
-                                        this.with_animation(
-                                            "select-toolchain-label",
-                                            Animation::new(Duration::from_secs(2))
-                                                .repeat()
-                                                .with_easing(pulsating_between(0.4, 0.8)),
-                                            |label, delta| label.alpha(delta),
-                                        )
-                                        .into_any()
-                                    } else {
-                                        this.into_any_element()
-                                    }
-                                }))
-                                .when_some(error, |this, error| this.child(Label::new(error).color(Color::Error))),
+                                .child(Label::new("Select Toolchain Path").color(Color::Muted).map(
+                                    |this| {
+                                        if is_loading {
+                                            this.with_animation(
+                                                "select-toolchain-label",
+                                                Animation::new(Duration::from_secs(2))
+                                                    .repeat()
+                                                    .with_easing(pulsating_between(0.4, 0.8)),
+                                                |label, delta| label.alpha(delta),
+                                            )
+                                            .into_any()
+                                        } else {
+                                            this.into_any_element()
+                                        }
+                                    },
+                                ))
+                                .when_some(error, |this, error| {
+                                    this.child(Label::new(error).color(Color::Error))
+                                }),
                         )
                         .into_any(),
                 )
@@ -188,7 +212,9 @@ impl AddToolchainState {
         PathInputState::Resolving(cx.spawn_in(window, async move |this, cx| {
             _ = maybe!(async move {
                 let toolchain = project
-                    .update(cx, |this, cx| this.resolve_toolchain(path.clone(), language_name, cx))?
+                    .update(cx, |this, cx| {
+                        this.resolve_toolchain(path.clone(), language_name, cx)
+                    })
                     .await;
                 let Ok(toolchain) = toolchain else {
                     // Go back to the path input state
@@ -203,10 +229,11 @@ impl AddToolchainState {
                         {
                             let Err(e) = toolchain else { unreachable!() };
                             *error = Some(Arc::from(e.to_string()));
-                            let (delegate, rx) = Self::create_path_browser_delegate(this.project.clone(), cx);
+                            let (delegate, rx) =
+                                Self::create_path_browser_delegate(this.project.clone(), cx);
                             picker.update(cx, |picker, cx| {
                                 *picker = Picker::uniform_list(delegate, window, cx);
-                                picker.set_query(Arc::from(path.to_string_lossy().as_ref()), window, cx);
+                                picker.set_query(path.to_string_lossy().as_ref(), window, cx);
                             });
                             *input_state = Self::wait_for_path(rx, window, cx);
                             this.focus_handle(cx).focus(window, cx);
@@ -214,13 +241,20 @@ impl AddToolchainState {
                     });
                     return Err(anyhow::anyhow!("Failed to resolve toolchain"));
                 };
-                let resolved_toolchain_path =
-                    project.read_with(cx, |this, cx| this.find_project_path(&toolchain.path.as_ref(), cx))?;
+                let resolved_toolchain_path = project.read_with(cx, |this, cx| {
+                    this.find_project_path(&toolchain.path.as_ref(), cx)
+                });
 
                 // Suggest a default scope based on the applicability.
                 let scope = if let Some(project_path) = resolved_toolchain_path {
                     if !root_path.path.as_ref().is_empty() && project_path.starts_with(&root_path) {
-                        ToolchainScope::Subproject(root_path.worktree_id, root_path.path)
+                        let worktree_root_path = project
+                            .read_with(cx, |this, cx| {
+                                this.worktree_for_id(root_path.worktree_id, cx)
+                                    .map(|worktree| worktree.read(cx).abs_path())
+                            })
+                            .context("Could not find a worktree with a given worktree ID")?;
+                        ToolchainScope::Subproject(worktree_root_path, root_path.path)
                     } else {
                         ToolchainScope::Project
                     }
@@ -261,9 +295,14 @@ impl AddToolchainState {
             maybe!(async move {
                 let result = rx.await.log_err()?;
 
-                let path = result.into_iter().flat_map(|paths| paths.into_iter()).next()?;
+                let path = result
+                    .into_iter()
+                    .flat_map(|paths| paths.into_iter())
+                    .next()?;
                 this.update_in(cx, |this, window, cx| {
-                    if let AddState::Path { input_state, error, .. } = &mut this.state
+                    if let AddState::Path {
+                        input_state, error, ..
+                    } = &mut this.state
                         && matches!(input_state, PathInputState::WaitingForPath(_))
                     {
                         error.take();
@@ -285,7 +324,12 @@ impl AddToolchainState {
         PathInputState::WaitingForPath(task)
     }
 
-    fn confirm_toolchain(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm_toolchain(
+        &mut self,
+        _: &menu::Confirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let AddState::Name {
             toolchain,
             editor,
@@ -365,12 +409,17 @@ impl Render for AddToolchainState {
             .map(|this| match &self.state {
                 AddState::Path { picker, .. } => this.child(picker.clone()),
                 AddState::Name {
-                    editor, scope_picker, ..
+                    editor,
+                    scope_picker,
+                    ..
                 } => {
                     let scope_options = [
                         ToolchainScope::Global,
                         ToolchainScope::Project,
-                        ToolchainScope::Subproject(self.root_path.worktree_id, self.root_path.path.clone()),
+                        ToolchainScope::Subproject(
+                            self.worktree_root_path.clone(),
+                            self.root_path.path.clone(),
+                        ),
                     ];
 
                     let mut navigable_scope_picker = Navigable::new(
@@ -392,21 +441,29 @@ impl Render for AddToolchainState {
                                             .mt_1()
                                             .ml_2(),
                                     )
-                                    .child(List::new().children(scope_options.iter().enumerate().map(|(i, scope)| {
-                                        let is_selected = *scope == scope_picker.selected_scope;
-                                        let label = scope.label();
-                                        let description = scope.description();
-                                        let scope_clone_for_action = scope.clone();
-                                        let scope_clone_for_click = scope.clone();
+                                    .child(List::new().children(
+                                        scope_options.iter().enumerate().map(|(i, scope)| {
+                                            let is_selected = *scope == scope_picker.selected_scope;
+                                            let label = scope.label();
+                                            let description = scope.description();
+                                            let scope_clone_for_action = scope.clone();
+                                            let scope_clone_for_click = scope.clone();
 
-                                        div()
-                                            .id(SharedString::from(format!("scope-option-{i}")))
-                                            .track_focus(&scope_picker.entries[i].focus_handle)
-                                            .on_action(cx.listener(move |this, _: &menu::Confirm, _, cx| {
-                                                this.select_scope(scope_clone_for_action.clone(), cx);
-                                            }))
-                                            .child(
-                                                ListItem::new(SharedString::from(format!("scope-{i}")))
+                                            div()
+                                                .id(SharedString::from(format!("scope-option-{i}")))
+                                                .track_focus(&scope_picker.entries[i].focus_handle)
+                                                .on_action(cx.listener(
+                                                    move |this, _: &menu::Confirm, _, cx| {
+                                                        this.select_scope(
+                                                            scope_clone_for_action.clone(),
+                                                            cx,
+                                                        );
+                                                    },
+                                                ))
+                                                .child(
+                                                    ListItem::new(SharedString::from(format!(
+                                                        "scope-{i}"
+                                                    )))
                                                     .toggle_state(
                                                         is_selected
                                                             || scope_picker.entries[i]
@@ -416,17 +473,24 @@ impl Render for AddToolchainState {
                                                     .inset(true)
                                                     .spacing(ListItemSpacing::Sparse)
                                                     .child(
-                                                        h_flex().gap_2().child(Label::new(label)).child(
-                                                            Label::new(description)
-                                                                .size(LabelSize::Small)
-                                                                .color(Color::Muted),
-                                                        ),
+                                                        h_flex()
+                                                            .gap_2()
+                                                            .child(Label::new(label))
+                                                            .child(
+                                                                Label::new(description)
+                                                                    .size(LabelSize::Small)
+                                                                    .color(Color::Muted),
+                                                            ),
                                                     )
                                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.select_scope(scope_clone_for_click.clone(), cx);
+                                                        this.select_scope(
+                                                            scope_clone_for_click.clone(),
+                                                            cx,
+                                                        );
                                                     })),
-                                            )
-                                    })))
+                                                )
+                                        }),
+                                    ))
                                     .child(Divider::horizontal())
                                     .child(h_flex().p_1p5().justify_end().map(|this| {
                                         let is_disabled = editor.read(cx).is_empty(cx);
@@ -434,17 +498,29 @@ impl Render for AddToolchainState {
                                         this.child(
                                             Button::new("add-toolchain", label)
                                                 .disabled(is_disabled)
-                                                .key_binding(KeyBinding::for_action_in(&menu::Confirm, &handle, cx))
+                                                .key_binding(KeyBinding::for_action_in(
+                                                    &menu::Confirm,
+                                                    &handle,
+                                                    cx,
+                                                ))
                                                 .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.confirm_toolchain(&menu::Confirm, window, cx);
+                                                    this.confirm_toolchain(
+                                                        &menu::Confirm,
+                                                        window,
+                                                        cx,
+                                                    );
                                                 }))
                                                 .map(|this| {
                                                     if false {
                                                         this.with_animation(
                                                             "inspecting-user-toolchain",
-                                                            Animation::new(Duration::from_millis(500))
-                                                                .repeat()
-                                                                .with_easing(pulsating_between(0.4, 0.8)),
+                                                            Animation::new(Duration::from_millis(
+                                                                500,
+                                                            ))
+                                                            .repeat()
+                                                            .with_easing(pulsating_between(
+                                                                0.4, 0.8,
+                                                            )),
                                                             |label, delta| label.alpha(delta),
                                                         )
                                                         .into_any()
@@ -483,7 +559,11 @@ impl RenderOnce for State {
     }
 }
 impl ToolchainSelector {
-    fn register(workspace: &mut Workspace, _window: Option<&mut Window>, _: &mut Context<Workspace>) {
+    fn register(
+        workspace: &mut Workspace,
+        _window: Option<&mut Window>,
+        _: &mut Context<Workspace>,
+    ) {
         workspace.register_action(move |workspace, _: &Select, window, cx| {
             Self::toggle(workspace, window, cx);
         });
@@ -499,18 +579,26 @@ impl ToolchainSelector {
         });
     }
 
-    fn toggle(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> Option<()> {
-        let (_, buffer, _) = workspace
+    fn toggle(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<()> {
+        let buffer = workspace
             .active_item(cx)?
             .act_as::<Editor>(cx)?
             .read(cx)
-            .active_excerpt(cx)?;
+            .active_buffer(cx)?;
         let project = workspace.project().clone();
 
         let language_name = buffer.read(cx).language()?.name();
         let worktree_id = buffer.read(cx).file()?.worktree_id(cx);
         let relative_path: Arc<RelPath> = buffer.read(cx).file()?.path().parent()?.into();
-        let worktree_root_path = project.read(cx).worktree_for_id(worktree_id, cx)?.read(cx).abs_path();
+        let worktree_root_path = project
+            .read(cx)
+            .worktree_for_id(worktree_id, cx)?
+            .read(cx)
+            .abs_path();
         let weak = workspace.weak_handle();
         cx.spawn_in(window, async move |workspace, cx| {
             let active_toolchain = project
@@ -523,7 +611,7 @@ impl ToolchainSelector {
                         language_name.clone(),
                         cx,
                     )
-                })?
+                })
                 .await;
             workspace
                 .update_in(cx, |this, window, cx| {
@@ -564,7 +652,10 @@ impl ToolchainSelector {
         cx.spawn({
             let language_name = language_name.clone();
             async move |this, cx| {
-                let language = language_registry.language_for_name(&language_name.0).await.ok();
+                let language = language_registry
+                    .language_for_name(&language_name.0)
+                    .await
+                    .ok();
                 this.update(cx, |this, cx| {
                     this.language = language;
                     cx.notify();
@@ -612,9 +703,14 @@ impl ToolchainSelector {
         }
     }
 
-    fn handle_add_toolchain(&mut self, _: &AddToolchain, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_add_toolchain(
+        &mut self,
+        _: &AddToolchain,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(self.state, State::Search(_)) {
-            self.state = State::AddToolchain(AddToolchainState::new(
+            let Ok(state) = AddToolchainState::new(
                 self.project.clone(),
                 self.language_name.clone(),
                 ProjectPath {
@@ -623,7 +719,10 @@ impl ToolchainSelector {
                 },
                 window,
                 cx,
-            ));
+            ) else {
+                return;
+            };
+            self.state = State::AddToolchain(state);
             self.state.focus_handle(cx).focus(window, cx);
             cx.notify();
         }
@@ -690,12 +789,14 @@ impl ToolchainSelectorDelegate {
                     .read_with(cx, |this, _| {
                         Project::toolchain_metadata(this.languages().clone(), language_name.clone())
                     })
-                    .ok()?
                     .await?;
                 let relative_path = this
                     .update(cx, |this, cx| {
-                        this.delegate.add_toolchain_text =
-                            format!("Add {}", meta.term.as_ref().to_case(convert_case::Case::Title)).into();
+                        this.delegate.add_toolchain_text = format!(
+                            "Add {}",
+                            meta.term.as_ref().to_case(convert_case::Case::Title)
+                        )
+                        .into();
                         cx.notify();
                         this.delegate.relative_path.clone()
                     })
@@ -716,7 +817,6 @@ impl ToolchainSelectorDelegate {
                             cx,
                         )
                     })
-                    .ok()?
                     .await?;
                 let pretty_path = {
                     if relative_path.is_empty() {
@@ -725,7 +825,8 @@ impl ToolchainSelectorDelegate {
                         Cow::Owned(format!("`{}`", relative_path.display(path_style)))
                     }
                 };
-                let placeholder_text = format!("Select a {} for {pretty_path}…", meta.term.to_lowercase(),).into();
+                let placeholder_text =
+                    format!("Select a {} for {pretty_path}…", meta.term.to_lowercase(),).into();
                 let _ = this.update_in(cx, move |this, window, cx| {
                     this.delegate.relative_path = relative_path;
                     this.delegate.placeholder_text = placeholder_text;
@@ -763,7 +864,7 @@ impl ToolchainSelectorDelegate {
                 Some(())
             }
         });
-        let placeholder_text = "Select a toolchain…".to_string().into();
+        let placeholder_text = Arc::from("Select a toolchain…");
         Self {
             toolchain_selector,
             candidates: Default::default(),
@@ -780,7 +881,11 @@ impl ToolchainSelectorDelegate {
             add_toolchain_text: Arc::from("Add Toolchain"),
         }
     }
-    fn relativize_path(path: SharedString, worktree_root: &Path, path_style: PathStyle) -> SharedString {
+    fn relativize_path(
+        path: SharedString,
+        worktree_root: &Path,
+        path_style: PathStyle,
+    ) -> SharedString {
         Path::new(&path.as_ref())
             .strip_prefix(&worktree_root)
             .ok()
@@ -792,6 +897,10 @@ impl ToolchainSelectorDelegate {
 
 impl PickerDelegate for ToolchainSelectorDelegate {
     type ListItem = ListItem;
+
+    fn name() -> &'static str {
+        "toolchain selector"
+    }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         self.placeholder_text.clone()
@@ -812,17 +921,27 @@ impl PickerDelegate for ToolchainSelectorDelegate {
             {
                 let workspace = self.workspace.clone();
                 let worktree_id = self.worktree_id;
+                let worktree_abs_path_root = self.worktree_abs_path_root.clone();
                 let path = self.relative_path.clone();
                 let relative_path = self.relative_path.clone();
+                let db = workspace::WorkspaceDb::global(cx);
                 cx.spawn_in(window, async move |_, cx| {
-                    workspace::WORKSPACE_DB
-                        .set_toolchain(workspace_id, worktree_id, relative_path, toolchain.clone())
-                        .await
-                        .log_err();
+                    db.set_toolchain(
+                        workspace_id,
+                        worktree_abs_path_root,
+                        relative_path,
+                        toolchain.clone(),
+                    )
+                    .await
+                    .log_err();
                     workspace
                         .update(cx, |this, cx| {
                             this.project().update(cx, |this, cx| {
-                                this.activate_toolchain(ProjectPath { worktree_id, path }, toolchain, cx)
+                                this.activate_toolchain(
+                                    ProjectPath { worktree_id, path },
+                                    toolchain,
+                                    cx,
+                                )
                             })
                         })
                         .ok()?
@@ -838,18 +957,28 @@ impl PickerDelegate for ToolchainSelectorDelegate {
     fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
         self.toolchain_selector
             .update(cx, |_, cx| cx.emit(DismissEvent))
-            .log_err();
+            .ok();
     }
 
     fn selected_index(&self) -> usize {
         self.selected_index
     }
 
-    fn set_selected_index(&mut self, ix: usize, _window: &mut Window, _: &mut Context<Picker<Self>>) {
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _: &mut Context<Picker<Self>>,
+    ) {
         self.selected_index = ix;
     }
 
-    fn update_matches(&mut self, query: String, window: &mut Window, cx: &mut Context<Picker<Self>>) -> gpui::Task<()> {
+    fn update_matches(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> gpui::Task<()> {
         let background = cx.background_executor().clone();
         let candidates = self.candidates.clone();
         let worktree_root_path = self.worktree_abs_path_root.clone();
@@ -860,7 +989,11 @@ impl PickerDelegate for ToolchainSelectorDelegate {
                     .into_iter()
                     .enumerate()
                     .map(|(index, (candidate, _))| {
-                        let path = Self::relativize_path(candidate.path.clone(), &worktree_root_path, path_style);
+                        let path = Self::relativize_path(
+                            candidate.path.clone(),
+                            &worktree_root_path,
+                            path_style,
+                        );
                         let string = format!("{}{}", candidate.name, path);
                         StringMatch {
                             candidate_id: index,
@@ -875,18 +1008,33 @@ impl PickerDelegate for ToolchainSelectorDelegate {
                     .into_iter()
                     .enumerate()
                     .map(|(candidate_id, (toolchain, _))| {
-                        let path = Self::relativize_path(toolchain.path.clone(), &worktree_root_path, path_style);
+                        let path = Self::relativize_path(
+                            toolchain.path.clone(),
+                            &worktree_root_path,
+                            path_style,
+                        );
                         let string = format!("{}{}", toolchain.name, path);
                         StringMatchCandidate::new(candidate_id, &string)
                     })
                     .collect::<Vec<_>>();
-                match_strings(&candidates, &query, false, true, 100, &Default::default(), background).await
+                match_strings(
+                    &candidates,
+                    &query,
+                    false,
+                    true,
+                    100,
+                    &Default::default(),
+                    background,
+                )
+                .await
             };
 
             this.update(cx, |this, cx| {
                 let delegate = &mut this.delegate;
                 delegate.matches = matches;
-                delegate.selected_index = delegate.selected_index.min(delegate.matches.len().saturating_sub(1));
+                delegate.selected_index = delegate
+                    .selected_index
+                    .min(delegate.matches.len().saturating_sub(1));
                 cx.notify();
             })
             .log_err();
@@ -905,7 +1053,11 @@ impl PickerDelegate for ToolchainSelectorDelegate {
 
         let label = toolchain.name.clone();
         let path_style = self.project.read(cx).path_style(cx);
-        let path = Self::relativize_path(toolchain.path.clone(), &self.worktree_abs_path_root, path_style);
+        let path = Self::relativize_path(
+            toolchain.path.clone(),
+            &self.worktree_abs_path_root,
+            path_style,
+        );
         let (name_highlights, mut path_highlights) = mat
             .positions
             .iter()
@@ -927,13 +1079,16 @@ impl PickerDelegate for ToolchainSelectorDelegate {
                         .color(Color::Muted),
                 )
                 .when_some(scope.as_ref(), |this, scope| {
-                    let id: SharedString =
-                        format!("delete-custom-toolchain-{}-{}", toolchain.name, toolchain.path).into();
+                    let id: SharedString = format!(
+                        "delete-custom-toolchain-{}-{}",
+                        toolchain.name, toolchain.path
+                    )
+                    .into();
                     let toolchain = toolchain.clone();
                     let scope = scope.clone();
 
-                    this.end_slot(
-                        IconButton::new(id, IconName::Trash).on_click(cx.listener(move |this, _, _, cx| {
+                    this.end_slot(IconButton::new(id, IconName::Trash).on_click(cx.listener(
+                        move |this, _, _, cx| {
                             this.delegate.project.update(cx, |this, cx| {
                                 this.remove_toolchain(toolchain.clone(), scope.clone(), cx)
                             });
@@ -956,16 +1111,21 @@ impl PickerDelegate for ToolchainSelectorDelegate {
                                 .collect();
 
                             if this.delegate.selected_index >= ix {
-                                this.delegate.selected_index = this.delegate.selected_index.saturating_sub(1);
+                                this.delegate.selected_index =
+                                    this.delegate.selected_index.saturating_sub(1);
                             }
                             cx.stop_propagation();
                             cx.notify();
-                        })),
-                    )
+                        },
+                    )))
                 }),
         )
     }
-    fn render_footer(&self, _window: &mut Window, cx: &mut Context<Picker<Self>>) -> Option<AnyElement> {
+    fn render_footer(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<AnyElement> {
         Some(
             v_flex()
                 .rounded_b_md()
@@ -977,13 +1137,25 @@ impl PickerDelegate for ToolchainSelectorDelegate {
                         .justify_end()
                         .child(
                             Button::new("xd", self.add_toolchain_text.clone())
-                                .key_binding(KeyBinding::for_action_in(&AddToolchain, &self.focus_handle, cx))
-                                .on_click(|_, window, cx| window.dispatch_action(Box::new(AddToolchain), cx)),
+                                .key_binding(KeyBinding::for_action_in(
+                                    &AddToolchain,
+                                    &self.focus_handle,
+                                    cx,
+                                ))
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(AddToolchain), cx)
+                                }),
                         )
                         .child(
                             Button::new("select", "Select")
-                                .key_binding(KeyBinding::for_action_in(&menu::Confirm, &self.focus_handle, cx))
-                                .on_click(|_, window, cx| window.dispatch_action(menu::Confirm.boxed_clone(), cx)),
+                                .key_binding(KeyBinding::for_action_in(
+                                    &menu::Confirm,
+                                    &self.focus_handle,
+                                    cx,
+                                ))
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(menu::Confirm.boxed_clone(), cx)
+                                }),
                         ),
                 )
                 .into_any_element(),

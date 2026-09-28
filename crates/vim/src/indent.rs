@@ -102,14 +102,20 @@ impl Vim {
     ) {
         self.stop_recording(cx);
         self.update_editor(cx, |_, editor, cx| {
-            let text_layout_details = editor.text_layout_details(window);
+            let text_layout_details = editor.text_layout_details(window, cx);
             editor.transact(window, cx, |editor, window, cx| {
                 let mut selection_starts: HashMap<_, _> = Default::default();
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = map.display_point_to_anchor(selection.head(), Bias::Right);
                         selection_starts.insert(selection.id, anchor);
-                        motion.expand_selection(map, selection, times, &text_layout_details, forced_motion);
+                        motion.expand_selection(
+                            map,
+                            selection,
+                            times,
+                            &text_layout_details,
+                            forced_motion,
+                        );
                     });
                 });
                 match dir {
@@ -118,7 +124,7 @@ impl Vim {
                     IndentDirection::Auto => editor.autoindent(&Default::default(), window, cx),
                 }
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = selection_starts.remove(&selection.id).unwrap();
                         selection.collapse_to(anchor.to_display_point(map), SelectionGoal::None);
                     });
@@ -141,7 +147,7 @@ impl Vim {
             editor.transact(window, cx, |editor, window, cx| {
                 let mut original_positions: HashMap<_, _> = Default::default();
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = map.display_point_to_anchor(selection.head(), Bias::Right);
                         original_positions.insert(selection.id, anchor);
                         object.expand_selection(map, selection, around, times);
@@ -153,7 +159,7 @@ impl Vim {
                     IndentDirection::Auto => editor.autoindent(&Default::default(), window, cx),
                 }
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = original_positions.remove(&selection.id).unwrap();
                         selection.collapse_to(anchor.to_display_point(map), SelectionGoal::None);
                     });
@@ -165,8 +171,23 @@ impl Vim {
 
 #[cfg(test)]
 mod test {
-    use crate::{state::Mode, test::VimTestContext};
+    use crate::{
+        state::Mode,
+        test::{NeovimBackedTestContext, VimTestContext},
+    };
     use indoc::indoc;
+
+    #[gpui::test]
+    async fn test_indent_gv(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_neovim_option("shiftwidth=4").await;
+
+        cx.set_shared_state("ˇhello\nworld\n").await;
+        cx.simulate_shared_keystrokes("v j > g v").await;
+        cx.shared_state()
+            .await
+            .assert_eq("«    hello\n ˇ»   world\n");
+    }
 
     #[gpui::test]
     async fn test_indent_hx(cx: &mut gpui::TestAppContext) {

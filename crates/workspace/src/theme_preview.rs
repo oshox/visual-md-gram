@@ -1,10 +1,14 @@
 #![allow(unused, dead_code)]
-use gpui::{AnyElement, App, Entity, EventEmitter, FocusHandle, Focusable, Hsla, Task, actions, hsla};
+use gpui::{
+    AnyElement, App, Entity, EventEmitter, FocusHandle, Focusable, Hsla, Task, actions, hsla,
+};
 use strum::IntoEnumIterator;
 use theme::all_theme_colors;
 use ui::{
-    ButtonLike, Checkbox, ContentGroup, DecoratedIcon, ElevationIndex, IconDecoration, Indicator, KeybindingHint,
-    Switch, TintColor, Tooltip, prelude::*, utils::calculate_contrast_ratio,
+    AudioStatus, Avatar, AvatarAudioStatusIndicator, AvatarAvailabilityIndicator, ButtonLike,
+    Checkbox, CollaboratorAvailability, DecoratedIcon, ElevationIndex, Facepile, IconDecoration,
+    Indicator, KeybindingHint, Switch, TintColor, Tooltip, prelude::*,
+    utils::calculate_contrast_ratio,
 };
 
 use crate::{Item, Workspace};
@@ -63,7 +67,9 @@ impl ThemePreview {
     ) -> impl IntoElement {
         match page {
             ThemePreviewPage::Overview => self.render_overview_page(window, cx).into_any_element(),
-            ThemePreviewPage::Typography => self.render_typography_page(window, cx).into_any_element(),
+            ThemePreviewPage::Typography => {
+                self.render_typography_page(window, cx).into_any_element()
+            }
         }
     }
 }
@@ -80,11 +86,15 @@ impl ThemePreview {}
 impl Item for ThemePreview {
     type Event = ();
 
-    fn to_item_events(_: &Self::Event, _: impl FnMut(crate::item::ItemEvent)) {}
+    fn to_item_events(_: &Self::Event, _: &mut dyn FnMut(crate::item::ItemEvent)) {}
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         let name = cx.theme().name.clone();
         format!("{} Preview", name).into()
+    }
+
+    fn telemetry_event_text(&self) -> Option<&'static str> {
+        None
     }
 
     fn can_split(&self) -> bool {
@@ -111,7 +121,12 @@ impl ThemePreview {
         cx.theme().colors().editor_background
     }
 
-    fn render_text(&self, layer: ElevationIndex, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_text(
+        &self,
+        layer: ElevationIndex,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let bg = layer.bg(cx);
 
         let label_with_contrast = |label: &str, fg: Hsla| {
@@ -272,13 +287,22 @@ impl ThemePreview {
             )
     }
 
-    fn render_colors(&self, layer: ElevationIndex, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_colors(
+        &self,
+        layer: ElevationIndex,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let bg = layer.bg(cx);
         let all_colors = all_theme_colors(cx);
 
         v_flex()
             .gap_1()
-            .child(Headline::new("Colors").size(HeadlineSize::Small).color(Color::Muted))
+            .child(
+                Headline::new("Colors")
+                    .size(HeadlineSize::Small)
+                    .color(Color::Muted),
+            )
             .child(
                 h_flex()
                     .flex_wrap()
@@ -322,7 +346,11 @@ impl ThemePreview {
             .child(self.render_colors(layer, window, cx))
     }
 
-    fn render_overview_page(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_overview_page(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         v_flex()
             .id("theme-preview-overview")
             .overflow_scroll()
@@ -338,7 +366,11 @@ impl ThemePreview {
             .child(self.render_theme_layer(ElevationIndex::ElevatedSurface, window, cx))
     }
 
-    fn render_typography_page(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_typography_page(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         v_flex()
             .id("theme-preview-typography")
             .overflow_scroll()

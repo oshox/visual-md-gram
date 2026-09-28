@@ -1,10 +1,22 @@
 use crate::ItemHandle;
 use gpui::{
-    AnyView, App, Context, Entity, EntityId, EventEmitter, KeyContext, ParentElement as _, Render, Styled, Window,
+    AnyView, App, Context, Div, Entity, EntityId, EventEmitter, Global, KeyContext,
+    ParentElement as _, Render, Styled, Window,
 };
+use language::LanguageRegistry;
+use std::sync::Arc;
 use ui::prelude::*;
 use ui::{h_flex, v_flex};
 
+pub struct PaneSearchBarCallbacks {
+    pub setup_search_bar:
+        fn(Option<Arc<LanguageRegistry>>, &Entity<Toolbar>, &mut Window, &mut App),
+    pub wrap_div_with_search_actions: fn(Div, Entity<crate::Pane>) -> Div,
+}
+
+impl Global for PaneSearchBarCallbacks {}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ToolbarItemEvent {
     ChangeLocation(ToolbarItemLocation),
 }
@@ -17,7 +29,13 @@ pub trait ToolbarItemView: Render + EventEmitter<ToolbarItemEvent> {
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation;
 
-    fn pane_focus_update(&mut self, _pane_focused: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn pane_focus_update(
+        &mut self,
+        _pane_focused: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 
     fn contribute_context(&self, _context: &mut KeyContext, _cx: &App) {}
 }
@@ -102,9 +120,10 @@ impl Render for Toolbar {
         v_flex()
             .group("toolbar")
             .relative()
-            .p(DynamicSpacing::Base08.rems(cx))
+            .py(DynamicSpacing::Base06.rems(cx))
+            .px(DynamicSpacing::Base08.rems(cx))
             .when(has_left_items || has_right_items, |this| {
-                this.gap(DynamicSpacing::Base08.rems(cx))
+                this.gap(DynamicSpacing::Base06.rems(cx))
             })
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
@@ -112,12 +131,13 @@ impl Render for Toolbar {
             .when(has_left_items || has_right_items, |this| {
                 this.child(
                     h_flex()
-                        .min_h_6()
+                        .items_start()
                         .justify_between()
                         .gap(DynamicSpacing::Base08.rems(cx))
                         .when(has_left_items, |this| {
                             this.child(
                                 h_flex()
+                                    .min_h_8()
                                     .flex_auto()
                                     .justify_start()
                                     .overflow_x_hidden()
@@ -127,17 +147,9 @@ impl Render for Toolbar {
                         .when(has_right_items, |this| {
                             this.child(
                                 h_flex()
-                                    .h_full()
+                                    .h_8()
                                     .flex_row_reverse()
-                                    .map(|el| {
-                                        if has_left_items {
-                                            // We're using `flex_none` here to prevent some flickering that can occur when the
-                                            // size of the left items container changes.
-                                            el.flex_none()
-                                        } else {
-                                            el.flex_auto()
-                                        }
-                                    })
+                                    .when(has_left_items, |this| this.flex_none())
                                     .justify_end()
                                     .children(self.right_items().map(|item| item.to_any())),
                             )
@@ -175,7 +187,11 @@ impl Toolbar {
     {
         let location = item.set_active_pane_item(self.active_item.as_deref(), window, cx);
         cx.subscribe(&item, |this, item, event, cx| {
-            if let Some((_, current_location)) = this.items.iter_mut().find(|(i, _)| i.id() == item.entity_id()) {
+            if let Some((_, current_location)) = this
+                .items
+                .iter_mut()
+                .find(|(i, _)| i.id() == item.entity_id())
+            {
                 match event {
                     ToolbarItemEvent::ChangeLocation(new_location) => {
                         if new_location != current_location {
@@ -191,7 +207,12 @@ impl Toolbar {
         cx.notify();
     }
 
-    pub fn set_active_item(&mut self, item: Option<&dyn ItemHandle>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_active_item(
+        &mut self,
+        item: Option<&dyn ItemHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.active_item = item.map(|item| item.boxed_clone());
         self.hidden = self
             .active_item
@@ -215,7 +236,9 @@ impl Toolbar {
     }
 
     pub fn item_of_type<T: ToolbarItemView>(&self) -> Option<Entity<T>> {
-        self.items.iter().find_map(|(item, _)| item.to_any().downcast().ok())
+        self.items
+            .iter()
+            .find_map(|(item, _)| item.to_any().downcast().ok())
     }
 
     pub fn hidden(&self) -> bool {
@@ -246,7 +269,9 @@ impl<T: ToolbarItemView> ToolbarItemViewHandle for Entity<T> {
         window: &mut Window,
         cx: &mut App,
     ) -> ToolbarItemLocation {
-        self.update(cx, |this, cx| this.set_active_pane_item(active_pane_item, window, cx))
+        self.update(cx, |this, cx| {
+            this.set_active_pane_item(active_pane_item, window, cx)
+        })
     }
 
     fn focus_changed(&mut self, pane_focused: bool, window: &mut Window, cx: &mut App) {

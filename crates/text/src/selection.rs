@@ -14,7 +14,7 @@ pub enum SelectionGoal {
     WrappedHorizontalPosition((u32, f32)),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Selection<T> {
     pub id: usize,
     pub start: T,
@@ -154,7 +154,10 @@ impl<T: Copy + Eq> Selection<T> {
 }
 
 impl Selection<Anchor> {
-    pub fn resolve<'a, D: 'a + TextDimension>(&'a self, snapshot: &'a BufferSnapshot) -> Selection<D> {
+    pub fn resolve<'a, D: 'a + TextDimension>(
+        &'a self,
+        snapshot: &'a BufferSnapshot,
+    ) -> Selection<D> {
         Selection {
             id: self.id,
             start: snapshot.summary_for_anchor(&self.start),

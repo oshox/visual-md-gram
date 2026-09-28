@@ -4,8 +4,9 @@ use anyhow::{Context as _, Ok, Result};
 use base64::Engine;
 use dap::{
     Capabilities, ContinueArguments, ExceptionFilterOptions, InitializeRequestArguments,
-    InitializeRequestArgumentsPathFormat, NextArguments, SetVariableResponse, SourceBreakpoint, StepInArguments,
-    StepOutArguments, SteppingGranularity, ValueFormat, Variable, VariablesArgumentsFilter,
+    InitializeRequestArgumentsPathFormat, NextArguments, SetVariableResponse, SourceBreakpoint,
+    StepInArguments, StepOutArguments, SteppingGranularity, ValueFormat, Variable,
+    VariablesArgumentsFilter,
     client::SessionId,
     proto_conversions::ProtoConversion,
     requests::{Continue, Next},
@@ -47,7 +48,10 @@ pub trait DapCommand: LocalDapCommand {
     fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> Self::ProtoRequest;
 
     #[allow(dead_code)]
-    fn response_to_proto(debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse;
+    fn response_to_proto(
+        debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse;
 
     #[allow(unused)]
     fn response_from_proto(&self, message: Self::ProtoResponse) -> Result<Self::Response>;
@@ -89,7 +93,10 @@ impl<T: DapCommand> DapCommand for Arc<T> {
         T::to_proto(self, debug_client_id, upstream_project_id)
     }
 
-    fn response_to_proto(debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse {
         T::response_to_proto(debug_client_id, message)
     }
 
@@ -162,11 +169,18 @@ impl DapCommand for NextCommand {
         }
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, _message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        _message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::Ack {}
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapNextRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapNextRequest {
         proto::DapNextRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
@@ -227,11 +241,18 @@ impl DapCommand for StepInCommand {
         }
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, _message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        _message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::Ack {}
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapStepInRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapStepInRequest {
         proto::DapStepInRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
@@ -292,11 +313,18 @@ impl DapCommand for StepOutCommand {
         }
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, _message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        _message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::Ack {}
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapStepOutRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapStepOutRequest {
         proto::DapStepOutRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
@@ -359,11 +387,18 @@ impl DapCommand for StepBackCommand {
         }
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, _message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        _message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::Ack {}
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapStepBackRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapStepBackRequest {
         proto::DapStepBackRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
@@ -407,7 +442,11 @@ impl DapCommand for ContinueCommand {
         SessionId::from_proto(request.client_id)
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapContinueRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapContinueRequest {
         proto::DapContinueRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
@@ -431,7 +470,10 @@ impl DapCommand for ContinueCommand {
         })
     }
 
-    fn response_to_proto(debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::DapContinueResponse {
             client_id: debug_client_id.to_proto(),
             all_threads_continued: message.all_threads_continued,
@@ -475,7 +517,11 @@ impl DapCommand for PauseCommand {
         }
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapPauseRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapPauseRequest {
         proto::DapPauseRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
@@ -483,7 +529,10 @@ impl DapCommand for PauseCommand {
         }
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, _message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        _message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::Ack {}
     }
 
@@ -535,7 +584,11 @@ impl DapCommand for DisconnectCommand {
         }
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapDisconnectRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapDisconnectRequest {
         proto::DapDisconnectRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
@@ -545,7 +598,10 @@ impl DapCommand for DisconnectCommand {
         }
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, _message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        _message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::Ack {}
     }
 
@@ -564,7 +620,9 @@ impl LocalDapCommand for TerminateThreadsCommand {
     type DapRequest = dap::requests::TerminateThreads;
 
     fn is_supported(capabilities: &Capabilities) -> bool {
-        capabilities.supports_terminate_threads_request.unwrap_or_default()
+        capabilities
+            .supports_terminate_threads_request
+            .unwrap_or_default()
     }
 
     fn to_dap(&self) -> <Self::DapRequest as dap::requests::Request>::Arguments {
@@ -599,7 +657,11 @@ impl DapCommand for TerminateThreadsCommand {
         Self { thread_ids }
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapTerminateThreadsRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapTerminateThreadsRequest {
         proto::DapTerminateThreadsRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
@@ -607,7 +669,10 @@ impl DapCommand for TerminateThreadsCommand {
         }
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, _message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        _message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::Ack {}
     }
 
@@ -629,7 +694,9 @@ impl LocalDapCommand for TerminateCommand {
         capabilities.supports_terminate_request.unwrap_or_default()
     }
     fn to_dap(&self) -> <Self::DapRequest as dap::requests::Request>::Arguments {
-        dap::TerminateArguments { restart: self.restart }
+        dap::TerminateArguments {
+            restart: self.restart,
+        }
     }
 
     fn response_from_dap(
@@ -654,7 +721,11 @@ impl DapCommand for TerminateCommand {
         }
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapTerminateRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapTerminateRequest {
         proto::DapTerminateRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
@@ -662,7 +733,10 @@ impl DapCommand for TerminateCommand {
         }
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, _message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        _message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::Ack {}
     }
 
@@ -685,7 +759,9 @@ impl LocalDapCommand for RestartCommand {
     }
 
     fn to_dap(&self) -> <Self::DapRequest as dap::requests::Request>::Arguments {
-        dap::RestartArguments { raw: self.raw.clone() }
+        dap::RestartArguments {
+            raw: self.raw.clone(),
+        }
     }
 
     fn response_from_dap(
@@ -712,7 +788,11 @@ impl DapCommand for RestartCommand {
         }
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapRestartRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapRestartRequest {
         let raw_args = serde_json::to_vec(&self.raw).log_err().unwrap_or_default();
 
         proto::DapRestartRequest {
@@ -722,7 +802,10 @@ impl DapCommand for RestartCommand {
         }
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, _message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        _message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::Ack {}
     }
 
@@ -793,7 +876,10 @@ impl DapCommand for VariablesCommand {
         }
     }
 
-    fn response_to_proto(debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::DapVariables {
             client_id: debug_client_id.to_proto(),
             variables: message.to_proto(),
@@ -859,7 +945,10 @@ impl DapCommand for SetVariableValueCommand {
         }
     }
 
-    fn response_to_proto(debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::DapSetVariableValueResponse {
             client_id: debug_client_id.to_proto(),
             value: message.value,
@@ -925,7 +1014,11 @@ impl DapCommand for RestartStackFrameCommand {
         }
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapRestartStackFrameRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapRestartStackFrameRequest {
         proto::DapRestartStackFrameRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
@@ -933,7 +1026,10 @@ impl DapCommand for RestartStackFrameCommand {
         }
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, _message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        _message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::Ack {}
     }
 
@@ -981,16 +1077,26 @@ impl DapCommand for ModulesCommand {
         Self {}
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapModulesRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapModulesRequest {
         proto::DapModulesRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
         }
     }
 
-    fn response_to_proto(debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::DapModulesResponse {
-            modules: message.into_iter().map(|module| module.to_proto()).collect(),
+            modules: message
+                .into_iter()
+                .map(|module| module.to_proto())
+                .collect(),
             client_id: debug_client_id.to_proto(),
         }
     }
@@ -1013,7 +1119,9 @@ impl LocalDapCommand for LoadedSourcesCommand {
     const CACHEABLE: bool = true;
 
     fn is_supported(capabilities: &Capabilities) -> bool {
-        capabilities.supports_loaded_sources_request.unwrap_or_default()
+        capabilities
+            .supports_loaded_sources_request
+            .unwrap_or_default()
     }
     fn to_dap(&self) -> <Self::DapRequest as dap::requests::Request>::Arguments {
         dap::LoadedSourcesArguments {}
@@ -1039,22 +1147,36 @@ impl DapCommand for LoadedSourcesCommand {
         Self {}
     }
 
-    fn to_proto(&self, debug_client_id: SessionId, upstream_project_id: u64) -> proto::DapLoadedSourcesRequest {
+    fn to_proto(
+        &self,
+        debug_client_id: SessionId,
+        upstream_project_id: u64,
+    ) -> proto::DapLoadedSourcesRequest {
         proto::DapLoadedSourcesRequest {
             project_id: upstream_project_id,
             client_id: debug_client_id.to_proto(),
         }
     }
 
-    fn response_to_proto(debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::DapLoadedSourcesResponse {
-            sources: message.into_iter().map(|source| source.to_proto()).collect(),
+            sources: message
+                .into_iter()
+                .map(|source| source.to_proto())
+                .collect(),
             client_id: debug_client_id.to_proto(),
         }
     }
 
     fn response_from_proto(&self, message: Self::ProtoResponse) -> Result<Self::Response> {
-        Ok(message.sources.into_iter().map(dap::Source::from_proto).collect())
+        Ok(message
+            .sources
+            .into_iter()
+            .map(dap::Source::from_proto)
+            .collect())
     }
 }
 
@@ -1114,10 +1236,17 @@ impl DapCommand for StackTraceCommand {
     }
 
     fn response_from_proto(&self, message: Self::ProtoResponse) -> Result<Self::Response> {
-        Ok(message.frames.into_iter().map(dap::StackFrame::from_proto).collect())
+        Ok(message
+            .frames
+            .into_iter()
+            .map(dap::StackFrame::from_proto)
+            .collect())
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::DapStackTraceResponse {
             frames: message.to_proto(),
         }
@@ -1174,7 +1303,10 @@ impl DapCommand for ScopesCommand {
         Ok(Vec::from_proto(message.scopes))
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::DapScopesResponse {
             scopes: message.to_proto(),
         }
@@ -1203,7 +1335,9 @@ impl LocalDapCommand for super::session::CompletionsQuery {
     }
 
     fn is_supported(capabilities: &Capabilities) -> bool {
-        capabilities.supports_completions_request.unwrap_or_default()
+        capabilities
+            .supports_completions_request
+            .unwrap_or_default()
     }
 }
 
@@ -1241,7 +1375,10 @@ impl DapCommand for super::session::CompletionsQuery {
         })
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::DapCompletionResponse {
             client_id: _debug_client_id.to_proto(),
             completions: message.targets.to_proto(),
@@ -1289,7 +1426,10 @@ impl DapCommand for EvaluateCommand {
             project_id: upstream_project_id,
             expression: self.expression.clone(),
             frame_id: self.frame_id,
-            context: self.context.clone().map(|context| context.to_proto().into()),
+            context: self
+                .context
+                .clone()
+                .map(|context| context.to_proto().into()),
         }
     }
 
@@ -1319,7 +1459,10 @@ impl DapCommand for EvaluateCommand {
         })
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::DapEvaluateResponse {
             result: message.result,
             evaluate_type: message.type_,
@@ -1374,7 +1517,10 @@ impl DapCommand for ThreadsCommand {
         Ok(Vec::from_proto(message.threads))
     }
 
-    fn response_to_proto(_debug_client_id: SessionId, message: Self::Response) -> Self::ProtoResponse {
+    fn response_to_proto(
+        _debug_client_id: SessionId,
+        message: Self::Response,
+    ) -> Self::ProtoResponse {
         proto::DapThreadsResponse {
             threads: message.to_proto(),
         }
@@ -1388,8 +1534,8 @@ pub(super) struct Initialize {
 
 fn dap_client_capabilities(adapter_id: String) -> InitializeRequestArguments {
     InitializeRequestArguments {
-        client_id: Some("gram".to_owned()),
-        client_name: Some("Gram".to_owned()),
+        client_id: Some("zed".to_owned()),
+        client_name: Some("Zed".to_owned()),
         adapter_id,
         locale: Some("en-US".to_owned()),
         path_format: Some(InitializeRequestArgumentsPathFormat::Path),
@@ -1432,7 +1578,9 @@ impl LocalDapCommand for ConfigurationDone {
     type DapRequest = dap::requests::ConfigurationDone;
 
     fn is_supported(capabilities: &Capabilities) -> bool {
-        capabilities.supports_configuration_done_request.unwrap_or_default()
+        capabilities
+            .supports_configuration_done_request
+            .unwrap_or_default()
     }
 
     fn to_dap(&self) -> <Self::DapRequest as dap::requests::Request>::Arguments {
@@ -1457,7 +1605,9 @@ impl LocalDapCommand for Launch {
     type DapRequest = dap::requests::Launch;
 
     fn to_dap(&self) -> <Self::DapRequest as dap::requests::Request>::Arguments {
-        dap::LaunchRequestArguments { raw: self.raw.clone() }
+        dap::LaunchRequestArguments {
+            raw: self.raw.clone(),
+        }
     }
 
     fn response_from_dap(
@@ -1478,7 +1628,9 @@ impl LocalDapCommand for Attach {
     type DapRequest = dap::requests::Attach;
 
     fn to_dap(&self) -> <Self::DapRequest as dap::requests::Request>::Arguments {
-        dap::AttachRequestArguments { raw: self.raw.clone() }
+        dap::AttachRequestArguments {
+            raw: self.raw.clone(),
+        }
     }
 
     fn response_from_dap(
@@ -1544,7 +1696,11 @@ impl DataBreakpointContext {
             DataBreakpointContext::Address { address, bytes } => {
                 let mut label = format!("Address: {}", address);
                 if let Some(bytes) = bytes {
-                    label.push_str(&format!(" ({} byte{})", bytes, if *bytes == 1 { "" } else { "s" }));
+                    label.push_str(&format!(
+                        " ({} byte{})",
+                        bytes,
+                        if *bytes == 1 { "" } else { "s" }
+                    ));
                 }
                 label
             }
@@ -1575,11 +1731,20 @@ impl LocalDapCommand for DataBreakpointInfoCommand {
                 variables_reference,
                 name,
                 bytes,
-            } => (Some(*variables_reference), name.clone(), None, Some(false), *bytes),
-            DataBreakpointContext::Expression { expression, frame_id } => {
-                (None, expression.clone(), *frame_id, Some(false), None)
+            } => (
+                Some(*variables_reference),
+                name.clone(),
+                None,
+                Some(false),
+                *bytes,
+            ),
+            DataBreakpointContext::Expression {
+                expression,
+                frame_id,
+            } => (None, expression.clone(), *frame_id, Some(false), None),
+            DataBreakpointContext::Address { address, bytes } => {
+                (None, address.clone(), None, Some(true), *bytes)
             }
-            DataBreakpointContext::Address { address, bytes } => (None, address.clone(), None, Some(true), *bytes),
         };
 
         dap::DataBreakpointInfoArguments {
@@ -1629,8 +1794,12 @@ impl LocalDapCommand for SetDataBreakpointsCommand {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub(super) enum SetExceptionBreakpoints {
-    Plain { filters: Vec<String> },
-    WithOptions { filters: Vec<ExceptionFilterOptions> },
+    Plain {
+        filters: Vec<String>,
+    },
+    WithOptions {
+        filters: Vec<ExceptionFilterOptions>,
+    },
 }
 
 impl LocalDapCommand for SetExceptionBreakpoints {
@@ -1644,11 +1813,13 @@ impl LocalDapCommand for SetExceptionBreakpoints {
                 exception_options: None,
                 filter_options: None,
             },
-            SetExceptionBreakpoints::WithOptions { filters } => dap::SetExceptionBreakpointsArguments {
-                filters: vec![],
-                filter_options: Some(filters.clone()),
-                exception_options: None,
-            },
+            SetExceptionBreakpoints::WithOptions { filters } => {
+                dap::SetExceptionBreakpointsArguments {
+                    filters: vec![],
+                    filter_options: Some(filters.clone()),
+                    exception_options: None,
+                }
+            }
         }
     }
 
@@ -1750,7 +1921,9 @@ impl LocalDapCommand for ReadMemory {
     const CACHEABLE: bool = true;
 
     fn is_supported(capabilities: &Capabilities) -> bool {
-        capabilities.supports_read_memory_request.unwrap_or_default()
+        capabilities
+            .supports_read_memory_request
+            .unwrap_or_default()
     }
     fn to_dap(&self) -> <Self::DapRequest as dap::requests::Request>::Arguments {
         dap::ReadMemoryArguments {
@@ -1785,7 +1958,9 @@ impl LocalDapCommand for dap::WriteMemoryArguments {
     type Response = dap::WriteMemoryResponse;
     type DapRequest = dap::requests::WriteMemory;
     fn is_supported(capabilities: &Capabilities) -> bool {
-        capabilities.supports_write_memory_request.unwrap_or_default()
+        capabilities
+            .supports_write_memory_request
+            .unwrap_or_default()
     }
     fn to_dap(&self) -> <Self::DapRequest as dap::requests::Request>::Arguments {
         self.clone()

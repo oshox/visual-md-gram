@@ -43,8 +43,9 @@ impl SpinnerVariant {
             SpinnerVariant::Dots => vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
             SpinnerVariant::DotsVariant => vec!["⣼", "⣹", "⢻", "⠿", "⡟", "⣏", "⣧", "⣶"],
             SpinnerVariant::Sand => vec![
-                "⠁", "⠂", "⠄", "⡀", "⡈", "⡐", "⡠", "⣀", "⣁", "⣂", "⣄", "⣌", "⣔", "⣤", "⣥", "⣦", "⣮", "⣶", "⣷", "⣿",
-                "⡿", "⠿", "⢟", "⠟", "⡛", "⠛", "⠫", "⢋", "⠋", "⠍", "⡉", "⠉", "⠑", "⠡", "⢁",
+                "⠁", "⠂", "⠄", "⡀", "⡈", "⡐", "⡠", "⣀", "⣁", "⣂", "⣄", "⣌", "⣔", "⣤", "⣥", "⣦",
+                "⣮", "⣶", "⣷", "⣿", "⡿", "⠿", "⢟", "⠟", "⡛", "⠛", "⠫", "⢋", "⠋", "⠍", "⡉", "⠉",
+                "⠑", "⠡", "⢁",
             ],
         }
     }
@@ -189,13 +190,21 @@ impl Component for SpinnerLabel {
         "Spinner Label"
     }
 
-    fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
+    fn description() -> &'static str {
+        "A text-based loading indicator that animates through a sequence of \
+        unicode glyphs to show ongoing or indeterminate work."
+    }
+
+    fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
         let examples = vec![
             single_example("Default", SpinnerLabel::new().into_any_element()),
-            single_example("Dots Variant", SpinnerLabel::dots_variant().into_any_element()),
+            single_example(
+                "Dots Variant",
+                SpinnerLabel::dots_variant().into_any_element(),
+            ),
             single_example("Sand Variant", SpinnerLabel::sand().into_any_element()),
         ];
 
-        Some(example_group(examples).vertical().into_any_element())
+        example_group(examples).vertical().into_any_element()
     }
 }

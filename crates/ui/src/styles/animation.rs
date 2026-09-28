@@ -1,4 +1,4 @@
-use crate::{ContentGroup, prelude::*};
+use crate::prelude::*;
 use gpui::{AnimationElement, AnimationExt, Styled};
 use std::time::Duration;
 
@@ -32,7 +32,11 @@ pub enum AnimationDirection {
 }
 
 pub trait DefaultAnimations: Styled + Sized + Element {
-    fn animate_in(self, animation_type: AnimationDirection, fade_in: bool) -> AnimationElement<Self> {
+    fn animate_in(
+        self,
+        animation_type: AnimationDirection,
+        fade_in: bool,
+    ) -> AnimationElement<Self> {
         let animation_name = match animation_type {
             AnimationDirection::FromBottom => "animate_from_bottom",
             AnimationDirection::FromLeft => "animate_from_left",
@@ -40,13 +44,14 @@ pub trait DefaultAnimations: Styled + Sized + Element {
             AnimationDirection::FromTop => "animate_from_top",
         };
 
-        let animation_id = self
-            .id()
-            .map_or_else(|| ElementId::from(animation_name), |id| (id, animation_name).into());
+        let animation_id = self.id().map_or_else(
+            || ElementId::from(animation_name),
+            |id| (id, animation_name).into(),
+        );
 
         self.with_animation(
             animation_id,
-            gpui::Animation::new(AnimationDuration::Fast.into()).with_easing(ease_out_quint),
+            gpui::Animation::new(AnimationDuration::Fast.into()).with_easing(ease_out_quint()),
             move |mut this, delta| {
                 let start_opacity = 0.4;
                 let start_pos = 0.0;
@@ -57,10 +62,18 @@ pub trait DefaultAnimations: Styled + Sized + Element {
                 }
 
                 match animation_type {
-                    AnimationDirection::FromBottom => this.bottom(px(start_pos + delta * (end_pos - start_pos))),
-                    AnimationDirection::FromLeft => this.left(px(start_pos + delta * (end_pos - start_pos))),
-                    AnimationDirection::FromRight => this.right(px(start_pos + delta * (end_pos - start_pos))),
-                    AnimationDirection::FromTop => this.top(px(start_pos + delta * (end_pos - start_pos))),
+                    AnimationDirection::FromBottom => {
+                        this.bottom(px(start_pos + delta * (end_pos - start_pos)))
+                    }
+                    AnimationDirection::FromLeft => {
+                        this.left(px(start_pos + delta * (end_pos - start_pos)))
+                    }
+                    AnimationDirection::FromRight => {
+                        this.right(px(start_pos + delta * (end_pos - start_pos)))
+                    }
+                    AnimationDirection::FromTop => {
+                        this.top(px(start_pos + delta * (end_pos - start_pos)))
+                    }
                 }
             },
         )
@@ -94,184 +107,169 @@ impl Component for Animation {
         ComponentScope::Utilities
     }
 
-    fn description() -> Option<&'static str> {
-        Some("Demonstrates various animation patterns and transitions available in the UI system.")
+    fn description() -> &'static str {
+        "Demonstrates various animation patterns and transitions available in the UI system."
     }
 
-    fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
+    fn preview(_window: &mut Window, cx: &mut App) -> AnyElement {
         let container_size = 128.0;
         let element_size = 32.0;
         let offset = container_size / 2.0 - element_size / 2.0;
-        Some(
-            v_flex()
-                .gap_6()
-                .children(vec![
-                    example_group_with_title(
-                        "Animate In",
-                        vec![
-                            single_example(
-                                "From Bottom",
-                                ContentGroup::new()
-                                    .relative()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(container_size))
-                                    .child(
-                                        div()
-                                            .id("animate-in-from-bottom")
-                                            .absolute()
-                                            .size(px(element_size))
-                                            .left(px(offset))
-                                            .rounded_md()
-                                            .bg(gpui::red())
-                                            .animate_in_from_bottom(false),
-                                    )
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "From Top",
-                                ContentGroup::new()
-                                    .relative()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(container_size))
-                                    .child(
-                                        div()
-                                            .id("animate-in-from-top")
-                                            .absolute()
-                                            .size(px(element_size))
-                                            .left(px(offset))
-                                            .rounded_md()
-                                            .bg(gpui::blue())
-                                            .animate_in_from_top(false),
-                                    )
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "From Left",
-                                ContentGroup::new()
-                                    .relative()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(container_size))
-                                    .child(
-                                        div()
-                                            .id("animate-in-from-left")
-                                            .absolute()
-                                            .size(px(element_size))
-                                            .top(px(offset))
-                                            .rounded_md()
-                                            .bg(gpui::green())
-                                            .animate_in_from_left(false),
-                                    )
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "From Right",
-                                ContentGroup::new()
-                                    .relative()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(container_size))
-                                    .child(
-                                        div()
-                                            .id("animate-in-from-right")
-                                            .absolute()
-                                            .size(px(element_size))
-                                            .top(px(offset))
-                                            .rounded_md()
-                                            .bg(gpui::yellow())
-                                            .animate_in_from_right(false),
-                                    )
-                                    .into_any_element(),
-                            ),
-                        ],
-                    )
-                    .grow(),
-                    example_group_with_title(
-                        "Fade and Animate In",
-                        vec![
-                            single_example(
-                                "From Bottom",
-                                ContentGroup::new()
-                                    .relative()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(container_size))
-                                    .child(
-                                        div()
-                                            .id("fade-animate-in-from-bottom")
-                                            .absolute()
-                                            .size(px(element_size))
-                                            .left(px(offset))
-                                            .rounded_md()
-                                            .bg(gpui::red())
-                                            .animate_in_from_bottom(true),
-                                    )
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "From Top",
-                                ContentGroup::new()
-                                    .relative()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(container_size))
-                                    .child(
-                                        div()
-                                            .id("fade-animate-in-from-top")
-                                            .absolute()
-                                            .size(px(element_size))
-                                            .left(px(offset))
-                                            .rounded_md()
-                                            .bg(gpui::blue())
-                                            .animate_in_from_top(true),
-                                    )
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "From Left",
-                                ContentGroup::new()
-                                    .relative()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(container_size))
-                                    .child(
-                                        div()
-                                            .id("fade-animate-in-from-left")
-                                            .absolute()
-                                            .size(px(element_size))
-                                            .top(px(offset))
-                                            .rounded_md()
-                                            .bg(gpui::green())
-                                            .animate_in_from_left(true),
-                                    )
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "From Right",
-                                ContentGroup::new()
-                                    .relative()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(container_size))
-                                    .child(
-                                        div()
-                                            .id("fade-animate-in-from-right")
-                                            .absolute()
-                                            .size(px(element_size))
-                                            .top(px(offset))
-                                            .rounded_md()
-                                            .bg(gpui::yellow())
-                                            .animate_in_from_right(true),
-                                    )
-                                    .into_any_element(),
-                            ),
-                        ],
-                    )
-                    .grow(),
-                ])
-                .into_any_element(),
-        )
+
+        let container = || {
+            h_flex()
+                .relative()
+                .justify_center()
+                .bg(cx.theme().colors().text.opacity(0.05))
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .rounded_sm()
+        };
+
+        v_flex()
+            .gap_6()
+            .children(vec![
+                example_group_with_title(
+                    "Animate In",
+                    vec![
+                        single_example(
+                            "From Bottom",
+                            container()
+                                .size(px(container_size))
+                                .child(
+                                    div()
+                                        .id("animate-in-from-bottom")
+                                        .absolute()
+                                        .size(px(element_size))
+                                        .left(px(offset))
+                                        .rounded_md()
+                                        .bg(gpui::red())
+                                        .animate_in_from_bottom(false),
+                                )
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "From Top",
+                            container()
+                                .size(px(container_size))
+                                .child(
+                                    div()
+                                        .id("animate-in-from-top")
+                                        .absolute()
+                                        .size(px(element_size))
+                                        .left(px(offset))
+                                        .rounded_md()
+                                        .bg(gpui::blue())
+                                        .animate_in_from_top(false),
+                                )
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "From Left",
+                            container()
+                                .size(px(container_size))
+                                .child(
+                                    div()
+                                        .id("animate-in-from-left")
+                                        .absolute()
+                                        .size(px(element_size))
+                                        .top(px(offset))
+                                        .rounded_md()
+                                        .bg(gpui::green())
+                                        .animate_in_from_left(false),
+                                )
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "From Right",
+                            container()
+                                .size(px(container_size))
+                                .child(
+                                    div()
+                                        .id("animate-in-from-right")
+                                        .absolute()
+                                        .size(px(element_size))
+                                        .top(px(offset))
+                                        .rounded_md()
+                                        .bg(gpui::yellow())
+                                        .animate_in_from_right(false),
+                                )
+                                .into_any_element(),
+                        ),
+                    ],
+                )
+                .grow(),
+                example_group_with_title(
+                    "Fade and Animate In",
+                    vec![
+                        single_example(
+                            "From Bottom",
+                            container()
+                                .size(px(container_size))
+                                .child(
+                                    div()
+                                        .id("fade-animate-in-from-bottom")
+                                        .absolute()
+                                        .size(px(element_size))
+                                        .left(px(offset))
+                                        .rounded_md()
+                                        .bg(gpui::red())
+                                        .animate_in_from_bottom(true),
+                                )
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "From Top",
+                            container()
+                                .size(px(container_size))
+                                .child(
+                                    div()
+                                        .id("fade-animate-in-from-top")
+                                        .absolute()
+                                        .size(px(element_size))
+                                        .left(px(offset))
+                                        .rounded_md()
+                                        .bg(gpui::blue())
+                                        .animate_in_from_top(true),
+                                )
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "From Left",
+                            container()
+                                .size(px(container_size))
+                                .child(
+                                    div()
+                                        .id("fade-animate-in-from-left")
+                                        .absolute()
+                                        .size(px(element_size))
+                                        .top(px(offset))
+                                        .rounded_md()
+                                        .bg(gpui::green())
+                                        .animate_in_from_left(true),
+                                )
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "From Right",
+                            container()
+                                .size(px(container_size))
+                                .child(
+                                    div()
+                                        .id("fade-animate-in-from-right")
+                                        .absolute()
+                                        .size(px(element_size))
+                                        .top(px(offset))
+                                        .rounded_md()
+                                        .bg(gpui::yellow())
+                                        .animate_in_from_right(true),
+                                )
+                                .into_any_element(),
+                        ),
+                    ],
+                )
+                .grow(),
+            ])
+            .into_any_element()
     }
 }

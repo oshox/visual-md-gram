@@ -11,7 +11,12 @@ use std::{marker::PhantomData, time::Instant};
 pub trait EnvelopedMessage: Clone + Debug + Serialize + Sized + Send + Sync + 'static {
     const NAME: &'static str;
     const PRIORITY: MessagePriority;
-    fn into_envelope(self, id: u32, responding_to: Option<u32>, original_sender_id: Option<PeerId>) -> Envelope;
+    fn into_envelope(
+        self,
+        id: u32,
+        responding_to: Option<u32>,
+        original_sender_id: Option<PeerId>,
+    ) -> Envelope;
     fn from_envelope(envelope: Envelope) -> Option<Self>;
 }
 
@@ -135,7 +140,9 @@ impl PeerId {
 
 impl Ord for PeerId {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.owner_id.cmp(&other.owner_id).then_with(|| self.id.cmp(&other.id))
+        self.owner_id
+            .cmp(&other.owner_id)
+            .then_with(|| self.id.cmp(&other.id))
     }
 }
 
@@ -176,7 +183,8 @@ pub struct TypedEnvelope<T> {
 
 impl<T> TypedEnvelope<T> {
     pub fn original_sender_id(&self) -> Result<PeerId> {
-        self.original_sender_id.context("missing original_sender_id")
+        self.original_sender_id
+            .context("missing original_sender_id")
     }
 }
 

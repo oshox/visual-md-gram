@@ -1,13 +1,13 @@
-use super::{latest, since_v0_1_0};
+use super::{latest, since_v0_1_0, since_v0_6_0};
 use crate::wasm_host::WasmState;
 use anyhow::Result;
 use extension::WorktreeDelegate;
 use gpui::BackgroundExecutor;
-use semver::Version as SemanticVersion;
+use semver::Version;
 use std::sync::{Arc, OnceLock};
 use wasmtime::component::{Linker, Resource};
 
-pub const MIN_VERSION: SemanticVersion = SemanticVersion::new(0, 0, 6);
+pub const MIN_VERSION: Version = Version::new(0, 0, 6);
 
 wasmtime::component::bindgen!({
     imports: {
@@ -18,11 +18,11 @@ wasmtime::component::bindgen!({
     },
     path: "../extension_api/wit/since_v0.0.6",
     with: {
-         "worktree": ExtensionWorktree,
-         "zed:extension/github": latest::zed::extension::github,
-         "zed:extension/lsp": since_v0_1_0::zed::extension::lsp,
-         "zed:extension/nodejs": latest::zed::extension::nodejs,
-         "zed:extension/platform": latest::zed::extension::platform,
+        "worktree": ExtensionWorktree,
+        "zed:extension/github": since_v0_6_0::zed::extension::github,
+        "zed:extension/lsp": since_v0_1_0::zed::extension::lsp,
+        "zed:extension/nodejs": latest::zed::extension::nodejs,
+        "zed:extension/platform": since_v0_6_0::zed::extension::platform,
     },
 });
 
@@ -56,7 +56,13 @@ impl From<SettingsLocation> for latest::SettingsLocation {
     fn from(value: SettingsLocation) -> Self {
         Self {
             worktree_id: value.worktree_id,
-            path: value.path,
+            // Passing the path here causes project settings reads to fail,
+            // since the extension passes the absolute path to the worktree,
+            // not a relative one like the settings API expects.
+            //
+            // This has been fixed in the API itself as of v0.2.0. Align the behavior
+            // here so that older extensions can also read project settings.
+            path: String::new(),
         }
     }
 }
@@ -125,7 +131,10 @@ impl HostWorktree for WasmState {
         latest::HostWorktree::id(self, delegate).await
     }
 
-    async fn root_path(&mut self, delegate: Resource<Arc<dyn WorktreeDelegate>>) -> wasmtime::Result<String> {
+    async fn root_path(
+        &mut self,
+        delegate: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> wasmtime::Result<String> {
         latest::HostWorktree::root_path(self, delegate).await
     }
 
@@ -137,7 +146,10 @@ impl HostWorktree for WasmState {
         latest::HostWorktree::read_text_file(self, delegate, path).await
     }
 
-    async fn shell_env(&mut self, delegate: Resource<Arc<dyn WorktreeDelegate>>) -> wasmtime::Result<EnvVars> {
+    async fn shell_env(
+        &mut self,
+        delegate: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> wasmtime::Result<EnvVars> {
         latest::HostWorktree::shell_env(self, delegate).await
     }
 
@@ -149,7 +161,7 @@ impl HostWorktree for WasmState {
         latest::HostWorktree::which(self, delegate, binary_name).await
     }
 
-    async fn drop(&mut self, _worktree: Resource<Worktree>) -> Result<()> {
+    async fn drop(&mut self, _worktree: Resource<Worktree>) -> wasmtime::Result<()> {
         // We only ever hand out borrows of worktrees.
         Ok(())
     }
@@ -162,7 +174,13 @@ impl ExtensionImports for WasmState {
         category: String,
         key: Option<String>,
     ) -> wasmtime::Result<Result<String, String>> {
-        latest::ExtensionImports::get_settings(self, location.map(|location| location.into()), category, key).await
+        latest::ExtensionImports::get_settings(
+            self,
+            location.map(|location| location.into()),
+            category,
+            key,
+        )
+        .await
     }
 
     async fn set_language_server_installation_status(
@@ -170,7 +188,12 @@ impl ExtensionImports for WasmState {
         server_name: String,
         status: LanguageServerInstallationStatus,
     ) -> wasmtime::Result<()> {
-        latest::ExtensionImports::set_language_server_installation_status(self, server_name, status.into()).await
+        latest::ExtensionImports::set_language_server_installation_status(
+            self,
+            server_name,
+            status.into(),
+        )
+        .await
     }
 
     async fn download_file(

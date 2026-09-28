@@ -1,8 +1,9 @@
 use std::ops::{Deref, DerefMut};
 
 use editor::test::editor_lsp_test_context::EditorLspTestContext;
-use gpui::{Context, Entity, SemanticVersion, UpdateGlobal};
+use gpui::{Context, Entity, UpdateGlobal};
 use search::{BufferSearchBar, project_search::ProjectSearchBar};
+use semver::Version;
 
 use crate::{state::Operator, *};
 
@@ -19,16 +20,17 @@ impl VimTestContext {
         cx.update(|cx| {
             let settings = SettingsStore::test(cx);
             cx.set_global(settings);
-            release_channel::init(SemanticVersion::new(0, 1, 0), cx);
+            release_channel::init(Version::new(0, 0, 0), cx);
             command_palette::init(cx);
             project_panel::init(cx);
             outline_panel::init(cx);
             git_ui::init(cx);
             crate::init(cx);
             search::init(cx);
-            theme::init(theme::LoadThemes::JustBase, cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             settings_ui::init(cx);
             markdown_preview::init(cx);
+            zed_actions::init();
         });
     }
 
@@ -97,15 +99,22 @@ impl VimTestContext {
         SettingsStore::update_global(cx, |store, cx| {
             store.update_user_settings(cx, |s| s.vim_mode = Some(enabled));
         });
-        let mut default_key_bindings =
-            settings::KeymapFile::load_asset_allow_partial_failure("keymaps/default-macos.jsonc", cx).unwrap();
+        let mut default_key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+            "keymaps/default-macos.json",
+            cx,
+        )
+        .unwrap();
         for key_binding in &mut default_key_bindings {
             key_binding.set_meta(settings::KeybindSource::Default.meta());
         }
         cx.bind_keys(default_key_bindings);
         if enabled {
-            let vim_key_bindings =
-                settings::KeymapFile::load_asset("keymaps/vim.jsonc", Some(settings::KeybindSource::Vim), cx).unwrap();
+            let mut vim_key_bindings =
+                settings::KeymapFile::load_asset_allow_partial_failure("keymaps/vim.json", cx)
+                    .unwrap();
+            for key_binding in &mut vim_key_bindings {
+                key_binding.set_meta(settings::KeybindSource::Vim.meta());
+            }
             cx.bind_keys(vim_key_bindings);
         }
     }
@@ -182,6 +191,10 @@ impl VimTestContext {
         self.update_editor(|editor, _, cx| editor.addon::<VimAddon>().unwrap().entity.read(cx).mode)
     }
 
+    pub fn forced_motion(&mut self) -> bool {
+        self.update_editor(|_, _, cx| cx.global::<VimGlobals>().forced_motion)
+    }
+
     pub fn active_operator(&mut self) -> Option<Operator> {
         self.update_editor(|editor, _, cx| {
             editor
@@ -197,7 +210,8 @@ impl VimTestContext {
 
     pub fn set_state(&mut self, text: &str, mode: Mode) {
         self.cx.set_state(text);
-        let vim = self.update_editor(|editor, _window, _cx| editor.addon::<VimAddon>().cloned().unwrap());
+        let vim =
+            self.update_editor(|editor, _window, _cx| editor.addon::<VimAddon>().cloned().unwrap());
 
         self.update(|window, cx| {
             vim.entity.update(cx, |vim, cx| {
@@ -228,7 +242,12 @@ impl VimTestContext {
         assert_eq!(self.active_operator(), None, "{}", self.assertion_context());
     }
 
-    pub fn assert_binding_normal(&mut self, keystrokes: &str, initial_state: &str, state_after: &str) {
+    pub fn assert_binding_normal(
+        &mut self,
+        keystrokes: &str,
+        initial_state: &str,
+        state_after: &str,
+    ) {
         self.set_state(initial_state, Mode::Normal);
         self.cx.simulate_keystrokes(keystrokes);
         self.cx.assert_editor_state(state_after);

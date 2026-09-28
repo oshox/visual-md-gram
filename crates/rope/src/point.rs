@@ -55,7 +55,11 @@ impl Point {
     }
 
     pub fn saturating_sub(self, other: Self) -> Self {
-        if self < other { Self::zero() } else { self - other }
+        if self < other {
+            Self::zero()
+        } else {
+            self - other
+        }
     }
 }
 

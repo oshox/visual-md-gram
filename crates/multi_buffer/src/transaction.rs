@@ -1,16 +1,16 @@
 use gpui::{App, Context, Entity};
-use language::{self, Buffer, TransactionId};
+use language::{self, Buffer, BufferEditSource, TransactionId};
 use std::{
     collections::HashMap,
-    ops::{AddAssign, Range, Sub},
+    ops::Range,
     time::{Duration, Instant},
 };
 use sum_tree::Bias;
 use text::BufferId;
 
-use crate::{BufferState, MultiBufferDimension};
+use crate::{Anchor, BufferState, MultiBufferOffset};
 
-use super::{Event, ExcerptSummary, MultiBuffer};
+use super::{Event, MultiBuffer};
 
 #[derive(Clone)]
 pub(super) struct History {
@@ -60,7 +60,11 @@ impl History {
         }
     }
 
-    fn end_transaction(&mut self, now: Instant, buffer_transactions: HashMap<BufferId, text::TransactionId>) -> bool {
+    fn end_transaction(
+        &mut self,
+        now: Instant,
+        buffer_transactions: HashMap<BufferId, text::TransactionId>,
+    ) -> bool {
         assert_ne!(self.transaction_depth, 0);
         self.transaction_depth -= 1;
         if self.transaction_depth == 0 {
@@ -84,8 +88,12 @@ impl History {
         }
     }
 
-    fn push_transaction<'a, T>(&mut self, buffer_transactions: T, now: Instant, cx: &Context<MultiBuffer>)
-    where
+    fn push_transaction<'a, T>(
+        &mut self,
+        buffer_transactions: T,
+        now: Instant,
+        cx: &Context<MultiBuffer>,
+    ) where
         T: IntoIterator<Item = (&'a Entity<Buffer>, &'a language::Transaction)>,
     {
         assert_eq!(self.transaction_depth, 0);
@@ -187,7 +195,8 @@ impl History {
         if let Some(mut transaction) = transactions.next_back() {
             while let Some(prev_transaction) = transactions.next_back() {
                 if !prev_transaction.suppress_grouping
-                    && transaction.first_edit_at - prev_transaction.last_edit_at <= self.group_interval
+                    && transaction.first_edit_at - prev_transaction.last_edit_at
+                        <= self.group_interval
                 {
                     transaction = prev_transaction;
                     count += 1;
@@ -248,7 +257,11 @@ impl MultiBuffer {
         self.start_transaction_at(Instant::now(), cx)
     }
 
-    pub fn start_transaction_at(&mut self, now: Instant, cx: &mut Context<Self>) -> Option<TransactionId> {
+    pub fn start_transaction_at(
+        &mut self,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) -> Option<TransactionId> {
         if let Some(buffer) = self.as_singleton() {
             return buffer.update(cx, |buffer, _| buffer.start_transaction_at(now));
         }
@@ -275,14 +288,23 @@ impl MultiBuffer {
         self.end_transaction_at(Instant::now(), cx)
     }
 
-    pub fn end_transaction_at(&mut self, now: Instant, cx: &mut Context<Self>) -> Option<TransactionId> {
+    pub fn end_transaction_with_source(
+        &mut self,
+        source: BufferEditSource,
+        cx: &mut Context<Self>,
+    ) -> Option<TransactionId> {
+        let now = Instant::now();
         if let Some(buffer) = self.as_singleton() {
-            return buffer.update(cx, |buffer, cx| buffer.end_transaction_at(now, cx));
+            return buffer.update(cx, |buffer, cx| {
+                buffer.end_transaction_with_source(source, cx)
+            });
         }
 
         let mut buffer_transactions = HashMap::default();
         for BufferState { buffer, .. } in self.buffers.values() {
-            if let Some(transaction_id) = buffer.update(cx, |buffer, cx| buffer.end_transaction_at(now, cx)) {
+            if let Some(transaction_id) = buffer.update(cx, |buffer, cx| {
+                buffer.end_transaction_with_source(source, cx)
+            }) {
                 buffer_transactions.insert(buffer.read(cx).remote_id(), transaction_id);
             }
         }
@@ -295,52 +317,76 @@ impl MultiBuffer {
         }
     }
 
-    pub fn edited_ranges_for_transaction<D>(&self, transaction_id: TransactionId, cx: &App) -> Vec<Range<D>>
-    where
-        D: MultiBufferDimension + Ord + Sub<D, Output = D::TextDimension> + AddAssign<D::TextDimension>,
-        D::TextDimension: PartialOrd + Sub<D::TextDimension, Output = D::TextDimension>,
-    {
+    pub fn end_transaction_at(
+        &mut self,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) -> Option<TransactionId> {
+        if let Some(buffer) = self.as_singleton() {
+            return buffer.update(cx, |buffer, cx| buffer.end_transaction_at(now, cx));
+        }
+
+        let mut buffer_transactions = HashMap::default();
+        for BufferState { buffer, .. } in self.buffers.values() {
+            if let Some(transaction_id) =
+                buffer.update(cx, |buffer, cx| buffer.end_transaction_at(now, cx))
+            {
+                buffer_transactions.insert(buffer.read(cx).remote_id(), transaction_id);
+            }
+        }
+
+        if self.history.end_transaction(now, buffer_transactions) {
+            let transaction_id = self.history.group().unwrap();
+            Some(transaction_id)
+        } else {
+            None
+        }
+    }
+
+    pub fn edited_ranges_for_transaction(
+        &self,
+        transaction_id: TransactionId,
+        cx: &App,
+    ) -> Vec<Range<MultiBufferOffset>> {
         let Some(transaction) = self.history.transaction(transaction_id) else {
             return Vec::new();
         };
 
-        let mut ranges = Vec::new();
         let snapshot = self.read(cx);
-        let mut cursor = snapshot.excerpts.cursor::<ExcerptSummary>(());
+        let mut buffer_anchors = Vec::new();
 
         for (buffer_id, buffer_transaction) in &transaction.buffer_transactions {
-            let Some(buffer_state) = self.buffers.get(buffer_id) else {
+            let Some(buffer) = self.buffer(*buffer_id) else {
                 continue;
             };
+            let Some(excerpt) = snapshot.first_excerpt_for_buffer(*buffer_id) else {
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
 
-            let buffer = buffer_state.buffer.read(cx);
-            for range in buffer.edited_ranges_for_transaction_id::<D::TextDimension>(*buffer_transaction) {
-                for excerpt_id in &buffer_state.excerpts {
-                    cursor.seek(excerpt_id, Bias::Left);
-                    if let Some(excerpt) = cursor.item()
-                        && excerpt.locator == *excerpt_id
-                    {
-                        let excerpt_buffer_start = excerpt.range.context.start.summary::<D::TextDimension>(buffer);
-                        let excerpt_buffer_end = excerpt.range.context.end.summary::<D::TextDimension>(buffer);
-                        let excerpt_range = excerpt_buffer_start..excerpt_buffer_end;
-                        if excerpt_range.contains(&range.start) && excerpt_range.contains(&range.end) {
-                            let excerpt_start = D::from_summary(&cursor.start().text);
-
-                            let mut start = excerpt_start;
-                            start += range.start - excerpt_buffer_start;
-                            let mut end = excerpt_start;
-                            end += range.end - excerpt_buffer_start;
-
-                            ranges.push(start..end);
-                            break;
-                        }
-                    }
-                }
+            for range in buffer
+                .read(cx)
+                .edited_ranges_for_transaction_id::<usize>(*buffer_transaction)
+            {
+                buffer_anchors.push(Anchor::in_buffer(
+                    excerpt.path_key_index,
+                    buffer_snapshot.anchor_at(range.start, Bias::Left),
+                ));
+                buffer_anchors.push(Anchor::in_buffer(
+                    excerpt.path_key_index,
+                    buffer_snapshot.anchor_at(range.end, Bias::Right),
+                ));
             }
         }
+        buffer_anchors.sort_unstable_by(|a, b| a.cmp(b, &snapshot));
 
-        ranges.sort_by_key(|range| range.start);
-        ranges
+        snapshot
+            .summaries_for_anchors(buffer_anchors.iter())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[s, e]| s..e)
+            .collect::<Vec<_>>()
     }
 
     pub fn merge_transactions(
@@ -350,19 +396,28 @@ impl MultiBuffer {
         cx: &mut Context<Self>,
     ) {
         if let Some(buffer) = self.as_singleton() {
-            buffer.update(cx, |buffer, _| buffer.merge_transactions(transaction, destination));
+            buffer.update(cx, |buffer, _| {
+                buffer.merge_transactions(transaction, destination)
+            });
         } else if let Some(transaction) = self.history.forget(transaction)
             && let Some(destination) = self.history.transaction_mut(destination)
         {
             for (buffer_id, buffer_transaction_id) in transaction.buffer_transactions {
-                if let Some(destination_buffer_transaction_id) = destination.buffer_transactions.get(&buffer_id) {
+                if let Some(destination_buffer_transaction_id) =
+                    destination.buffer_transactions.get(&buffer_id)
+                {
                     if let Some(state) = self.buffers.get(&buffer_id) {
                         state.buffer.update(cx, |buffer, _| {
-                            buffer.merge_transactions(buffer_transaction_id, *destination_buffer_transaction_id)
+                            buffer.merge_transactions(
+                                buffer_transaction_id,
+                                *destination_buffer_transaction_id,
+                            )
                         });
                     }
                 } else {
-                    destination.buffer_transactions.insert(buffer_id, buffer_transaction_id);
+                    destination
+                        .buffer_transactions
+                        .insert(buffer_id, buffer_transaction_id);
                 }
             }
         }
@@ -381,13 +436,20 @@ impl MultiBuffer {
     where
         T: IntoIterator<Item = (&'a Entity<Buffer>, &'a language::Transaction)>,
     {
-        self.history.push_transaction(buffer_transactions, Instant::now(), cx);
+        self.history
+            .push_transaction(buffer_transactions, Instant::now(), cx);
         self.history.finalize_last_transaction();
     }
 
-    pub fn group_until_transaction(&mut self, transaction_id: TransactionId, cx: &mut Context<Self>) {
+    pub fn group_until_transaction(
+        &mut self,
+        transaction_id: TransactionId,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(buffer) = self.as_singleton() {
-            buffer.update(cx, |buffer, _| buffer.group_until_transaction(transaction_id));
+            buffer.update(cx, |buffer, _| {
+                buffer.group_until_transaction(transaction_id)
+            });
         } else {
             self.history.group_until(transaction_id);
         }
@@ -458,7 +520,9 @@ impl MultiBuffer {
         } else if let Some(transaction) = self.history.remove_from_undo(transaction_id) {
             for (buffer_id, transaction_id) in &transaction.buffer_transactions {
                 if let Some(BufferState { buffer, .. }) = self.buffers.get(buffer_id) {
-                    buffer.update(cx, |buffer, cx| buffer.undo_transaction(*transaction_id, cx));
+                    buffer.update(cx, |buffer, cx| {
+                        buffer.undo_transaction(*transaction_id, cx)
+                    });
                 }
             }
         }

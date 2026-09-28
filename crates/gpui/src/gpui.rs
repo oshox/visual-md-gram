@@ -1,11 +1,10 @@
 #![doc = include_str!("../README.md")]
-#![deny(missing_docs)]
+#![warn(missing_docs)]
 #![allow(clippy::type_complexity)] // Not useful, GPUI makes heavy use of callbacks
 #![allow(clippy::collapsible_else_if)] // False positives in platform specific code
 #![allow(unused_mut)] // False positives in platform specific code
 
 extern crate self as gpui;
-
 #[macro_use]
 mod action;
 mod app;
@@ -17,10 +16,15 @@ mod bounds_tree;
 mod color;
 /// The default colors used by GPUI.
 pub mod colors;
+#[cfg(feature = "profiler")]
+mod debug_overlay;
 mod element;
 mod elements;
 mod executor;
+mod platform_scheduler;
+pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
+mod gestures;
 mod global;
 mod input;
 mod inspector;
@@ -30,10 +34,21 @@ mod keymap;
 mod path_builder;
 mod platform;
 pub mod prelude;
-mod profiler;
+/// Profiling utilities for task, frame, and thread performance tracking.
+pub mod profiler;
+#[cfg(any(
+    test,
+    target_os = "windows",
+    target_os = "linux",
+    target_family = "wasm",
+    feature = "test-support",
+    feature = "bench-support"
+))]
+#[expect(missing_docs)]
+pub mod queue;
 mod scene;
-mod shared_string;
 mod shared_uri;
+mod spring;
 mod style;
 mod styled;
 mod subscription;
@@ -46,6 +61,14 @@ mod text_system;
 mod util;
 mod view;
 mod window;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use proptest;
+
+#[cfg(doc)]
+pub mod _accessibility;
+#[cfg(doc)]
+pub mod _ownership_and_data_flow;
 
 /// Do not touch, here be dragons for use by gpui_macros and such.
 #[doc(hidden)]
@@ -63,6 +86,9 @@ mod seal {
     pub trait Sealed {}
 }
 
+pub use accesskit;
+pub use accesskit::Action as AccessibleAction;
+pub use accesskit::{Orientation, Role, Toggled};
 pub use action::*;
 pub use anyhow::Result;
 pub use app::*;
@@ -71,12 +97,65 @@ pub use asset_cache::*;
 pub use assets::*;
 pub use color::*;
 pub use ctor::ctor;
+#[cfg(feature = "profiler")]
+pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
 pub use geometry::*;
+pub use gestures::*;
 pub use global::*;
-pub use gpui_macros::{AppContext, IntoElement, Render, VisualContext, register_action, test};
+pub use gpui_macros::{
+    AppContext, IntoElement, Render, VisualContext, bench, property_test, register_action, test,
+};
+pub use spring::*;
+
+/// Defines a Criterion benchmark group for benchmarks annotated with [`gpui::bench`].
+///
+/// This mirrors `criterion::criterion_group!`, but the group measures with the
+/// `gpui::BenchMeasurement` configured by `BENCH_MEASUREMENT` (see
+/// `BenchMeasurement::from_env`). By default Criterion analyzes wall time
+/// while retired instructions, cycles, IPC, context switches, and the other
+/// counters this machine supports are printed per iteration in the GPUI bench
+/// report. `BENCH_MEASUREMENT=instructions` makes Criterion analyze
+/// process-wide instructions instead, `foreground-instructions` the benchmark
+/// thread's alone, and `wall-time` disables all counters. A
+/// `config = ...` expression may set any other Criterion option; its
+/// measurement is replaced. To measure with something else, call
+/// `criterion::criterion_group!` directly with
+/// `config = criterion::Criterion::default().with_measurement(gpui::BenchMeasurement::new(...))`.
+///
+/// [`gpui::bench`]: crate::bench
+#[macro_export]
+macro_rules! bench_group {
+    (name = $name:ident; config = $config:expr; targets = $($target:path),+ $(,)?) => {
+        criterion::criterion_group! {
+            name = $name;
+            config = ($config).with_measurement($crate::BenchMeasurement::from_env_or_exit());
+            targets = $($target),+
+        }
+    };
+    ($name:ident, $($target:path),+ $(,)?) => {
+        $crate::bench_group! {
+            name = $name;
+            config = criterion::Criterion::default();
+            targets = $($target),+
+        }
+    };
+}
+
+/// Defines the entry point for GPUI Criterion benchmark groups.
+///
+/// This mirrors `criterion::criterion_main!` so GPUI benchmark files can keep the
+/// same shape as ordinary Criterion benchmarks.
+#[macro_export]
+macro_rules! bench_main {
+    ($($tokens:tt)*) => {
+        criterion::criterion_main!($($tokens)*);
+    };
+}
+pub use gpui_shared_string::*;
+pub use gpui_util::arc_cow::ArcCow;
 pub use http_client;
 pub use input::*;
 pub use inspector::*;
@@ -86,46 +165,42 @@ pub use keymap::*;
 pub use path_builder::*;
 pub use platform::*;
 pub use profiler::*;
+#[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
+pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 pub use scene::*;
-pub use shared_string::*;
 pub use shared_uri::*;
-pub use smol::Timer;
+use std::{any::Any, future::Future};
 pub use style::*;
 pub use styled::*;
 pub use subscription::*;
 pub use svg_renderer::*;
 pub(crate) use tab_stop::*;
+use taffy::TaffyLayoutEngine;
 pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;
-#[cfg(any(test, feature = "test-support"))]
-pub use util::smol_timeout;
-pub use util::{FutureExt, Timeout, arc_cow::ArcCow};
+pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use window::*;
 
-use std::{any::Any, future::Future};
-use taffy::TaffyLayoutEngine;
+#[cfg(not(target_family = "wasm"))]
+pub use pollster::block_on;
 
 /// The context trait, allows the different contexts in GPUI to be used
 /// interchangeably for certain operations.
 pub trait AppContext {
-    /// The result type for this context, used for async contexts that
-    /// can't hold a direct reference to the application context.
-    type Result<T>;
-
     /// Create a new entity in the app context.
     #[expect(
         clippy::wrong_self_convention,
         reason = "`App::new` is an ubiquitous function for creating entities"
     )]
-    fn new<T: 'static>(&mut self, build_entity: impl FnOnce(&mut Context<T>) -> T) -> Self::Result<Entity<T>>;
+    fn new<T: 'static>(&mut self, build_entity: impl FnOnce(&mut Context<T>) -> T) -> Entity<T>;
 
     /// Reserve a slot for a entity to be inserted later.
     /// The returned [Reservation] allows you to obtain the [EntityId] for the future entity.
-    fn reserve_entity<T: 'static>(&mut self) -> Self::Result<Reservation<T>>;
+    fn reserve_entity<T: 'static>(&mut self) -> Reservation<T>;
 
     /// Insert a new entity in the app context based on a [Reservation] previously obtained from [`reserve_entity`].
     ///
@@ -134,24 +209,24 @@ pub trait AppContext {
         &mut self,
         reservation: Reservation<T>,
         build_entity: impl FnOnce(&mut Context<T>) -> T,
-    ) -> Self::Result<Entity<T>>;
+    ) -> Entity<T>;
 
     /// Update a entity in the app context.
     fn update_entity<T, R>(
         &mut self,
         handle: &Entity<T>,
         update: impl FnOnce(&mut T, &mut Context<T>) -> R,
-    ) -> Self::Result<R>
+    ) -> R
     where
         T: 'static;
 
     /// Update a entity in the app context.
-    fn as_mut<'a, T>(&'a mut self, handle: &Entity<T>) -> Self::Result<GpuiBorrow<'a, T>>
+    fn as_mut<'a, T>(&'a mut self, handle: &Entity<T>) -> GpuiBorrow<'a, T>
     where
         T: 'static;
 
     /// Read a entity from the app context.
-    fn read_entity<T, R>(&self, handle: &Entity<T>, read: impl FnOnce(&T, &App) -> R) -> Self::Result<R>
+    fn read_entity<T, R>(&self, handle: &Entity<T>, read: impl FnOnce(&T, &App) -> R) -> R
     where
         T: 'static;
 
@@ -160,8 +235,22 @@ pub trait AppContext {
     where
         F: FnOnce(AnyView, &mut Window, &mut App) -> T;
 
+    /// Run `f` against the entity's *current* window — the most recently
+    /// rendered window that referenced the entity. Returns `None` if the
+    /// entity has no current window or that window is unavailable. See
+    /// [`App::with_window`] for the underlying lookup.
+    fn with_window<R>(
+        &mut self,
+        entity_id: EntityId,
+        f: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> Option<R>;
+
     /// Read a window off of the application context.
-    fn read_window<T, R>(&self, window: &WindowHandle<T>, read: impl FnOnce(Entity<T>, &App) -> R) -> Result<R>
+    fn read_window<T, R>(
+        &self,
+        window: &WindowHandle<T>,
+        read: impl FnOnce(Entity<T>, &App) -> R,
+    ) -> Result<R>
     where
         T: 'static;
 
@@ -171,7 +260,7 @@ pub trait AppContext {
         R: Send + 'static;
 
     /// Read a global from this app context
-    fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> Self::Result<R>
+    fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> R
     where
         G: Global;
 }
@@ -190,6 +279,9 @@ impl<T: 'static> Reservation<T> {
 /// This trait is used for the different visual contexts in GPUI that
 /// require a window to be present.
 pub trait VisualContext: AppContext {
+    /// The result type for window operations.
+    type Result<T>;
+
     /// Returns the handle of the window associated with this context.
     fn window_handle(&self) -> AnyWindowHandle;
 
@@ -264,24 +356,6 @@ where
     {
         self.borrow_mut().default_global::<G>();
         self.update_global(f)
-    }
-}
-
-/// A flatten equivalent for anyhow `Result`s.
-pub trait Flatten<T> {
-    /// Convert this type into a simple `Result<T>`.
-    fn flatten(self) -> Result<T>;
-}
-
-impl<T> Flatten<T> for Result<Result<T>> {
-    fn flatten(self) -> Result<T> {
-        self?
-    }
-}
-
-impl<T> Flatten<T> for Result<T> {
-    fn flatten(self) -> Result<T> {
-        self
     }
 }
 

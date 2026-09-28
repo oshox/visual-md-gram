@@ -43,25 +43,19 @@ macro_rules! set_eq {
 #[macro_export]
 macro_rules! assert_set_eq {
     ($left:expr,$right:expr) => {{
-        use util::set_eq;
         use util::test::*;
+        use util::set_eq;
 
         let left = $left;
         let right = $right;
 
         match set_eq!(&left, &right) {
             Err(SetEqError::LeftMissing(missing)) => {
-                panic!(
-                    "assertion failed: `(left == right)`\n left: {:?}\nright: {:?}\nleft does not contain {:?}",
-                    &left, &right, &missing
-                );
-            }
+                panic!("assertion failed: `(left == right)`\n left: {:?}\nright: {:?}\nleft does not contain {:?}", &left, &right, &missing);
+            },
             Err(SetEqError::RightMissing(missing)) => {
-                panic!(
-                    "assertion failed: `(left == right)`\n left: {:?}\nright: {:?}\nright does not contain {:?}",
-                    &left, &right, &missing
-                );
-            }
+                panic!("assertion failed: `(left == right)`\n left: {:?}\nright: {:?}\nright does not contain {:?}", &left, &right, &missing);
+            },
             _ => {}
         }
     }};

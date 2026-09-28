@@ -2,13 +2,13 @@ use crate::wasm_host::WasmState;
 use anyhow::Result;
 use extension::{KeyValueStoreDelegate, ProjectDelegate, WorktreeDelegate};
 use gpui::BackgroundExecutor;
-use semver::Version as SemanticVersion;
+use semver::Version;
 use std::sync::{Arc, OnceLock};
 use wasmtime::component::{Linker, Resource};
 
-use super::latest;
+use super::{latest, since_v0_6_0};
 
-pub const MIN_VERSION: SemanticVersion = SemanticVersion::new(0, 5, 0);
+pub const MIN_VERSION: Version = Version::new(0, 5, 0);
 
 wasmtime::component::bindgen!({
     imports: {
@@ -23,12 +23,14 @@ wasmtime::component::bindgen!({
         "project": ExtensionProject,
         "key-value-store": ExtensionKeyValueStore,
         "zed:extension/common": latest::zed::extension::common,
-        "zed:extension/github": latest::zed::extension::github,
+        "zed:extension/github": since_v0_6_0::zed::extension::github,
         "zed:extension/http-client": latest::zed::extension::http_client,
-        "zed:extension/lsp": latest::zed::extension::lsp,
+        "zed:extension/lsp": since_v0_6_0::zed::extension::lsp,
         "zed:extension/nodejs": latest::zed::extension::nodejs,
-        "zed:extension/platform": latest::zed::extension::platform,
+        "zed:extension/platform": since_v0_6_0::zed::extension::platform,
         "zed:extension/process": latest::zed::extension::process,
+        "zed:extension/slash-command": latest::zed::extension::slash_command,
+        "zed:extension/context-server": latest::zed::extension::context_server,
     },
 });
 
@@ -119,18 +121,21 @@ impl HostKeyValueStore for WasmState {
         latest::HostKeyValueStore::insert(self, kv_store, key, value).await
     }
 
-    async fn drop(&mut self, _worktree: Resource<ExtensionKeyValueStore>) -> Result<()> {
+    async fn drop(&mut self, _worktree: Resource<ExtensionKeyValueStore>) -> wasmtime::Result<()> {
         // We only ever hand out borrows of key-value stores.
         Ok(())
     }
 }
 
 impl HostProject for WasmState {
-    async fn worktree_ids(&mut self, project: Resource<ExtensionProject>) -> wasmtime::Result<Vec<u64>> {
+    async fn worktree_ids(
+        &mut self,
+        project: Resource<ExtensionProject>,
+    ) -> wasmtime::Result<Vec<u64>> {
         latest::HostProject::worktree_ids(self, project).await
     }
 
-    async fn drop(&mut self, _project: Resource<Project>) -> Result<()> {
+    async fn drop(&mut self, _project: Resource<Project>) -> wasmtime::Result<()> {
         // We only ever hand out borrows of projects.
         Ok(())
     }
@@ -141,7 +146,10 @@ impl HostWorktree for WasmState {
         latest::HostWorktree::id(self, delegate).await
     }
 
-    async fn root_path(&mut self, delegate: Resource<Arc<dyn WorktreeDelegate>>) -> wasmtime::Result<String> {
+    async fn root_path(
+        &mut self,
+        delegate: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> wasmtime::Result<String> {
         latest::HostWorktree::root_path(self, delegate).await
     }
 
@@ -153,7 +161,10 @@ impl HostWorktree for WasmState {
         latest::HostWorktree::read_text_file(self, delegate, path).await
     }
 
-    async fn shell_env(&mut self, delegate: Resource<Arc<dyn WorktreeDelegate>>) -> wasmtime::Result<EnvVars> {
+    async fn shell_env(
+        &mut self,
+        delegate: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> wasmtime::Result<EnvVars> {
         latest::HostWorktree::shell_env(self, delegate).await
     }
 
@@ -165,7 +176,7 @@ impl HostWorktree for WasmState {
         latest::HostWorktree::which(self, delegate, binary_name).await
     }
 
-    async fn drop(&mut self, _worktree: Resource<Worktree>) -> Result<()> {
+    async fn drop(&mut self, _worktree: Resource<Worktree>) -> wasmtime::Result<()> {
         // We only ever hand out borrows of worktrees.
         Ok(())
     }
@@ -178,7 +189,13 @@ impl ExtensionImports for WasmState {
         category: String,
         key: Option<String>,
     ) -> wasmtime::Result<Result<String, String>> {
-        latest::ExtensionImports::get_settings(self, location.map(|location| location.into()), category, key).await
+        latest::ExtensionImports::get_settings(
+            self,
+            location.map(|location| location.into()),
+            category,
+            key,
+        )
+        .await
     }
 
     async fn set_language_server_installation_status(
@@ -186,7 +203,12 @@ impl ExtensionImports for WasmState {
         server_name: String,
         status: LanguageServerInstallationStatus,
     ) -> wasmtime::Result<()> {
-        latest::ExtensionImports::set_language_server_installation_status(self, server_name, status.into()).await
+        latest::ExtensionImports::set_language_server_installation_status(
+            self,
+            server_name,
+            status.into(),
+        )
+        .await
     }
 
     async fn download_file(

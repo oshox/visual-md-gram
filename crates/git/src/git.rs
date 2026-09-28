@@ -13,19 +13,28 @@ use gpui::{Action, actions};
 pub use repository::RemoteCommandOutput;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::fmt::Write;
+use std::fmt::{self, Write as _};
 use std::str::FromStr;
-
-#[cfg(any(test, feature = "test-support"))]
-use rand::RngExt as _;
 
 pub const DOT_GIT: &str = ".git";
 pub const GITIGNORE: &str = ".gitignore";
 pub const FSMONITOR_DAEMON: &str = "fsmonitor--daemon";
 pub const LFS_DIR: &str = "lfs";
+pub const OBJECTS_DIR: &str = "objects";
+pub const REFS_DIR: &str = "refs";
+pub const REFTABLE_DIR: &str = "reftable";
+pub const HOOKS_DIR: &str = "hooks";
+pub const LOGS_DIR: &str = "logs";
+pub const LOGS_REF_STASH: &str = "logs/refs/stash";
+pub const REBASE_MERGE_DIR: &str = "rebase-merge";
+pub const REBASE_APPLY_DIR: &str = "rebase-apply";
+pub const SEQUENCER_DIR: &str = "sequencer";
 pub const COMMIT_MESSAGE: &str = "COMMIT_EDITMSG";
-pub const INDEX_LOCK: &str = "index.lock";
+pub const FETCH_HEAD: &str = "FETCH_HEAD";
+pub const ORIG_HEAD: &str = "ORIG_HEAD";
+pub const BISECT_LOG: &str = "BISECT_LOG";
+pub const GC_PID: &str = "gc.pid";
+pub const INFO_DIR: &str = "info";
 pub const REPO_EXCLUDE: &str = "info/exclude";
 
 actions!(
@@ -43,16 +52,30 @@ actions!(
         /// Restores the selected hunks to their original state.
         #[action(deprecated_aliases = ["editor::RevertSelectedHunks"])]
         Restore,
+        /// Restores the selected hunks to their original state and moves to the
+        /// next one.
+        RestoreAndNext,
         // per-file
         /// Shows git blame information for the current file.
         #[action(deprecated_aliases = ["editor::ToggleGitBlame"])]
         Blame,
-        /// Shows the git history for the current file.
+        /// Shows the git history for the selected file, folder, or project.
         FileHistory,
+        /// Opens a permalink for the selected file on its Git hosting provider.
+        OpenFilePermalink,
+        /// Copies a permalink for the selected file on its Git hosting provider.
+        CopyFilePermalink,
+        /// Opens the selected file in the editor without a diff view.
+        ViewFile,
         /// Stages the current file.
         StageFile,
         /// Unstages the current file.
         UnstageFile,
+        // per-section
+        /// Stages every entry in the section containing the selected entry.
+        StageSection,
+        /// Unstages every entry in the section containing the selected entry.
+        UnstageSection,
         // repo-wide
         /// Stages all changes in the repository.
         StageAll,
@@ -60,6 +83,10 @@ actions!(
         UnstageAll,
         /// Stashes all changes in the repository, including untracked files.
         StashAll,
+        /// Stashes tracked changes in the repository, leaving untracked files in place.
+        StashTracked,
+        /// Stashes staged changes in the repository, leaving unstaged changes in place.
+        StashStaged,
         /// Pops the most recent stash.
         StashPop,
         /// Apply the most recent stash.
@@ -86,6 +113,8 @@ actions!(
         FetchFrom,
         /// Creates a new commit with staged changes.
         Commit,
+        /// Runs the next commit with `git commit --no-verify`.
+        SkipHooks,
         /// Amends the last commit with staged changes.
         Amend,
         /// Enable the --signoff option.
@@ -94,16 +123,26 @@ actions!(
         Cancel,
         /// Expands the commit message editor.
         ExpandCommitEditor,
-        /// Toggles whether the commit message editor fills all the available vertical space within the git panel
+        /// Toggles whether the commit message editor fills all the available
+        /// vertical space within the git panel.
         ToggleFillCommitEditor,
+        /// Generates a commit message using AI.
+        GenerateCommitMessage,
         /// Initializes a new git repository.
         Init,
         /// Opens all modified files in the editor.
         OpenModifiedFiles,
+        /// Opens the current file in a solo diff view.
+        OpenFileDiff,
         /// Clones a repository.
         Clone,
+        ViewCommit,
         /// Adds a file to .gitignore.
         AddToGitignore,
+        /// Adds a file to the repository's .git/info/exclude.
+        AddToGitInfoExclude,
+        /// Copies the current branch name to the clipboard.
+        CopyBranchName,
     ]
 );
 
@@ -130,6 +169,7 @@ pub struct RestoreFile {
 
 /// The length of a Git short SHA.
 pub const SHORT_SHA_LENGTH: usize = 7;
+
 const SHA1_BYTE_LENGTH: usize = 20;
 const SHA256_BYTE_LENGTH: usize = 32;
 const SHA1_HEX_LENGTH: usize = SHA1_BYTE_LENGTH * 2;
@@ -175,6 +215,7 @@ impl Oid {
                 );
             }
         };
+
         let mut oid_bytes = [0u8; SHA256_BYTE_LENGTH];
         oid_bytes[..bytes.len()].copy_from_slice(bytes);
         Ok(Self {
@@ -197,7 +238,7 @@ impl Oid {
         &self.bytes[..self.format.byte_len()]
     }
 
-    pub(crate) fn is_zero(&self) -> bool {
+    pub fn is_zero(&self) -> bool {
         self.as_bytes().iter().all(|byte| *byte == 0)
     }
 
@@ -225,7 +266,11 @@ impl Oid {
     fn hex_digit(&self, index: usize) -> char {
         debug_assert!(index < self.format.hex_len());
         let byte = self.as_bytes()[index / 2];
-        let nibble = if index & 1 == 0 { byte >> 4 } else { byte & 0x0f };
+        let nibble = if index & 1 == 0 {
+            byte >> 4
+        } else {
+            byte & 0x0f
+        };
         char::from(HEX_DIGITS[nibble as usize])
     }
 }
@@ -275,6 +320,7 @@ fn decode_hex_digit(byte: u8) -> Option<u8> {
         _ => None,
     }
 }
+
 impl fmt::Debug for Oid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
@@ -306,15 +352,6 @@ impl<'de> Deserialize<'de> for Oid {
     }
 }
 
-impl Default for Oid {
-    fn default() -> Self {
-        Self {
-            bytes: [0u8; SHA256_BYTE_LENGTH],
-            format: OidFormat::Sha1,
-        }
-    }
-}
-
 impl From<Oid> for u32 {
     fn from(oid: Oid) -> Self {
         let mut u32_bytes = [0u8; 4];
@@ -328,31 +365,6 @@ impl From<Oid> for usize {
         let mut u64_bytes = [0u8; 8];
         u64_bytes.copy_from_slice(&oid.as_bytes()[..8]);
         u64::from_ne_bytes(u64_bytes) as usize
-    }
-}
-
-#[repr(i32)]
-#[derive(Copy, Clone, Debug)]
-pub enum RunHook {
-    PreCommit,
-}
-
-impl RunHook {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::PreCommit => "pre-commit",
-        }
-    }
-
-    pub fn to_proto(&self) -> i32 {
-        *self as i32
-    }
-
-    pub fn from_proto(value: i32) -> Option<Self> {
-        match value {
-            0 => Some(Self::PreCommit),
-            _ => None,
-        }
     }
 }
 
@@ -383,5 +395,30 @@ mod tests {
         assert!("".parse::<Oid>().is_err());
         assert!("a".repeat(SHA1_HEX_LENGTH + 1).parse::<Oid>().is_err());
         assert!("a".repeat(SHA256_HEX_LENGTH - 1).parse::<Oid>().is_err());
+    }
+}
+
+#[repr(i32)]
+#[derive(Copy, Clone, Debug)]
+pub enum RunHook {
+    PreCommit,
+}
+
+impl RunHook {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::PreCommit => "pre-commit",
+        }
+    }
+
+    pub fn to_proto(&self) -> i32 {
+        *self as i32
+    }
+
+    pub fn from_proto(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::PreCommit),
+            _ => None,
+        }
     }
 }

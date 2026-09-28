@@ -1,13 +1,13 @@
 //! Implements `#[derive_inspector_reflection]` macro to provide runtime access to trait methods
 //! that have the shape `fn method(self) -> Self`. This code was generated using Zed Agent with Claude Opus 4.
 
-use convert_case::{Case, Casing};
+use heck::ToSnakeCase as _;
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{
-    Attribute, Expr, FnArg, Ident, Item, ItemTrait, Lit, Meta, Path, ReturnType, TraitItem, Type, parse_macro_input,
-    parse_quote,
+    Attribute, Expr, FnArg, Ident, Item, ItemTrait, Lit, Meta, Path, ReturnType, TraitItem, Type,
+    parse_macro_input, parse_quote,
     visit_mut::{self, VisitMut},
 };
 
@@ -87,14 +87,17 @@ fn generate_reflected_trait(trait_item: ItemTrait) -> TokenStream {
 
     // Generate the reflection module name
     let reflection_mod_name = Ident::new(
-        &format!("{}_reflection", trait_name.to_string().to_case(Case::Snake)),
+        &format!("{}_reflection", trait_name.to_string().to_snake_case()),
         trait_name.span(),
     );
 
     // Generate wrapper functions for each method
     // These wrappers use type erasure to allow runtime invocation
     let wrapper_functions = method_infos.iter().map(|(method_name, _doc, cfg_attrs)| {
-        let wrapper_name = Ident::new(&format!("__wrapper_{}", method_name), method_name.span());
+        let wrapper_name = Ident::new(
+            &format!("__wrapper_{}", method_name),
+            method_name.span(),
+        );
         quote! {
             #(#cfg_attrs)*
             fn #wrapper_name<T: #trait_name + 'static>(value: Box<dyn std::any::Any>) -> Box<dyn std::any::Any> {

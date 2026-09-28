@@ -34,7 +34,12 @@ impl Connection {
     /// Note: Unlike everything else in SQLez, migrations are run eagerly, without first
     /// preparing the SQL statements. This makes it possible to do multi-statement schema
     /// updates in a single string without running into prepare errors.
-    pub fn migrate(&self, domain: &'static str, migrations: &[&'static str]) -> Result<()> {
+    pub fn migrate(
+        &self,
+        domain: &'static str,
+        migrations: &[&'static str],
+        should_allow_migration_change: &mut dyn FnMut(usize, &str, &str) -> bool,
+    ) -> Result<()> {
         self.with_savepoint("migrating", || {
             // Setup the migrations table unconditionally
             self.exec(indoc! {"
@@ -44,36 +49,48 @@ impl Connection {
                     migration TEXT
                 )"})?()?;
 
-            let completed_migrations = self.select_bound::<&str, (String, usize, String)>(indoc! {"
+            let completed_migrations =
+                self.select_bound::<&str, (String, usize, String)>(indoc! {"
                     SELECT domain, step, migration FROM migrations
                     WHERE domain = ?
                     ORDER BY step
                     "})?(domain)?;
 
-            let mut store_completed_migration =
-                self.exec_bound("INSERT INTO migrations (domain, step, migration) VALUES (?, ?, ?)")?;
+            let mut store_completed_migration = self
+                .exec_bound("INSERT INTO migrations (domain, step, migration) VALUES (?, ?, ?)")?;
 
             let mut did_migrate = false;
             for (index, migration) in migrations.iter().enumerate() {
-                let migration_cmp: String = migration.split_whitespace().collect();
+                let migration =
+                    sqlformat::format(migration, &sqlformat::QueryParams::None, Default::default());
                 if let Some((_, _, completed_migration)) = completed_migrations.get(index) {
-                    let completed_cmp: String = completed_migration.split_whitespace().collect();
-                    if completed_cmp == migration_cmp {
+                    // Reformat completed migrations with the current `sqlformat` version, so that past migrations stored
+                    // conform to the new formatting rules.
+                    let completed_migration = sqlformat::format(
+                        completed_migration,
+                        &sqlformat::QueryParams::None,
+                        Default::default(),
+                    );
+                    if completed_migration == migration {
+                        // Migration already run. Continue
                         continue;
+                    } else if should_allow_migration_change(index, &completed_migration, &migration)
+                    {
+                        continue;
+                    } else {
+                        anyhow::bail!(formatdoc! {"
+                            Migration changed for {domain} at step {index}
+
+                            Stored migration:
+                            {completed_migration}
+
+                            Proposed migration:
+                            {migration}"});
                     }
-                    anyhow::bail!(formatdoc! {"
-                        Migration changed for {domain} at step {index}
-
-                        Stored migration:
-                        {completed_migration}
-
-                        Proposed migration:
-                        {migration}"});
                 }
 
-                self.eager_exec(migration)?;
+                self.eager_exec(&migration)?;
                 did_migrate = true;
-                let migration = sqlformat::format(migration, &sqlformat::QueryParams::None, Default::default());
                 store_completed_migration((domain, index, migration))?;
             }
 
@@ -107,7 +124,10 @@ impl Connection {
         )?()?;
 
         if !foreign_key_info.is_empty() {
-            log::info!("Found {} foreign key relationships to check", foreign_key_info.len());
+            log::info!(
+                "Found {} foreign key relationships to check",
+                foreign_key_info.len()
+            );
         }
 
         for (child_table, child_key, parent_table, parent_key) in foreign_key_info {
@@ -143,6 +163,7 @@ mod test {
                     a TEXT,
                     b TEXT
                 )"}],
+                &mut disallow_migration_change,
             )
             .unwrap();
 
@@ -171,6 +192,7 @@ mod test {
                         d TEXT
                     )"},
                 ],
+                &mut disallow_migration_change,
             )
             .unwrap();
 
@@ -240,14 +262,26 @@ mod test {
         .unwrap();
 
         assert_eq!(
-            connection.select_row::<usize>("SELECT * FROM test_table").unwrap()().unwrap(),
+            connection
+                .select_row::<usize>("SELECT * FROM test_table")
+                .unwrap()()
+            .unwrap(),
             Some(1)
         );
 
         // Run the migration verifying that the row got dropped
-        connection.migrate("test", &["DELETE FROM test_table"]).unwrap();
+        connection
+            .migrate(
+                "test",
+                &["DELETE FROM test_table"],
+                &mut disallow_migration_change,
+            )
+            .unwrap();
         assert_eq!(
-            connection.select_row::<usize>("SELECT * FROM test_table").unwrap()().unwrap(),
+            connection
+                .select_row::<usize>("SELECT * FROM test_table")
+                .unwrap()()
+            .unwrap(),
             None
         );
 
@@ -258,9 +292,18 @@ mod test {
         .unwrap();
 
         // Run the same migration again and verify that the table was left unchanged
-        connection.migrate("test", &["DELETE FROM test_table"]).unwrap();
+        connection
+            .migrate(
+                "test",
+                &["DELETE FROM test_table"],
+                &mut disallow_migration_change,
+            )
+            .unwrap();
         assert_eq!(
-            connection.select_row::<usize>("SELECT * FROM test_table").unwrap()().unwrap(),
+            connection
+                .select_row::<usize>("SELECT * FROM test_table")
+                .unwrap()()
+            .unwrap(),
             Some(2)
         );
     }
@@ -273,9 +316,15 @@ mod test {
         connection
             .migrate(
                 "test migration",
-                &["CREATE TABLE test (col INTEGER)", "INSERT INTO test (col) VALUES (1)"],
+                &[
+                    "CREATE TABLE test (col INTEGER)",
+                    "INSERT INTO test (col) VALUES (1)",
+                ],
+                &mut disallow_migration_change,
             )
             .unwrap();
+
+        let mut migration_changed = false;
 
         // Create another migration with the same domain but different steps
         let second_migration_result = connection.migrate(
@@ -284,9 +333,58 @@ mod test {
                 "CREATE TABLE test (color INTEGER )",
                 "INSERT INTO test (color) VALUES (1)",
             ],
+            &mut |_, old, new| {
+                assert_eq!(old, "CREATE TABLE test (col INTEGER)");
+                assert_eq!(new, "CREATE TABLE test (color INTEGER)");
+                migration_changed = true;
+                false
+            },
         );
 
         // Verify new migration returns error when run
         assert!(second_migration_result.is_err())
+    }
+
+    #[test]
+    fn test_create_alter_drop() {
+        let connection = Connection::open_memory(Some("test_create_alter_drop"));
+
+        connection
+            .migrate(
+                "first_migration",
+                &["CREATE TABLE table1(a TEXT) STRICT;"],
+                &mut disallow_migration_change,
+            )
+            .unwrap();
+
+        connection
+            .exec("INSERT INTO table1(a) VALUES (\"test text\");")
+            .unwrap()()
+        .unwrap();
+
+        connection
+            .migrate(
+                "second_migration",
+                &[indoc! {"
+                    CREATE TABLE table2(b TEXT) STRICT;
+
+                    INSERT INTO table2 (b)
+                    SELECT a FROM table1;
+
+                    DROP TABLE table1;
+
+                    ALTER TABLE table2 RENAME TO table1;
+                "}],
+                &mut disallow_migration_change,
+            )
+            .unwrap();
+
+        let res = &connection.select::<String>("SELECT b FROM table1").unwrap()().unwrap()[0];
+
+        assert_eq!(res, "test text");
+    }
+
+    fn disallow_migration_change(_: usize, _: &str, _: &str) -> bool {
+        false
     }
 }

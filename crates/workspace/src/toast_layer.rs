@@ -3,9 +3,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use app_actions::toast;
-use gpui::{AnyView, DismissEvent, Entity, EntityId, FocusHandle, ManagedView, Subscription, Task};
+use gpui::{
+    AnyView, DismissEvent, Entity, EntityId, FocusHandle, ManagedView, MouseButton, Subscription,
+    Task,
+};
 use ui::{animation::DefaultAnimations, prelude::*};
+use zed_actions::toast;
 
 use crate::Workspace;
 
@@ -41,6 +44,10 @@ pub fn init(cx: &mut App) {
 
 pub trait ToastView: ManagedView {
     fn action(&self) -> Option<ToastAction>;
+
+    fn auto_dismiss(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -51,10 +58,17 @@ pub struct ToastAction {
 }
 
 impl ToastAction {
-    pub fn new(label: SharedString, on_click: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>) -> Self {
+    pub fn new(
+        label: SharedString,
+        on_click: Option<Rc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    ) -> Self {
         let id = ElementId::Name(label.clone());
 
-        Self { id, label, on_click }
+        Self {
+            id,
+            label,
+            on_click,
+        }
     }
 }
 
@@ -121,6 +135,7 @@ impl ToastLayer {
         V: ToastView,
     {
         let action = new_toast.read(cx).action();
+        let auto_dismiss = new_toast.read(cx).auto_dismiss();
         let focus_handle = cx.focus_handle();
 
         self.active_toast = Some(ActiveToast {
@@ -133,7 +148,9 @@ impl ToastLayer {
             focus_handle,
         });
 
-        self.start_dismiss_timer(DEFAULT_TOAST_DURATION, cx);
+        if auto_dismiss {
+            self.start_dismiss_timer(DEFAULT_TOAST_DURATION, cx);
+        }
 
         cx.notify();
     }
@@ -162,7 +179,8 @@ impl ToastLayer {
         let Some(duration_remaining) = self.duration_remaining.as_mut() else {
             return;
         };
-        *duration_remaining = duration_remaining.saturating_sub(dismiss_timer.instant_started.elapsed());
+        *duration_remaining =
+            duration_remaining.saturating_sub(dismiss_timer.instant_started.elapsed());
         if *duration_remaining < MINIMUM_RESUME_DURATION {
             *duration_remaining = MINIMUM_RESUME_DURATION;
         }
@@ -177,7 +195,7 @@ impl ToastLayer {
             cx.background_executor().timer(duration).await;
 
             if let Some(this) = this.upgrade() {
-                this.update(cx, |this, cx| this.hide_toast(cx)).ok();
+                this.update(cx, |this, cx| this.hide_toast(cx));
             }
         });
 
@@ -236,6 +254,12 @@ impl Render for ToastLayer {
                         .on_click(|_, _, cx| {
                             cx.stop_propagation();
                         })
+                        .on_mouse_down(
+                            MouseButton::Middle,
+                            cx.listener(|this, _, _, cx| {
+                                this.hide_toast(cx);
+                            }),
+                        )
                         .child(active_toast.toast.view()),
                 )
                 .animate_in(AnimationDirection::FromBottom, true),

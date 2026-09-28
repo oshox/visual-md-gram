@@ -107,13 +107,17 @@ impl ErrorExt for anyhow::Error {
             rpc_error.to_proto()
         } else {
             ErrorCode::Internal
-                .message(format!("{self:#}").lines().fold(String::new(), |mut message, line| {
-                    if !message.is_empty() {
-                        message.push(' ');
-                    }
-                    message.push_str(line);
-                    message
-                }))
+                .message(
+                    format!("{self:#}")
+                        .lines()
+                        .fold(String::new(), |mut message, line| {
+                            if !message.is_empty() {
+                                message.push(' ');
+                            }
+                            message.push_str(line);
+                            message
+                        }),
+                )
                 .to_proto()
         }
     }
@@ -155,6 +159,12 @@ pub struct RpcError {
 /// in the app; however it is useful for chaining .message() and .with_tag() on
 /// ErrorCode.
 impl RpcError {
+    /// Returns the raw server-provided error message without any RPC framing
+    /// (e.g. without the "RPC request X failed: " prefix that `Display` adds).
+    pub fn raw_message(&self) -> &str {
+        &self.msg
+    }
+
     /// from_proto converts a crate::Error into an anyhow::Error containing
     /// an RpcError.
     pub fn from_proto(error: &crate::Error, request: &str) -> anyhow::Error {

@@ -89,51 +89,6 @@ impl StringMatch {
             .get(ix..)
             .and_then(|slice| slice.chars().next().map(|char| char.len_utf8()))
     }
-
-    /// Split match into two halves (if sep is found)
-    /// searching from the left (sep binds to the left).
-    pub fn split_at_from_start(&self, sep: &str) -> (StringMatch, Option<StringMatch>) {
-        let Some(ix) = self.string.find(sep) else {
-            return (self.clone(), None);
-        };
-        self.split_at(ix + sep.len())
-    }
-
-    /// Split match into two halves (if sep is found)
-    /// searching from the right (sep binds to the left).
-    /// Useful for displaying filename and path separately
-    /// while retaining highlight positions
-    pub fn split_at_from_end(&self, sep: &str) -> (StringMatch, Option<StringMatch>) {
-        let Some(ix) = self.string.rfind(sep) else {
-            return (self.clone(), None);
-        };
-        self.split_at(ix + sep.len())
-    }
-
-    fn split_at(&self, ix: usize) -> (StringMatch, Option<StringMatch>) {
-        let pos_ix = self.positions.iter().copied().position(|pos| pos >= ix).unwrap_or(0);
-        (
-            StringMatch {
-                candidate_id: self.candidate_id,
-                score: self.score,
-                positions: self.positions[..pos_ix].to_vec(),
-                string: self.string[..ix].to_string(),
-            },
-            Some(StringMatch {
-                candidate_id: self.candidate_id,
-                score: self.score,
-                positions: self
-                    .positions
-                    .iter()
-                    .copied()
-                    .skip(pos_ix)
-                    .filter(|x| *x >= ix)
-                    .map(|x| x - ix)
-                    .collect(),
-                string: self.string[ix..].to_string(),
-            }),
-        )
-    }
 }
 
 impl PartialEq for StringMatch {
@@ -207,12 +162,20 @@ where
                 scope.spawn(async move {
                     let segment_start = cmp::min(segment_idx * segment_size, candidates.len());
                     let segment_end = cmp::min(segment_start + segment_size, candidates.len());
-                    let mut matcher = Matcher::new(query, lowercase_query, query_char_bag, smart_case, penalize_length);
+                    let mut matcher = Matcher::new(
+                        query,
+                        lowercase_query,
+                        query_char_bag,
+                        smart_case,
+                        penalize_length,
+                    );
 
                     matcher.match_candidates(
                         &[],
                         &[],
-                        candidates[segment_start..segment_end].iter().map(|c| c.borrow()),
+                        candidates[segment_start..segment_end]
+                            .iter()
+                            .map(|c| c.borrow()),
                         results,
                         cancel_flag,
                         |candidate: &&StringMatchCandidate, score, positions| StringMatch {
@@ -232,28 +195,11 @@ where
     }
 
     let mut results = segment_results.concat();
-    util::truncate_to_bottom_n_sorted_by(&mut results, max_results, &|a, b| b.cmp(a));
+    rank_matches(&mut results, max_results);
     results
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_split_at() {
-        let string_match = StringMatch {
-            candidate_id: 1,
-            score: 0.5,
-            positions: vec![0, 23, 46],
-            string: "c1️⃣2️⃣3️⃣/d4️⃣5️⃣6️⃣/e7️⃣8️⃣9️⃣/f".to_string(),
-        };
-
-        let (left, right) = string_match.split_at_from_start("/");
-        assert_eq!(left.string, "c1️⃣2️⃣3️⃣/");
-        assert_eq!(left.positions, vec![0]);
-        let right = right.unwrap();
-        assert_eq!(right.string, "d4️⃣5️⃣6️⃣/e7️⃣8️⃣9️⃣/f");
-        assert_eq!(right.positions, vec![0, 23]);
-    }
+#[inline(never)]
+fn rank_matches(results: &mut Vec<StringMatch>, max_results: usize) {
+    gpui_util::truncate_to_bottom_n_sorted_by(results, max_results, &|a, b| b.cmp(a));
 }

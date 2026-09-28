@@ -1,24 +1,25 @@
 [package]
 name = "language_selector"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
 
 [lib]
-doctest = false
 path = "src/language_selector.rs"
-test = false
+doctest = false
 
 [dependencies]
 anyhow.workspace = true
 editor.workspace = true
-file_finder.workspace = true
 file_icons.workspace = true
 fuzzy.workspace = true
 gpui.workspace = true
 language.workspace = true
+open_path_prompt.workspace = true
 picker.workspace = true
 project.workspace = true
 settings.workspace = true
@@ -28,6 +29,4 @@ workspace.workspace = true
 
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }
-
-[lints]
-workspace = true
+serde_json.workspace = true

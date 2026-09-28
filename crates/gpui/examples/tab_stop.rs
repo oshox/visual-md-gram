@@ -1,7 +1,13 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
+#[path = "example_support/fonts.rs"]
+mod example_support;
+
 use gpui::{
-    App, Application, Bounds, Context, Div, ElementId, FocusHandle, KeyBinding, SharedString, Stateful, Window,
+    App, Bounds, Context, Div, ElementId, FocusHandle, KeyBinding, SharedString, Stateful, Window,
     WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
+use gpui_platform::application;
 
 actions!(example, [Tab, TabPrev]);
 
@@ -77,25 +83,34 @@ impl Render for Example {
             .bg(gpui::white())
             .text_color(gpui::black())
             .child(self.message.clone())
-            .children(self.items.clone().into_iter().enumerate().map(|(ix, item_handle)| {
-                div()
-                    .id(("item", ix))
-                    .track_focus(&item_handle)
-                    .h_10()
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .border_1()
-                    .border_color(gpui::black())
-                    .when(item_handle.tab_stop && item_handle.is_focused(window), tab_stop_style)
-                    .map(|this| match item_handle.tab_stop {
-                        true => this
-                            .hover(|this| this.bg(gpui::black().opacity(0.1)))
-                            .child(format!("tab_index: {}", item_handle.tab_index)),
-                        false => this.opacity(0.4).child("tab_stop: false"),
-                    })
-            }))
+            .children(
+                self.items
+                    .clone()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, item_handle)| {
+                        div()
+                            .id(("item", ix))
+                            .track_focus(&item_handle)
+                            .h_10()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .border_1()
+                            .border_color(gpui::black())
+                            .when(
+                                item_handle.tab_stop && item_handle.is_focused(window),
+                                tab_stop_style,
+                            )
+                            .map(|this| match item_handle.tab_stop {
+                                true => this
+                                    .hover(|this| this.bg(gpui::black().opacity(0.1)))
+                                    .child(format!("tab_index: {}", item_handle.tab_index)),
+                                false => this.opacity(0.4).child("tab_stop: false"),
+                            })
+                    }),
+            )
             .child(
                 div()
                     .flex()
@@ -121,11 +136,58 @@ impl Render for Example {
                             })),
                     ),
             )
+            .child(
+                div()
+                    .id("group-1")
+                    .tab_index(6)
+                    .tab_group()
+                    .tab_stop(false)
+                    .child(
+                        button("group-1-button-1")
+                            .tab_index(1)
+                            .child("Tab index [6, 1]"),
+                    )
+                    .child(
+                        button("group-1-button-2")
+                            .tab_index(2)
+                            .child("Tab index [6, 2]"),
+                    )
+                    .child(
+                        button("group-1-button-3")
+                            .tab_index(3)
+                            .child("Tab index [6, 3]"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("group-2")
+                    .tab_index(7)
+                    .tab_group()
+                    .tab_stop(false)
+                    .child(
+                        button("group-2-button-1")
+                            .tab_index(1)
+                            .child("Tab index [7, 1]"),
+                    )
+                    .child(
+                        button("group-2-button-2")
+                            .tab_index(2)
+                            .child("Tab index [7, 2]"),
+                    )
+                    .child(
+                        button("group-2-button-3")
+                            .tab_index(3)
+                            .child("Tab index [7, 3]"),
+                    ),
+            )
     }
 }
 
-fn main() {
-    Application::new().run(|cx: &mut App| {
+fn run_example() {
+    application().run(|cx: &mut App| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         cx.bind_keys([
             KeyBinding::new("tab", Tab, None),
             KeyBinding::new("shift-tab", TabPrev, None),
@@ -141,6 +203,18 @@ fn main() {
         )
         .unwrap();
 
-        cx.activate();
+        cx.activate(true);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

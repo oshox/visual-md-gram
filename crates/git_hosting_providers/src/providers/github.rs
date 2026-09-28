@@ -1,27 +1,93 @@
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
+use futures::AsyncReadExt;
+use gpui::SharedString;
+use http_client::{AsyncBody, HttpClient, HttpRequestExt, Request};
 use regex::Regex;
+use serde::Deserialize;
 use url::Url;
 use urlencoding::encode;
 
 use git::{
-    BuildCommitPermalinkParams, BuildPermalinkParams, GitHostingProvider, ParsedGitRemote, PullRequest, RemoteUrl,
+    BuildCommitPermalinkParams, BuildPermalinkParams, GitHostingProvider, ParsedGitRemote,
+    PullRequest, RemoteUrl,
 };
 
 use crate::get_host_from_git_remote_url;
 
 fn pull_request_number_regex() -> &'static Regex {
-    static PULL_REQUEST_NUMBER_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\(#(\d+)\)$").unwrap());
+    static PULL_REQUEST_NUMBER_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\(#(\d+)\)$").unwrap());
     &PULL_REQUEST_NUMBER_REGEX
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitDetails {
+    #[expect(
+        unused,
+        reason = "This field was found to be unused with serde library bump; it's left as is due to insufficient context on PO's side, but it *may* be fine to remove"
+    )]
+    commit: Commit,
+    author: Option<User>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Commit {
+    #[expect(
+        unused,
+        reason = "This field was found to be unused with serde library bump; it's left as is due to insufficient context on PO's side, but it *may* be fine to remove"
+    )]
+    author: Author,
+}
+
+#[derive(Debug, Deserialize)]
+struct Author {
+    #[expect(
+        unused,
+        reason = "This field was found to be unused with serde library bump; it's left as is due to insufficient context on PO's side, but it *may* be fine to remove"
+    )]
+    email: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct User {
+    #[expect(
+        unused,
+        reason = "This field was found to be unused with serde library bump; it's left as is due to insufficient context on PO's side, but it *may* be fine to remove"
+    )]
+    pub id: u64,
+    pub avatar_url: String,
 }
 
 #[derive(Debug)]
 pub struct Github {
     name: String,
     base_url: Url,
+}
+
+fn normalize_author_email(email: &str) -> &str {
+    email.trim_start_matches('<').trim_end_matches('>')
+}
+
+fn build_cdn_avatar_url(email: &str) -> Result<Url> {
+    let email = normalize_author_email(email);
+    Url::parse(&format!(
+        "https://avatars.githubusercontent.com/u/e?email={}&s=128",
+        encode(email)
+    ))
+    .context("failed to construct avatar URL")
+}
+
+fn build_cdn_avatar_url_for_author_email(email: &str) -> Result<Option<Url>> {
+    let email = normalize_author_email(email);
+    if email.ends_with("[bot]@users.noreply.github.com") {
+        return Ok(None);
+    }
+
+    build_cdn_avatar_url(email).map(Some)
 }
 
 impl Github {
@@ -54,6 +120,49 @@ impl Github {
             Url::parse(&format!("https://{}", host))?,
         ))
     }
+
+    async fn fetch_github_commit_author(
+        &self,
+        repo_owner: &str,
+        repo: &str,
+        commit: &str,
+        client: &Arc<dyn HttpClient>,
+    ) -> Result<Option<User>> {
+        let Some(host) = self.base_url.host_str() else {
+            bail!("failed to get host from github base url");
+        };
+        let url = format!("https://api.{host}/repos/{repo_owner}/{repo}/commits/{commit}");
+
+        let mut request = Request::get(&url)
+            .header("Content-Type", "application/json")
+            .follow_redirects(http_client::RedirectPolicy::FollowAll);
+
+        if let Ok(github_token) = std::env::var("GITHUB_TOKEN") {
+            request = request.header("Authorization", format!("Bearer {}", github_token));
+        }
+
+        let mut response = client
+            .send(request.body(AsyncBody::default())?)
+            .await
+            .with_context(|| format!("error fetching GitHub commit details at {:?}", url))?;
+
+        let mut body = Vec::new();
+        response.body_mut().read_to_end(&mut body).await?;
+
+        if response.status().is_client_error() {
+            let text = String::from_utf8_lossy(body.as_slice());
+            bail!(
+                "status error {}, response: {text:?}",
+                response.status().as_u16()
+            );
+        }
+
+        let body_str = std::str::from_utf8(&body)?;
+
+        serde_json::from_str::<CommitDetails>(body_str)
+            .map(|commit| commit.author)
+            .context("failed to deserialize GitHub commit details")
+    }
 }
 
 #[async_trait]
@@ -64,6 +173,12 @@ impl GitHostingProvider for Github {
 
     fn base_url(&self) -> Url {
         self.base_url.clone()
+    }
+
+    fn supports_avatars(&self) -> bool {
+        // Avatars are not supported for self-hosted GitHub instances
+        // See tracking issue: https://github.com/zed-industries/zed/issues/11043
+        &self.name == "GitHub"
     }
 
     fn format_line_number(&self, line: u32) -> String {
@@ -96,16 +211,26 @@ impl GitHostingProvider for Github {
         })
     }
 
-    fn build_commit_permalink(&self, remote: &ParsedGitRemote, params: BuildCommitPermalinkParams) -> Url {
+    fn build_commit_permalink(
+        &self,
+        remote: &ParsedGitRemote,
+        params: BuildCommitPermalinkParams,
+    ) -> Url {
         let BuildCommitPermalinkParams { sha } = params;
         let ParsedGitRemote { owner, repo } = remote;
 
-        self.base_url().join(&format!("{owner}/{repo}/commit/{sha}")).unwrap()
+        self.base_url()
+            .join(&format!("{owner}/{repo}/commit/{sha}"))
+            .unwrap()
     }
 
     fn build_permalink(&self, remote: ParsedGitRemote, params: BuildPermalinkParams) -> Url {
         let ParsedGitRemote { owner, repo } = remote;
-        let BuildPermalinkParams { sha, path, selection } = params;
+        let BuildPermalinkParams {
+            sha,
+            path,
+            selection,
+        } = params;
 
         let mut permalink = self
             .base_url()
@@ -114,11 +239,19 @@ impl GitHostingProvider for Github {
         if path.ends_with(".md") {
             permalink.set_query(Some("plain=1"));
         }
-        permalink.set_fragment(selection.map(|selection| self.line_fragment(&selection)).as_deref());
+        permalink.set_fragment(
+            selection
+                .map(|selection| self.line_fragment(&selection))
+                .as_deref(),
+        );
         permalink
     }
 
-    fn build_create_pull_request_url(&self, remote: &ParsedGitRemote, source_branch: &str) -> Option<Url> {
+    fn build_create_pull_request_url(
+        &self,
+        remote: &ParsedGitRemote,
+        source_branch: &str,
+    ) -> Option<Url> {
         let ParsedGitRemote { owner, repo } = remote;
         let encoded_source = encode(source_branch);
 
@@ -138,6 +271,33 @@ impl GitHostingProvider for Github {
 
         Some(PullRequest { number, url })
     }
+
+    async fn commit_author_avatar_url(
+        &self,
+        repo_owner: &str,
+        repo: &str,
+        commit: SharedString,
+        author_email: Option<SharedString>,
+        http_client: Arc<dyn HttpClient>,
+    ) -> Result<Option<Url>> {
+        if let Some(email) = author_email
+            && let Some(avatar_url) = build_cdn_avatar_url_for_author_email(&email)?
+        {
+            return Ok(Some(avatar_url));
+        }
+
+        let commit = commit.to_string();
+        let avatar_url = self
+            .fetch_github_commit_author(repo_owner, repo, &commit, &http_client)
+            .await?
+            .map(|author| -> Result<Url, url::ParseError> {
+                let mut url = Url::parse(&author.avatar_url)?;
+                url.set_query(Some("size=128"));
+                Ok(url)
+            })
+            .transpose()?;
+        Ok(avatar_url)
+    }
 }
 
 #[cfg(test)]
@@ -150,46 +310,56 @@ mod tests {
 
     #[test]
     fn test_remote_url_with_root_slash() {
-        let remote_url = "git@github.com:/GramEditor/gram";
-        let parsed_remote = Github::public_instance().parse_remote_url(remote_url).unwrap();
+        let remote_url = "git@github.com:/zed-industries/zed";
+        let parsed_remote = Github::public_instance()
+            .parse_remote_url(remote_url)
+            .unwrap();
 
         assert_eq!(
             parsed_remote,
             ParsedGitRemote {
-                owner: "GramEditor".into(),
-                repo: "gram".into(),
+                owner: "zed-industries".into(),
+                repo: "zed".into(),
             }
         );
     }
 
     #[test]
     fn test_invalid_self_hosted_remote_url() {
-        let remote_url = "git@github.com:GramEditor/gram.git";
+        let remote_url = "git@github.com:zed-industries/zed.git";
         let github = Github::from_remote_url(remote_url);
         assert!(github.is_err());
     }
 
     #[test]
     fn test_from_remote_url_ssh() {
-        let remote_url = "git@github.my-enterprise.com:GramEditor/gram.git";
+        let remote_url = "git@github.my-enterprise.com:zed-industries/zed.git";
         let github = Github::from_remote_url(remote_url).unwrap();
 
+        assert!(!github.supports_avatars());
         assert_eq!(github.name, "GitHub Self-Hosted".to_string());
-        assert_eq!(github.base_url, Url::parse("https://github.my-enterprise.com").unwrap());
+        assert_eq!(
+            github.base_url,
+            Url::parse("https://github.my-enterprise.com").unwrap()
+        );
     }
 
     #[test]
     fn test_from_remote_url_https() {
-        let remote_url = "https://github.my-enterprise.com/GramEditor/gram.git";
+        let remote_url = "https://github.my-enterprise.com/zed-industries/zed.git";
         let github = Github::from_remote_url(remote_url).unwrap();
 
+        assert!(!github.supports_avatars());
         assert_eq!(github.name, "GitHub Self-Hosted".to_string());
-        assert_eq!(github.base_url, Url::parse("https://github.my-enterprise.com").unwrap());
+        assert_eq!(
+            github.base_url,
+            Url::parse("https://github.my-enterprise.com").unwrap()
+        );
     }
 
     #[test]
     fn test_parse_remote_url_given_self_hosted_ssh_url() {
-        let remote_url = "git@github.my-enterprise.com:GramEditor/gram.git";
+        let remote_url = "git@github.my-enterprise.com:zed-industries/zed.git";
         let parsed_remote = Github::from_remote_url(remote_url)
             .unwrap()
             .parse_remote_url(remote_url)
@@ -198,15 +368,15 @@ mod tests {
         assert_eq!(
             parsed_remote,
             ParsedGitRemote {
-                owner: "GramEditor".into(),
-                repo: "gram".into(),
+                owner: "zed-industries".into(),
+                repo: "zed".into(),
             }
         );
     }
 
     #[test]
     fn test_parse_remote_url_given_self_hosted_https_url_with_subgroup() {
-        let remote_url = "https://github.my-enterprise.com/GramEditor/gram.git";
+        let remote_url = "https://github.my-enterprise.com/zed-industries/zed.git";
         let parsed_remote = Github::from_remote_url(remote_url)
             .unwrap()
             .parse_remote_url(remote_url)
@@ -215,8 +385,8 @@ mod tests {
         assert_eq!(
             parsed_remote,
             ParsedGitRemote {
-                owner: "GramEditor".into(),
-                repo: "gram".into(),
+                owner: "zed-industries".into(),
+                repo: "zed".into(),
             }
         );
     }
@@ -224,14 +394,14 @@ mod tests {
     #[test]
     fn test_parse_remote_url_given_ssh_url() {
         let parsed_remote = Github::public_instance()
-            .parse_remote_url("git@github.com:GramEditor/gram.git")
+            .parse_remote_url("git@github.com:zed-industries/zed.git")
             .unwrap();
 
         assert_eq!(
             parsed_remote,
             ParsedGitRemote {
-                owner: "GramEditor".into(),
-                repo: "gram".into(),
+                owner: "zed-industries".into(),
+                repo: "zed".into(),
             }
         );
     }
@@ -239,14 +409,14 @@ mod tests {
     #[test]
     fn test_parse_remote_url_given_https_url() {
         let parsed_remote = Github::public_instance()
-            .parse_remote_url("https://github.com/GramEditor/gram.git")
+            .parse_remote_url("https://github.com/zed-industries/zed.git")
             .unwrap();
 
         assert_eq!(
             parsed_remote,
             ParsedGitRemote {
-                owner: "GramEditor".into(),
-                repo: "gram".into(),
+                owner: "zed-industries".into(),
+                repo: "zed".into(),
             }
         );
     }
@@ -269,8 +439,8 @@ mod tests {
     #[test]
     fn test_build_github_permalink_from_ssh_url() {
         let remote = ParsedGitRemote {
-            owner: "GramEditor".into(),
-            repo: "gram".into(),
+            owner: "zed-industries".into(),
+            repo: "zed".into(),
         };
         let permalink = Github::public_instance().build_permalink(
             remote,
@@ -281,7 +451,7 @@ mod tests {
             ),
         );
 
-        let expected_url = "https://github.com/GramEditor/gram/blob/e6ebe7974deb6bb6cc0e2595c8ec31f0c71084b7/crates/editor/src/git/permalink.rs";
+        let expected_url = "https://github.com/zed-industries/zed/blob/e6ebe7974deb6bb6cc0e2595c8ec31f0c71084b7/crates/editor/src/git/permalink.rs";
         assert_eq!(permalink.to_string(), expected_url.to_string())
     }
 
@@ -289,8 +459,8 @@ mod tests {
     fn test_build_github_permalink() {
         let permalink = Github::public_instance().build_permalink(
             ParsedGitRemote {
-                owner: "GramEditor".into(),
-                repo: "gram".into(),
+                owner: "zed-industries".into(),
+                repo: "zed".into(),
             },
             BuildPermalinkParams::new(
                 "b2efec9824c45fcc90c9a7eb107a50d1772a60aa",
@@ -299,8 +469,7 @@ mod tests {
             ),
         );
 
-        let expected_url =
-            "https://github.com/GramEditor/gram/blob/b2efec9824c45fcc90c9a7eb107a50d1772a60aa/crates/zed/src/main.rs";
+        let expected_url = "https://github.com/zed-industries/zed/blob/b2efec9824c45fcc90c9a7eb107a50d1772a60aa/crates/zed/src/main.rs";
         assert_eq!(permalink.to_string(), expected_url.to_string())
     }
 
@@ -308,8 +477,8 @@ mod tests {
     fn test_build_github_permalink_with_single_line_selection() {
         let permalink = Github::public_instance().build_permalink(
             ParsedGitRemote {
-                owner: "GramEditor".into(),
-                repo: "gram".into(),
+                owner: "zed-industries".into(),
+                repo: "zed".into(),
             },
             BuildPermalinkParams::new(
                 "e6ebe7974deb6bb6cc0e2595c8ec31f0c71084b7",
@@ -318,7 +487,7 @@ mod tests {
             ),
         );
 
-        let expected_url = "https://github.com/GramEditor/gram/blob/e6ebe7974deb6bb6cc0e2595c8ec31f0c71084b7/crates/editor/src/git/permalink.rs#L7";
+        let expected_url = "https://github.com/zed-industries/zed/blob/e6ebe7974deb6bb6cc0e2595c8ec31f0c71084b7/crates/editor/src/git/permalink.rs#L7";
         assert_eq!(permalink.to_string(), expected_url.to_string())
     }
 
@@ -326,8 +495,8 @@ mod tests {
     fn test_build_github_permalink_with_multi_line_selection() {
         let permalink = Github::public_instance().build_permalink(
             ParsedGitRemote {
-                owner: "GramEditor".into(),
-                repo: "gram".into(),
+                owner: "zed-industries".into(),
+                repo: "zed".into(),
             },
             BuildPermalinkParams::new(
                 "e6ebe7974deb6bb6cc0e2595c8ec31f0c71084b7",
@@ -336,15 +505,15 @@ mod tests {
             ),
         );
 
-        let expected_url = "https://github.com/GramEditor/gram/blob/e6ebe7974deb6bb6cc0e2595c8ec31f0c71084b7/crates/editor/src/git/permalink.rs#L24-L48";
+        let expected_url = "https://github.com/zed-industries/zed/blob/e6ebe7974deb6bb6cc0e2595c8ec31f0c71084b7/crates/editor/src/git/permalink.rs#L24-L48";
         assert_eq!(permalink.to_string(), expected_url.to_string())
     }
 
     #[test]
     fn test_build_github_create_pr_url() {
         let remote = ParsedGitRemote {
-            owner: "GramEditor".into(),
-            repo: "gram".into(),
+            owner: "zed-industries".into(),
+            repo: "zed".into(),
         };
 
         let provider = Github::public_instance();
@@ -355,15 +524,15 @@ mod tests {
 
         assert_eq!(
             url.as_str(),
-            "https://github.com/GramEditor/gram/pull/new/feature%2Fsomething%20cool"
+            "https://github.com/zed-industries/zed/pull/new/feature%2Fsomething%20cool"
         );
     }
 
     #[test]
     fn test_github_pull_requests() {
         let remote = ParsedGitRemote {
-            owner: "GramEditor".into(),
-            repo: "gram".into(),
+            owner: "zed-industries".into(),
+            repo: "zed".into(),
         };
 
         let github = Github::public_instance();
@@ -383,8 +552,12 @@ mod tests {
         };
 
         assert_eq!(
-            github.extract_pull_request(&remote, message).unwrap().url.as_str(),
-            "https://github.com/GramEditor/gram/pull/10687"
+            github
+                .extract_pull_request(&remote, message)
+                .unwrap()
+                .url
+                .as_str(),
+            "https://github.com/zed-industries/zed/pull/10687"
         );
 
         // Pull request number in middle of line, which we want to ignore
@@ -402,7 +575,7 @@ mod tests {
     fn test_git_permalink_url_escaping() {
         let permalink = Github::public_instance().build_permalink(
             ParsedGitRemote {
-                owner: "GramEditor".into(),
+                owner: "zed-industries".into(),
                 repo: "nonexistent".into(),
             },
             BuildPermalinkParams::new(
@@ -412,15 +585,15 @@ mod tests {
             ),
         );
 
-        let expected_url = "https://github.com/GramEditor/nonexistent/blob/3ef1539900037dd3601be7149b2b39ed6d0ce3db/app/blog/%5Bslug%5D/page.tsx#L8";
+        let expected_url = "https://github.com/zed-industries/nonexistent/blob/3ef1539900037dd3601be7149b2b39ed6d0ce3db/app/blog/%5Bslug%5D/page.tsx#L8";
         assert_eq!(permalink.to_string(), expected_url.to_string())
     }
 
     #[test]
     fn test_build_create_pull_request_url() {
         let remote = ParsedGitRemote {
-            owner: "GramEditor".into(),
-            repo: "gram".into(),
+            owner: "zed-industries".into(),
+            repo: "zed".into(),
         };
 
         let github = Github::public_instance();
@@ -430,10 +603,10 @@ mod tests {
 
         assert_eq!(
             url.as_str(),
-            "https://github.com/GramEditor/gram/pull/new/feature%2Fnew-feature"
+            "https://github.com/zed-industries/zed/pull/new/feature%2Fnew-feature"
         );
 
-        let base_url = Url::parse("https://github.eat-the-rich.com").unwrap();
+        let base_url = Url::parse("https://github.zed.com").unwrap();
         let github = Github::new("GitHub Self-Hosted", base_url);
         let url = github
             .build_create_pull_request_url(&remote, "feature/new-feature")
@@ -441,7 +614,56 @@ mod tests {
 
         assert_eq!(
             url.as_str(),
-            "https://github.eat-the-rich.com/GramEditor/gram/pull/new/feature%2Fnew-feature"
+            "https://github.zed.com/zed-industries/zed/pull/new/feature%2Fnew-feature"
+        );
+    }
+
+    #[test]
+    fn test_build_cdn_avatar_url_simple_email() {
+        let url = build_cdn_avatar_url("user@example.com").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://avatars.githubusercontent.com/u/e?email=user%40example.com&s=128"
+        );
+    }
+
+    #[test]
+    fn test_build_cdn_avatar_url_with_angle_brackets() {
+        let url = build_cdn_avatar_url("<user@example.com>").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://avatars.githubusercontent.com/u/e?email=user%40example.com&s=128"
+        );
+    }
+
+    #[test]
+    fn test_build_cdn_avatar_url_with_special_chars() {
+        let url = build_cdn_avatar_url("user+tag@example.com").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://avatars.githubusercontent.com/u/e?email=user%2Btag%40example.com&s=128"
+        );
+    }
+
+    #[test]
+    fn test_build_cdn_avatar_url_for_author_email_skips_bot_noreply_emails() {
+        for email in [
+            "41898282+github-actions[bot]@users.noreply.github.com",
+            "<41898282+github-actions[bot]@users.noreply.github.com>",
+        ] {
+            assert_eq!(build_cdn_avatar_url_for_author_email(email).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn test_build_cdn_avatar_url_for_author_email_uses_user_noreply_emails() {
+        let url = build_cdn_avatar_url_for_author_email("12345+octocat@users.noreply.github.com")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://avatars.githubusercontent.com/u/e?email=12345%2Boctocat%40users.noreply.github.com&s=128"
         );
     }
 }

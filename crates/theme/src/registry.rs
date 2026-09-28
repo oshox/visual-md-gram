@@ -1,19 +1,15 @@
 use std::sync::Arc;
 use std::{fmt::Debug, path::Path};
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use collections::HashMap;
-use derive_more::{Deref, DerefMut};
-use fs::Fs;
-use futures::StreamExt;
 use gpui::{App, AssetSource, Global, SharedString};
 use parking_lot::RwLock;
 use thiserror::Error;
-use util::ResultExt;
 
 use crate::{
-    Appearance, AppearanceContent, ChevronIcons, DEFAULT_ICON_THEME_NAME, DirectoryIcons, IconDefinition, IconTheme,
-    Theme, ThemeFamily, ThemeFamilyContent, default_icon_theme, read_icon_theme, read_user_theme, refine_theme_family,
+    Appearance, AppearanceContent, ChevronIcons, DEFAULT_ICON_THEME_NAME, DirectoryIcons,
+    IconDefinition, IconTheme, IconThemeFamilyContent, Theme, ThemeFamily, default_icon_theme,
 };
 
 /// The metadata for a theme.
@@ -41,8 +37,22 @@ pub struct IconThemeNotFoundError(pub SharedString);
 /// inserting the [`ThemeRegistry`] into the context as a global.
 ///
 /// This should not be exposed outside of this module.
-#[derive(Default, Deref, DerefMut)]
+#[derive(Default)]
 struct GlobalThemeRegistry(Arc<ThemeRegistry>);
+
+impl std::ops::DerefMut for GlobalThemeRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl std::ops::Deref for GlobalThemeRegistry {
+    type Target = Arc<ThemeRegistry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl Global for GlobalThemeRegistry {}
 
@@ -82,6 +92,11 @@ impl ThemeRegistry {
         cx.set_global(GlobalThemeRegistry(Arc::new(ThemeRegistry::new(assets))));
     }
 
+    /// Returns the asset source used by this registry.
+    pub fn assets(&self) -> &dyn AssetSource {
+        self.assets.as_ref()
+    }
+
     /// Creates a new [`ThemeRegistry`] with the given [`AssetSource`].
     pub fn new(assets: Box<dyn AssetSource>) -> Self {
         let registry = Self {
@@ -93,9 +108,9 @@ impl ThemeRegistry {
             assets,
         };
 
-        // We're loading the Gram default theme, as we need a theme to be loaded
+        // We're loading the Zed default theme, as we need a theme to be loaded
         // for tests.
-        registry.insert_theme_families([crate::fallback_themes::gram_default_themes()]);
+        registry.insert_theme_families([crate::fallback_themes::zed_default_themes()]);
 
         let default_icon_theme = crate::default_icon_theme();
         registry
@@ -117,25 +132,35 @@ impl ThemeRegistry {
         self.state.write().extensions_loaded = true;
     }
 
-    fn insert_theme_families(&self, families: impl IntoIterator<Item = ThemeFamily>) {
+    /// Inserts the given theme families into the registry.
+    pub fn insert_theme_families(&self, families: impl IntoIterator<Item = ThemeFamily>) {
         for family in families.into_iter() {
             self.insert_themes(family.themes);
         }
     }
 
-    fn insert_themes(&self, themes: impl IntoIterator<Item = Theme>) {
+    /// Registers theme families for use in tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_test_themes(&self, families: impl IntoIterator<Item = ThemeFamily>) {
+        self.insert_theme_families(families);
+    }
+
+    /// Registers icon themes for use in tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_test_icon_themes(&self, icon_themes: impl IntoIterator<Item = IconTheme>) {
         let mut state = self.state.write();
-        for theme in themes.into_iter() {
-            state.themes.insert(theme.name.clone(), Arc::new(theme));
+        for icon_theme in icon_themes {
+            state
+                .icon_themes
+                .insert(icon_theme.name.clone(), Arc::new(icon_theme));
         }
     }
 
-    #[allow(unused)]
-    fn insert_user_theme_families(&self, families: impl IntoIterator<Item = ThemeFamilyContent>) {
-        for family in families.into_iter() {
-            let refined_family = refine_theme_family(family);
-
-            self.insert_themes(refined_family.themes);
+    /// Inserts the given themes into the registry.
+    pub fn insert_themes(&self, themes: impl IntoIterator<Item = Theme>) {
+        let mut state = self.state.write();
+        for theme in themes.into_iter() {
+            state.themes.insert(theme.name.clone(), Arc::new(theme));
         }
     }
 
@@ -182,63 +207,6 @@ impl ThemeRegistry {
             .cloned()
     }
 
-    /// Loads the themes bundled with the Gram binary and adds them to the registry.
-    pub fn load_bundled_themes(&self) {
-        let theme_paths = self
-            .assets
-            .list("themes/")
-            .expect("failed to list theme assets")
-            .into_iter()
-            .filter(|path| path.ends_with(".json"));
-
-        for path in theme_paths {
-            let Some(theme) = self.assets.load(&path).log_err().flatten() else {
-                continue;
-            };
-
-            let Some(theme_family) = serde_json::from_slice(&theme)
-                .with_context(|| format!("failed to parse theme at path \"{path}\""))
-                .log_err()
-            else {
-                continue;
-            };
-
-            self.insert_user_theme_families([theme_family]);
-        }
-    }
-
-    /// Loads the user themes from the specified directory and adds them to the registry.
-    pub async fn load_user_themes(&self, themes_path: &Path, fs: Arc<dyn Fs>) -> Result<()> {
-        let mut theme_paths = fs
-            .read_dir(themes_path)
-            .await
-            .with_context(|| format!("reading themes from {themes_path:?}"))?;
-
-        while let Some(theme_path) = theme_paths.next().await {
-            let Some(theme_path) = theme_path.log_err() else {
-                continue;
-            };
-
-            self.load_user_theme(&theme_path, fs.clone()).await.log_err();
-        }
-
-        Ok(())
-    }
-
-    /// Loads the user theme from the specified path and adds it to the registry.
-    pub async fn load_user_theme(&self, theme_path: &Path, fs: Arc<dyn Fs>) -> Result<()> {
-        if fs.is_dir(theme_path).await {
-            // Can happen when we get an FS event for the
-            // themes directory itself (created, deleted)
-            return Ok(());
-        }
-
-        let theme = read_user_theme(theme_path, fs).await?;
-        self.insert_user_theme_families([theme]);
-
-        Ok(())
-    }
-
     /// Returns the default icon theme.
     pub fn default_icon_theme(&self) -> Result<Arc<IconTheme>, IconThemeNotFoundError> {
         self.get_icon_theme(DEFAULT_ICON_THEME_NAME)
@@ -275,15 +243,22 @@ impl ThemeRegistry {
             .retain(|name, _| !icon_themes_to_remove.contains(name))
     }
 
-    /// Loads the icon theme from the specified path and adds it to the registry.
+    /// Loads the icon theme from the icon theme family and adds it to the registry.
     ///
     /// The `icons_root_dir` parameter indicates the root directory from which
     /// the relative paths to icons in the theme should be resolved against.
-    pub async fn load_icon_theme(&self, icon_theme_path: &Path, icons_root_dir: &Path, fs: Arc<dyn Fs>) -> Result<()> {
-        let icon_theme_family = read_icon_theme(icon_theme_path, fs).await?;
-
-        let resolve_icon_path =
-            |path: SharedString| icons_root_dir.join(path.as_ref()).to_string_lossy().to_string().into();
+    pub fn load_icon_theme(
+        &self,
+        icon_theme_family: IconThemeFamilyContent,
+        icons_root_dir: &Path,
+    ) -> Result<()> {
+        let resolve_icon_path = |path: SharedString| {
+            icons_root_dir
+                .join(path.as_ref())
+                .to_string_lossy()
+                .to_string()
+                .into()
+        };
 
         let default_icon_theme = default_icon_theme();
 
@@ -296,15 +271,17 @@ impl ThemeRegistry {
             file_suffixes.extend(icon_theme.file_suffixes);
 
             let mut named_directory_icons = default_icon_theme.named_directory_icons.clone();
-            named_directory_icons.extend(icon_theme.named_directory_icons.into_iter().map(|(key, value)| {
-                (
-                    key,
-                    DirectoryIcons {
-                        collapsed: value.collapsed.map(resolve_icon_path),
-                        expanded: value.expanded.map(resolve_icon_path),
-                    },
-                )
-            }));
+            named_directory_icons.extend(icon_theme.named_directory_icons.into_iter().map(
+                |(key, value)| {
+                    (
+                        key,
+                        DirectoryIcons {
+                            collapsed: value.collapsed.map(resolve_icon_path),
+                            expanded: value.expanded.map(resolve_icon_path),
+                        },
+                    )
+                },
+            ));
 
             let icon_theme = IconTheme {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -338,7 +315,9 @@ impl ThemeRegistry {
                     .collect(),
             };
 
-            state.icon_themes.insert(icon_theme.name.clone(), Arc::new(icon_theme));
+            state
+                .icon_themes
+                .insert(icon_theme.name.clone(), Arc::new(icon_theme));
         }
 
         Ok(())

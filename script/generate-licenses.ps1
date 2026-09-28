@@ -1,3 +1,6 @@
+$ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
+
 $CARGO_ABOUT_VERSION="0.8.2"
 $outputFile=$args[0] ? $args[0] : "$(Get-Location)/assets/licenses.md"
 $templateFile="script/licenses/template.md.hbs"
@@ -5,33 +8,34 @@ $templateFile="script/licenses/template.md.hbs"
 New-Item -Path "$outputFile" -ItemType File -Value "" -Force
 
 @(
-    "# ###### LICENSES ######\n"
-    Get-Content LICENSE
-    "\n"
-    Get-Content licenses/APACHE
-    "\n"
-    Get-Content licenses/MIT
-    "\n"
-    Get-Content licenses/CC-A-SA-4.0
-    "\n"
-    Get-Content licenses/OFL
+    "# ###### THEME LICENSES ######\n"
+    Get-Content assets/themes/LICENSES
     "\n# ###### ICON LICENSES ######\n"
-    Get-Content assets/icons/LICENSE
+    Get-Content assets/icons/LICENSES
     "\n# ###### CODE LICENSES ######\n"
 ) | Add-Content -Path $outputFile
 
-$versionOutput = cargo about --version
-if (-not ($versionOutput -match "cargo-about $CARGO_ABOUT_VERSION")) {
+$needsInstall = $false
+try {
+    $versionOutput = cargo about --version
+    if (-not ($versionOutput -match "cargo-about $CARGO_ABOUT_VERSION")) {
+        $needsInstall = $true
+    } else {
+        Write-Host "cargo-about@$CARGO_ABOUT_VERSION is already installed"
+    }
+} catch {
+    $needsInstall = $true
+}
+
+if ($needsInstall) {
     Write-Host "Installing cargo-about@$CARGO_ABOUT_VERSION..."
     cargo install "cargo-about@$CARGO_ABOUT_VERSION"
-} else {
-    Write-Host "cargo-about@$CARGO_ABOUT_VERSION" is already installed
 }
 
 Write-Host "Generating cargo licenses"
 
 $failFlag = $env:ALLOW_MISSING_LICENSES ? "--fail" : ""
-$args = @('about', 'generate', $failFlag, '-c', 'script/licenses/licenses.toml', $templateFile, '-o', $outputFile) | Where-Object { $_ }
+$args = @('about', 'generate', $failFlag, '-c', 'script/licenses/zed-licenses.toml', $templateFile, '-o', $outputFile) | Where-Object { $_ }
 cargo @args
 
 Write-Host "Applying replacements"

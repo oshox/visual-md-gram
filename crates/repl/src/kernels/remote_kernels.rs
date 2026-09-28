@@ -9,13 +9,11 @@ use async_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValu
 use futures::StreamExt;
 use smol::io::AsyncReadExt as _;
 
-use crate::Session;
-
-use super::RunningKernel;
+use super::{KernelSession, RunningKernel};
 use anyhow::Result;
 use jupyter_websocket_client::{
-    JupyterWebSocket, JupyterWebSocketReader, JupyterWebSocketWriter, KernelLaunchRequest, KernelSpecsResponse,
-    RemoteServer,
+    JupyterWebSocket, JupyterWebSocketReader, JupyterWebSocketWriter, KernelLaunchRequest,
+    KernelSpecsResponse, ProtocolMode, RemoteServer,
 };
 use std::{fmt::Debug, sync::Arc};
 
@@ -121,16 +119,17 @@ pub struct RemoteRunningKernel {
     http_client: Arc<dyn HttpClient>,
     pub working_directory: std::path::PathBuf,
     pub request_tx: mpsc::Sender<JupyterMessage>,
+    pub stdin_tx: mpsc::Sender<JupyterMessage>,
     pub execution_state: ExecutionState,
     pub kernel_info: Option<KernelInfoReply>,
     pub kernel_id: String,
 }
 
 impl RemoteRunningKernel {
-    pub fn new(
+    pub fn new<S: KernelSession + 'static>(
         kernelspec: RemoteKernelSpecification,
         working_directory: std::path::PathBuf,
-        session: Entity<Session>,
+        session: Entity<S>,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Box<dyn RunningKernel>>> {
@@ -163,7 +162,7 @@ impl RemoteRunningKernel {
             headers.insert(
                 "User-Agent",
                 HeaderValue::from_str(&format!(
-                    "Gram/{} ({}; {})",
+                    "Zed/{} ({}; {})",
                     "repl",
                     std::env::consts::OS,
                     std::env::consts::ARCH
@@ -176,12 +175,13 @@ impl RemoteRunningKernel {
 
             let kernel_socket = JupyterWebSocket {
                 inner: ws_stream,
-                protocol_mode: Default::default(),
+                protocol_mode: ProtocolMode::Json,
             };
+            let (mut w, mut r): (JupyterWebSocketWriter, JupyterWebSocketReader) =
+                kernel_socket.split();
 
-            let (mut w, mut r): (JupyterWebSocketWriter, JupyterWebSocketReader) = kernel_socket.split();
-
-            let (request_tx, mut request_rx) = futures::channel::mpsc::channel::<JupyterMessage>(100);
+            let (request_tx, mut request_rx) =
+                futures::channel::mpsc::channel::<JupyterMessage>(100);
 
             let routing_task = cx.background_spawn({
                 async move {
@@ -214,12 +214,15 @@ impl RemoteRunningKernel {
                 }
             });
 
+            let stdin_tx = request_tx.clone();
+
             anyhow::Ok(Box::new(Self {
                 _routing_task: routing_task,
                 _receiving_task: receiving_task,
                 remote_server,
                 working_directory,
                 request_tx,
+                stdin_tx,
                 // todo(kyle): pull this from the kernel API to start with
                 execution_state: ExecutionState::Idle,
                 kernel_info: None,
@@ -248,6 +251,10 @@ impl RunningKernel for RemoteRunningKernel {
         self.request_tx.clone()
     }
 
+    fn stdin_tx(&self) -> futures::channel::mpsc::Sender<runtimelib::JupyterMessage> {
+        self.stdin_tx.clone()
+    }
+
     fn working_directory(&self) -> &std::path::PathBuf {
         &self.working_directory
     }
@@ -269,7 +276,9 @@ impl RunningKernel for RemoteRunningKernel {
     }
 
     fn force_shutdown(&mut self, window: &mut Window, cx: &mut App) -> Task<anyhow::Result<()>> {
-        let url = self.remote_server.api_url(&format!("/kernels/{}", self.kernel_id));
+        let url = self
+            .remote_server
+            .api_url(&format!("/kernels/{}", self.kernel_id));
         let token = self.remote_server.token.clone();
         let http_client = self.http_client.clone();
 
@@ -289,5 +298,10 @@ impl RunningKernel for RemoteRunningKernel {
             );
             Ok(())
         })
+    }
+
+    fn kill(&mut self) {
+        self.request_tx.close_channel();
+        self.stdin_tx.close_channel();
     }
 }

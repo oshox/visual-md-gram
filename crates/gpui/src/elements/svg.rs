@@ -1,11 +1,16 @@
-use std::{fs, path::Path, sync::Arc};
+use std::{
+    fs,
+    hash::{Hash, Hasher},
+    path::Path,
+    sync::Arc,
+};
 
 use crate::{
-    App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity,
-    IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size, StyleRefinement, Styled, TransformationMatrix,
-    Window, geometry::Negate as _, point, px, radians, size,
+    App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
+    Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size,
+    StyleRefinement, Styled, TransformationMatrix, Window, point, px, radians, size,
 };
-use util::ResultExt;
+use gpui_util::ResultExt;
 
 /// An SVG element.
 pub struct Svg {
@@ -13,6 +18,8 @@ pub struct Svg {
     transformation: Option<Transformation>,
     path: Option<SharedString>,
     external_path: Option<SharedString>,
+    data: Option<Arc<[u8]>>,
+    data_path: Option<SharedString>,
 }
 
 /// Create a new SVG element.
@@ -23,6 +30,8 @@ pub fn svg() -> Svg {
         transformation: None,
         path: None,
         external_path: None,
+        data: None,
+        data_path: None,
     }
 }
 
@@ -36,6 +45,19 @@ impl Svg {
     /// Set the path to the SVG file for this element.
     pub fn external_path(mut self, path: impl Into<SharedString>) -> Self {
         self.external_path = Some(path.into());
+        self
+    }
+
+    /// Set the raw SVG data for this element.
+    /// The SVG will be rendered directly from the provided bytes.
+    pub fn data(mut self, data: &[u8]) -> Self {
+        // Generate a unique deterministic path based on the data hash for caching
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        data.hash(&mut hasher);
+        let hash = hasher.finish();
+        let path = SharedString::from(format!("__binary_svg__{}", hash));
+        self.data = Some(Arc::from(data));
+        self.data_path = Some(path);
         self
     }
 
@@ -66,11 +88,13 @@ impl Element for Svg {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let layout_id = self
-            .interactivity
-            .request_layout(global_id, inspector_id, window, cx, |style, window, cx| {
-                window.request_layout(style, None, cx)
-            });
+        let layout_id = self.interactivity.request_layout(
+            global_id,
+            inspector_id,
+            window,
+            cx,
+            |style, window, cx| window.request_layout(style, None, cx),
+        );
         (layout_id, ())
     }
 
@@ -114,29 +138,50 @@ impl Element for Svg {
             window,
             cx,
             |style, window, cx| {
-                if let Some((path, color)) = self.path.as_ref().zip(style.text.color) {
-                    let transformation = self
-                        .transformation
-                        .as_ref()
-                        .map(|transformation| transformation.into_matrix(bounds.center(), window.scale_factor()))
-                        .unwrap_or_default();
+                let transformation = self
+                    .transformation
+                    .as_ref()
+                    .map(|transformation| {
+                        transformation.into_matrix(bounds.center(), window.scale_factor())
+                    })
+                    .unwrap_or_default();
 
-                    window
-                        .paint_svg(bounds, path.clone(), None, transformation, color, cx)
-                        .log_err();
-                } else if let Some((path, color)) = self.external_path.as_ref().zip(style.text.color) {
-                    let Some(bytes) = window.use_asset::<SvgAsset>(path, cx).and_then(|asset| asset.log_err()) else {
+                if let Some((data, path)) = self.data.as_ref().zip(self.data_path.as_ref()) {
+                    if let Some(color) = style.text.color {
+                        window
+                            .paint_svg(
+                                bounds,
+                                path.clone(),
+                                Some(&**data),
+                                transformation,
+                                color,
+                                cx,
+                            )
+                            .log_err();
+                    }
+                } else if let Some((path, color)) =
+                    self.external_path.as_ref().zip(style.text.color)
+                {
+                    let Some(bytes) = window
+                        .use_asset::<SvgAsset>(path, cx)
+                        .and_then(|asset| asset.log_err())
+                    else {
                         return;
                     };
 
-                    let transformation = self
-                        .transformation
-                        .as_ref()
-                        .map(|transformation| transformation.into_matrix(bounds.center(), window.scale_factor()))
-                        .unwrap_or_default();
-
                     window
-                        .paint_svg(bounds, path.clone(), Some(&bytes), transformation, color, cx)
+                        .paint_svg(
+                            bounds,
+                            path.clone(),
+                            Some(&bytes),
+                            transformation,
+                            color,
+                            cx,
+                        )
+                        .log_err();
+                } else if let Some((path, color)) = self.path.as_ref().zip(style.text.color) {
+                    window
+                        .paint_svg(bounds, path.clone(), None, transformation, color, cx)
                         .log_err();
                 }
             },
@@ -235,7 +280,7 @@ impl Transformation {
             .translate(center.scale(scale_factor) + self.translate.scale(scale_factor))
             .rotate(self.rotate)
             .scale(self.scale)
-            .translate(center.scale(scale_factor).negate())
+            .translate(center.scale(-scale_factor))
     }
 }
 
@@ -245,7 +290,10 @@ impl Asset for SvgAsset {
     type Source = SharedString;
     type Output = Result<Arc<[u8]>, Arc<std::io::Error>>;
 
-    fn load(source: Self::Source, _cx: &mut App) -> impl Future<Output = Self::Output> + Send + 'static {
+    fn load(
+        source: Self::Source,
+        _cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
         async move {
             let bytes = fs::read(Path::new(source.as_ref())).map_err(|e| Arc::new(e))?;
             let bytes = Arc::from(bytes);

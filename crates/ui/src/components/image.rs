@@ -5,17 +5,22 @@ use gpui::{App, IntoElement, Rems, RenderOnce, Size, Styled, Window, svg};
 use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString, IntoStaticStr};
 
-use crate::Color;
 use crate::prelude::*;
 use crate::traits::transformable::Transformable;
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone, EnumIter, EnumString, IntoStaticStr, Serialize, Deserialize)]
+#[derive(
+    Debug, PartialEq, Eq, Copy, Clone, EnumIter, EnumString, IntoStaticStr, Serialize, Deserialize,
+)]
 #[strum(serialize_all = "snake_case")]
 pub enum VectorName {
-    DebuggerGrid,
+    BusinessStamp,
+    VipStamp,
     Grid,
-    LogoDark,
-    LogoLight,
+    ProTrialStamp,
+    ProUserStamp,
+    StudentStamp,
+    ZedLogo,
+    ZedXCopilot,
 }
 
 impl VectorName {
@@ -102,62 +107,64 @@ impl Component for Vector {
         "Vector"
     }
 
-    fn description() -> Option<&'static str> {
-        Some("A vector image component that can be displayed at specific sizes.")
+    fn description() -> &'static str {
+        "A vector image component that can be displayed at specific sizes."
     }
 
-    fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
-        let size = rems_from_px(60.0_f32);
+    fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
+        let size = rems_from_px(60_f32);
 
-        Some(
-            v_flex()
-                .gap_6()
-                .children(vec![
-                    example_group_with_title(
-                        "Basic Usage",
-                        vec![
-                            single_example("Default", Vector::square(VectorName::LogoDark, size).into_any_element()),
-                            single_example(
-                                "Custom Size",
-                                h_flex()
-                                    .h(rems_from_px(120.0_f32))
-                                    .justify_center()
-                                    .child(Vector::new(
-                                        VectorName::LogoDark,
-                                        rems_from_px(120.0_f32),
-                                        rems_from_px(200.0_f32),
-                                    ))
-                                    .into_any_element(),
-                            ),
-                        ],
-                    ),
-                    example_group_with_title(
-                        "Colored",
-                        vec![
-                            single_example(
-                                "Accent Color",
-                                Vector::square(VectorName::LogoDark, size)
-                                    .color(Color::Accent)
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "Error Color",
-                                Vector::square(VectorName::LogoDark, size)
-                                    .color(Color::Error)
-                                    .into_any_element(),
-                            ),
-                        ],
-                    ),
-                    example_group_with_title(
-                        "Different Vectors",
-                        vec![single_example(
-                            "Gram Logo",
-                            Vector::square(VectorName::LogoDark, rems_from_px(8.0_f32)).into_any_element(),
-                        )],
-                    ),
-                ])
-                .into_any_element(),
-        )
+        v_flex()
+            .gap_6()
+            .children(vec![
+                example_group_with_title(
+                    "Basic Usage",
+                    vec![
+                        single_example(
+                            "Default",
+                            Vector::square(VectorName::ZedLogo, size).into_any_element(),
+                        ),
+                        single_example(
+                            "Custom Size",
+                            h_flex()
+                                .h(rems_from_px(120_f32))
+                                .justify_center()
+                                .child(Vector::new(
+                                    VectorName::ZedLogo,
+                                    rems_from_px(120_f32),
+                                    rems_from_px(200_f32),
+                                ))
+                                .into_any_element(),
+                        ),
+                    ],
+                ),
+                example_group_with_title(
+                    "Colored",
+                    vec![
+                        single_example(
+                            "Accent Color",
+                            Vector::square(VectorName::ZedLogo, size)
+                                .color(Color::Accent)
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "Error Color",
+                            Vector::square(VectorName::ZedLogo, size)
+                                .color(Color::Error)
+                                .into_any_element(),
+                        ),
+                    ],
+                ),
+                example_group_with_title(
+                    "Different Vectors",
+                    vec![single_example(
+                        "Zed X Copilot",
+                        Vector::square(VectorName::ZedXCopilot, rems_from_px(100_f32))
+                            .into_any_element(),
+                    )],
+                ),
+            ])
+            .into_any_element()
     }
 }
 
@@ -167,6 +174,6 @@ mod tests {
 
     #[test]
     fn vector_path() {
-        assert_eq!(VectorName::LogoDark.path().as_ref(), "images/logo_dark.svg");
+        assert_eq!(VectorName::ZedLogo.path().as_ref(), "images/zed_logo.svg");
     }
 }

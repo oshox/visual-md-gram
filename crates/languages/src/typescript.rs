@@ -3,20 +3,22 @@ use async_trait::async_trait;
 use chrono::{DateTime, Local};
 use collections::HashMap;
 use futures::future::join_all;
-use gpui::{App, AppContext, AsyncApp, Task};
+use gpui::{App, AppContext, AsyncApp, Entity, Task};
 use itertools::Itertools as _;
 use language::{
-    ContextLocation, ContextProvider, File, LanguageName, LanguageToolchainStore, LspAdapter, LspAdapterDelegate,
-    LspInstaller, Toolchain,
+    Buffer, ContextLocation, ContextProvider, File, LanguageName, LanguageToolchainStore,
+    LspAdapter, LspAdapterDelegate, LspInstaller, Toolchain,
 };
 use lsp::{CodeActionKind, LanguageServerBinary, LanguageServerName, Uri};
 use node_runtime::{NodeRuntime, VersionStrategy};
 use project::{Fs, lsp_store::language_server_settings};
+use semver::{Version, VersionReq};
 use serde_json::{Value, json};
 use smol::lock::RwLock;
 use std::{
     borrow::Cow,
     ffi::OsString,
+    future::Future,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
@@ -31,7 +33,8 @@ pub(crate) struct TypeScriptContextProvider {
     last_package_json: PackageJsonContents,
 }
 
-const TYPESCRIPT_RUNNER_VARIABLE: VariableName = VariableName::Custom(Cow::Borrowed("TYPESCRIPT_RUNNER"));
+const TYPESCRIPT_RUNNER_VARIABLE: VariableName =
+    VariableName::Custom(Cow::Borrowed("TYPESCRIPT_RUNNER"));
 
 const TYPESCRIPT_JEST_TEST_NAME_VARIABLE: VariableName =
     VariableName::Custom(Cow::Borrowed("TYPESCRIPT_JEST_TEST_NAME"));
@@ -54,7 +57,8 @@ const TYPESCRIPT_JASMINE_PACKAGE_PATH_VARIABLE: VariableName =
 const TYPESCRIPT_BUN_PACKAGE_PATH_VARIABLE: VariableName =
     VariableName::Custom(Cow::Borrowed("TYPESCRIPT_BUN_PACKAGE_PATH"));
 
-const TYPESCRIPT_BUN_TEST_NAME_VARIABLE: VariableName = VariableName::Custom(Cow::Borrowed("TYPESCRIPT_BUN_TEST_NAME"));
+const TYPESCRIPT_BUN_TEST_NAME_VARIABLE: VariableName =
+    VariableName::Custom(Cow::Borrowed("TYPESCRIPT_BUN_TEST_NAME"));
 
 const TYPESCRIPT_NODE_PACKAGE_PATH_VARIABLE: VariableName =
     VariableName::Custom(Cow::Borrowed("TYPESCRIPT_NODE_PACKAGE_PATH"));
@@ -87,10 +91,17 @@ impl PackageJsonData {
                     "jest".to_owned(),
                     "--runInBand".to_owned(),
                     "--testNamePattern".to_owned(),
-                    format!("\"{}\"", TYPESCRIPT_JEST_TEST_NAME_VARIABLE.template_value()),
+                    format!(
+                        "\"{}\"",
+                        TYPESCRIPT_JEST_TEST_NAME_VARIABLE.template_value()
+                    ),
                     VariableName::File.template_value(),
                 ],
-                tags: vec!["ts-test".to_owned(), "js-test".to_owned(), "tsx-test".to_owned()],
+                tags: vec![
+                    "ts-test".to_owned(),
+                    "js-test".to_owned(),
+                    "tsx-test".to_owned(),
+                ],
                 cwd: Some(TYPESCRIPT_JEST_PACKAGE_PATH_VARIABLE.template_value()),
                 ..TaskTemplate::default()
             });
@@ -112,7 +123,11 @@ impl PackageJsonData {
                 ..TaskTemplate::default()
             });
             task_templates.0.push(TaskTemplate {
-                label: format!("{} test {}", "vitest".to_owned(), VariableName::Symbol.template_value(),),
+                label: format!(
+                    "{} test {}",
+                    "vitest".to_owned(),
+                    VariableName::Symbol.template_value(),
+                ),
                 command: TYPESCRIPT_RUNNER_VARIABLE.template_value(),
                 args: vec![
                     "exec".to_owned(),
@@ -121,10 +136,17 @@ impl PackageJsonData {
                     "run".to_owned(),
                     "--no-file-parallelism".to_owned(),
                     "--testNamePattern".to_owned(),
-                    format!("\"{}\"", TYPESCRIPT_VITEST_TEST_NAME_VARIABLE.template_value()),
+                    format!(
+                        "\"{}\"",
+                        TYPESCRIPT_VITEST_TEST_NAME_VARIABLE.template_value()
+                    ),
                     VariableName::File.template_value(),
                 ],
-                tags: vec!["ts-test".to_owned(), "js-test".to_owned(), "tsx-test".to_owned()],
+                tags: vec![
+                    "ts-test".to_owned(),
+                    "js-test".to_owned(),
+                    "tsx-test".to_owned(),
+                ],
                 cwd: Some(TYPESCRIPT_VITEST_PACKAGE_PATH_VARIABLE.template_value()),
                 ..TaskTemplate::default()
             });
@@ -144,7 +166,11 @@ impl PackageJsonData {
                 ..TaskTemplate::default()
             });
             task_templates.0.push(TaskTemplate {
-                label: format!("{} test {}", "mocha".to_owned(), VariableName::Symbol.template_value(),),
+                label: format!(
+                    "{} test {}",
+                    "mocha".to_owned(),
+                    VariableName::Symbol.template_value(),
+                ),
                 command: TYPESCRIPT_RUNNER_VARIABLE.template_value(),
                 args: vec![
                     "exec".to_owned(),
@@ -154,7 +180,11 @@ impl PackageJsonData {
                     format!("\"{}\"", VariableName::Symbol.template_value()),
                     VariableName::File.template_value(),
                 ],
-                tags: vec!["ts-test".to_owned(), "js-test".to_owned(), "tsx-test".to_owned()],
+                tags: vec![
+                    "ts-test".to_owned(),
+                    "js-test".to_owned(),
+                    "tsx-test".to_owned(),
+                ],
                 cwd: Some(TYPESCRIPT_MOCHA_PACKAGE_PATH_VARIABLE.template_value()),
                 ..TaskTemplate::default()
             });
@@ -187,7 +217,11 @@ impl PackageJsonData {
                     format!("--filter={}", VariableName::Symbol.template_value()),
                     VariableName::File.template_value(),
                 ],
-                tags: vec!["ts-test".to_owned(), "js-test".to_owned(), "tsx-test".to_owned()],
+                tags: vec![
+                    "ts-test".to_owned(),
+                    "js-test".to_owned(),
+                    "tsx-test".to_owned(),
+                ],
                 cwd: Some(TYPESCRIPT_JASMINE_PACKAGE_PATH_VARIABLE.template_value()),
                 ..TaskTemplate::default()
             });
@@ -210,7 +244,11 @@ impl PackageJsonData {
                     format!("\"{}\"", TYPESCRIPT_BUN_TEST_NAME_VARIABLE.template_value()),
                     VariableName::File.template_value(),
                 ],
-                tags: vec!["ts-test".to_owned(), "js-test".to_owned(), "tsx-test".to_owned()],
+                tags: vec![
+                    "ts-test".to_owned(),
+                    "js-test".to_owned(),
+                    "tsx-test".to_owned(),
+                ],
                 cwd: Some(TYPESCRIPT_BUN_PACKAGE_PATH_VARIABLE.template_value()),
                 ..TaskTemplate::default()
             });
@@ -221,7 +259,11 @@ impl PackageJsonData {
                 label: format!("{} file test", "node test".to_owned()),
                 command: "node".to_owned(),
                 args: vec!["--test".to_owned(), VariableName::File.template_value()],
-                tags: vec!["ts-test".to_owned(), "js-test".to_owned(), "tsx-test".to_owned()],
+                tags: vec![
+                    "ts-test".to_owned(),
+                    "js-test".to_owned(),
+                    "tsx-test".to_owned(),
+                ],
                 cwd: Some(TYPESCRIPT_NODE_PACKAGE_PATH_VARIABLE.template_value()),
                 ..TaskTemplate::default()
             });
@@ -234,17 +276,23 @@ impl PackageJsonData {
                     format!("\"{}\"", VariableName::Symbol.template_value()),
                     VariableName::File.template_value(),
                 ],
-                tags: vec!["ts-test".to_owned(), "js-test".to_owned(), "tsx-test".to_owned()],
+                tags: vec![
+                    "ts-test".to_owned(),
+                    "js-test".to_owned(),
+                    "tsx-test".to_owned(),
+                ],
                 cwd: Some(TYPESCRIPT_NODE_PACKAGE_PATH_VARIABLE.template_value()),
                 ..TaskTemplate::default()
             });
         }
 
         let script_name_counts: HashMap<_, usize> =
-            self.scripts.iter().fold(HashMap::default(), |mut acc, (_, script)| {
-                *acc.entry(script).or_default() += 1;
-                acc
-            });
+            self.scripts
+                .iter()
+                .fold(HashMap::default(), |mut acc, (_, script)| {
+                    *acc.entry(script).or_default() += 1;
+                    acc
+                });
         for (path, script) in &self.scripts {
             let label = if script_name_counts.get(script).copied().unwrap_or_default() > 1
                 && let Some(parent) = path.parent().and_then(|parent| parent.file_name())
@@ -259,7 +307,12 @@ impl PackageJsonData {
                 command: TYPESCRIPT_RUNNER_VARIABLE.template_value(),
                 args: vec!["run".to_owned(), script.to_owned()],
                 tags: vec!["package-script".into()],
-                cwd: Some(path.parent().unwrap_or(Path::new("/")).to_string_lossy().to_string()),
+                cwd: Some(
+                    path.parent()
+                        .unwrap_or(Path::new("/"))
+                        .to_string_lossy()
+                        .to_string(),
+                ),
                 ..TaskTemplate::default()
             });
         }
@@ -284,7 +337,9 @@ impl TypeScriptContextProvider {
         let new_json_data = file_relative_path
             .ancestors()
             .map(|path| worktree_root.join(path.as_std_path()))
-            .map(|parent_path| self.package_json_data(&parent_path, self.last_package_json.clone(), fs.clone(), cx))
+            .map(|parent_path| {
+                self.package_json_data(&parent_path, self.last_package_json.clone(), fs.clone(), cx)
+            })
             .collect::<Vec<_>>();
 
         cx.background_spawn(async move {
@@ -322,14 +377,16 @@ impl TypeScriptContextProvider {
             match existing_data {
                 Some(existing_data) => Ok(existing_data),
                 None => {
-                    let package_json_string = fs
-                        .load(&package_json_path)
-                        .await
-                        .with_context(|| format!("loading package.json from {package_json_path:?}"))?;
+                    let package_json_string =
+                        fs.load(&package_json_path).await.with_context(|| {
+                            format!("loading package.json from {package_json_path:?}")
+                        })?;
                     let package_json: HashMap<String, serde_json_lenient::Value> =
-                        serde_json_lenient::from_str(&package_json_string)
-                            .with_context(|| format!("parsing package.json from {package_json_path:?}"))?;
-                    let new_data = PackageJsonData::new(package_json_path.as_path().into(), package_json);
+                        serde_json_lenient::from_str(&package_json_string).with_context(|| {
+                            format!("parsing package.json from {package_json_path:?}")
+                        })?;
+                    let new_data =
+                        PackageJsonData::new(package_json_path.as_path().into(), package_json);
                     {
                         let mut contents = existing_package_json.0.write().await;
                         contents.insert(
@@ -367,21 +424,33 @@ async fn detect_package_manager(
 }
 
 impl ContextProvider for TypeScriptContextProvider {
-    fn associated_tasks(&self, file: Option<Arc<dyn File>>, cx: &App) -> Task<Option<TaskTemplates>> {
-        let Some(file) = project::File::from_dyn(file.as_ref()).cloned() else {
+    fn associated_tasks(
+        &self,
+        buffer: Option<Entity<Buffer>>,
+        cx: &App,
+    ) -> Task<Option<TaskTemplates>> {
+        let file = buffer.and_then(|buffer| buffer.read(cx).file());
+        let Some(file) = project::File::from_dyn(file).cloned() else {
             return Task::ready(None);
         };
         let Some(worktree_root) = file.worktree.read(cx).root_dir() else {
             return Task::ready(None);
         };
         let file_relative_path = file.path().clone();
-        let package_json_data =
-            self.combined_package_json_data(self.fs.clone(), &worktree_root, &file_relative_path, cx);
+        let package_json_data = self.combined_package_json_data(
+            self.fs.clone(),
+            &worktree_root,
+            &file_relative_path,
+            cx,
+        );
 
         cx.background_spawn(async move {
             let mut task_templates = TaskTemplates(Vec::new());
             task_templates.0.push(TaskTemplate {
-                label: format!("execute selection {}", VariableName::SelectedText.template_value()),
+                label: format!(
+                    "execute selection {}",
+                    VariableName::SelectedText.template_value()
+                ),
                 command: "node".to_owned(),
                 args: vec![
                     "-e".to_owned(),
@@ -395,7 +464,9 @@ impl ContextProvider for TypeScriptContextProvider {
                     package_json.fill_task_templates(&mut task_templates);
                 }
                 Err(e) => {
-                    log::error!("Failed to read package.json for worktree {file_relative_path:?}: {e:#}");
+                    log::error!(
+                        "Failed to read package.json for worktree {file_relative_path:?}: {e:#}"
+                    );
                 }
             }
 
@@ -414,26 +485,35 @@ impl ContextProvider for TypeScriptContextProvider {
         let mut vars = task::TaskVariables::default();
 
         if let Some(symbol) = current_vars.get(&VariableName::Symbol) {
-            vars.insert(TYPESCRIPT_JEST_TEST_NAME_VARIABLE, replace_test_name_parameters(symbol));
+            vars.insert(
+                TYPESCRIPT_JEST_TEST_NAME_VARIABLE,
+                replace_test_name_parameters(symbol),
+            );
             vars.insert(
                 TYPESCRIPT_VITEST_TEST_NAME_VARIABLE,
                 replace_test_name_parameters(symbol),
             );
-            vars.insert(TYPESCRIPT_BUN_TEST_NAME_VARIABLE, replace_test_name_parameters(symbol));
+            vars.insert(
+                TYPESCRIPT_BUN_TEST_NAME_VARIABLE,
+                replace_test_name_parameters(symbol),
+            );
         }
-        let file_path = location.file_location.buffer.read(cx).file().map(|file| file.path());
+        let file_path = location
+            .file_location
+            .buffer
+            .read(cx)
+            .file()
+            .map(|file| file.path());
 
-        let args = location
-            .worktree_root
-            .zip(location.fs)
-            .zip(file_path)
-            .map(|((worktree_root, fs), file_path)| {
+        let args = location.worktree_root.zip(location.fs).zip(file_path).map(
+            |((worktree_root, fs), file_path)| {
                 (
                     self.combined_package_json_data(fs.clone(), &worktree_root, file_path, cx),
                     worktree_root,
                     fs,
                 )
-            });
+            },
+        );
         cx.background_spawn(async move {
             if let Some((task, worktree_root, fs)) = args {
                 let package_json_data = task.await.log_err();
@@ -448,42 +528,60 @@ impl ContextProvider for TypeScriptContextProvider {
                     if let Some(path) = package_json_data.jest_package_path {
                         vars.insert(
                             TYPESCRIPT_JEST_PACKAGE_PATH_VARIABLE,
-                            path.parent().unwrap_or(Path::new("")).to_string_lossy().to_string(),
+                            path.parent()
+                                .unwrap_or(Path::new(""))
+                                .to_string_lossy()
+                                .to_string(),
                         );
                     }
 
                     if let Some(path) = package_json_data.mocha_package_path {
                         vars.insert(
                             TYPESCRIPT_MOCHA_PACKAGE_PATH_VARIABLE,
-                            path.parent().unwrap_or(Path::new("")).to_string_lossy().to_string(),
+                            path.parent()
+                                .unwrap_or(Path::new(""))
+                                .to_string_lossy()
+                                .to_string(),
                         );
                     }
 
                     if let Some(path) = package_json_data.vitest_package_path {
                         vars.insert(
                             TYPESCRIPT_VITEST_PACKAGE_PATH_VARIABLE,
-                            path.parent().unwrap_or(Path::new("")).to_string_lossy().to_string(),
+                            path.parent()
+                                .unwrap_or(Path::new(""))
+                                .to_string_lossy()
+                                .to_string(),
                         );
                     }
 
                     if let Some(path) = package_json_data.jasmine_package_path {
                         vars.insert(
                             TYPESCRIPT_JASMINE_PACKAGE_PATH_VARIABLE,
-                            path.parent().unwrap_or(Path::new("")).to_string_lossy().to_string(),
+                            path.parent()
+                                .unwrap_or(Path::new(""))
+                                .to_string_lossy()
+                                .to_string(),
                         );
                     }
 
                     if let Some(path) = package_json_data.bun_package_path {
                         vars.insert(
                             TYPESCRIPT_BUN_PACKAGE_PATH_VARIABLE,
-                            path.parent().unwrap_or(Path::new("")).to_string_lossy().to_string(),
+                            path.parent()
+                                .unwrap_or(Path::new(""))
+                                .to_string_lossy()
+                                .to_string(),
                         );
                     }
 
                     if let Some(path) = package_json_data.node_package_path {
                         vars.insert(
                             TYPESCRIPT_NODE_PACKAGE_PATH_VARIABLE,
-                            path.parent().unwrap_or(Path::new("")).to_string_lossy().to_string(),
+                            path.parent()
+                                .unwrap_or(Path::new(""))
+                                .to_string_lossy()
+                                .to_string(),
                         );
                     }
                 }
@@ -503,6 +601,9 @@ fn replace_test_name_parameters(test_name: &str) -> String {
     PATTERN.split(test_name).map(regex::escape).join("(.+?)")
 }
 
+static TYPESCRIPT_VERSION_REQ: LazyLock<VersionReq> =
+    LazyLock::new(|| VersionReq::parse("^6").expect("Failed to parse TypeScript version req"));
+
 pub struct TypeScriptLspAdapter {
     fs: Arc<dyn Fs>,
     node: NodeRuntime,
@@ -515,7 +616,8 @@ impl TypeScriptLspAdapter {
     const PACKAGE_NAME: &str = "typescript";
     const SERVER_PACKAGE_NAME: &str = "typescript-language-server";
 
-    const SERVER_NAME: LanguageServerName = LanguageServerName::new_static(Self::SERVER_PACKAGE_NAME);
+    const SERVER_NAME: LanguageServerName =
+        LanguageServerName::new_static(Self::SERVER_PACKAGE_NAME);
 
     pub fn new(node: NodeRuntime, fs: Arc<dyn Fs>) -> Self {
         TypeScriptLspAdapter { fs, node }
@@ -523,7 +625,9 @@ impl TypeScriptLspAdapter {
 
     async fn tsdk_path(&self, adapter: &Arc<dyn LspAdapterDelegate>) -> Option<&'static str> {
         let is_yarn = adapter
-            .read_text_file(RelPath::unix(".yarn/sdks/typescript/lib/typescript.js").unwrap())
+            .read_text_file(
+                RelPath::from_unix_str(".yarn/sdks/typescript/lib/typescript.js").unwrap(),
+            )
             .await
             .is_ok();
 
@@ -533,7 +637,18 @@ impl TypeScriptLspAdapter {
             "node_modules/typescript/lib"
         };
 
-        if self.fs.is_dir(&adapter.worktree_root_path().join(tsdk_path)).await {
+        // typescript-language-server doesn't support TypeScript 7+, which no longer
+        // ships `tsserver.js`.
+        if self
+            .fs
+            .is_file(
+                &adapter
+                    .worktree_root_path()
+                    .join(tsdk_path)
+                    .join("tsserver.js"),
+            )
+            .await
+        {
             Some(tsdk_path)
         } else {
             None
@@ -542,104 +657,108 @@ impl TypeScriptLspAdapter {
 }
 
 pub struct TypeScriptVersions {
-    typescript_version: String,
-    server_version: String,
+    typescript_version: Version,
+    server_version: Version,
 }
 
 impl LspInstaller for TypeScriptLspAdapter {
     type BinaryVersion = TypeScriptVersions;
 
-    async fn check_if_user_installed(
-        &self,
-        delegate: &dyn LspAdapterDelegate,
-        _: Option<Toolchain>,
-        _: &AsyncApp,
-    ) -> Option<LanguageServerBinary> {
-        let path = delegate.which(Self::SERVER_NAME.as_ref()).await?;
-
-        return Some(LanguageServerBinary {
-            path: path,
-            env: None,
-            arguments: vec!["--stdio".into()],
-        });
-    }
-
     async fn fetch_latest_server_version(
         &self,
-        _: &dyn LspAdapterDelegate,
+        _: &Arc<dyn LspAdapterDelegate>,
         _: bool,
         _: &mut AsyncApp,
-    ) -> Result<TypeScriptVersions> {
+    ) -> Result<Self::BinaryVersion> {
         Ok(TypeScriptVersions {
-            typescript_version: self.node.npm_package_latest_version(Self::PACKAGE_NAME).await?,
-            server_version: self.node.npm_package_latest_version(Self::SERVER_PACKAGE_NAME).await?,
+            typescript_version: self
+                .node
+                .npm_package_latest_version_with_requirement(
+                    Self::PACKAGE_NAME,
+                    Some(&TYPESCRIPT_VERSION_REQ),
+                )
+                .await?,
+            server_version: self
+                .node
+                .npm_package_latest_version(Self::SERVER_PACKAGE_NAME)
+                .await?,
         })
     }
 
-    async fn check_if_version_installed(
+    fn check_if_version_installed(
         &self,
-        version: &TypeScriptVersions,
+        version: &Self::BinaryVersion,
         container_dir: &PathBuf,
-        _: &dyn LspAdapterDelegate,
-    ) -> Option<LanguageServerBinary> {
-        let server_path = container_dir.join(Self::NEW_SERVER_PATH);
+        _: &Arc<dyn LspAdapterDelegate>,
+    ) -> impl Send + Future<Output = Option<LanguageServerBinary>> + use<> {
+        let node = self.node.clone();
+        let typescript_version = version.typescript_version.clone();
+        let server_version = version.server_version.clone();
+        let container_dir = container_dir.clone();
 
-        if self
-            .node
-            .should_install_npm_package(
-                Self::PACKAGE_NAME,
-                &server_path,
-                container_dir,
-                VersionStrategy::Latest(version.typescript_version.as_str()),
-            )
-            .await
-        {
-            return None;
+        async move {
+            let server_path = container_dir.join(Self::NEW_SERVER_PATH);
+
+            // Pin rather than Latest so an unusable TypeScript 7.x install gets downgraded.
+            if node
+                .should_install_npm_package(
+                    Self::PACKAGE_NAME,
+                    &server_path,
+                    &container_dir,
+                    VersionStrategy::Pin(&typescript_version),
+                )
+                .await
+            {
+                return None;
+            }
+
+            if node
+                .should_install_npm_package(
+                    Self::SERVER_PACKAGE_NAME,
+                    &server_path,
+                    &container_dir,
+                    VersionStrategy::Latest(&server_version),
+                )
+                .await
+            {
+                return None;
+            }
+
+            Some(LanguageServerBinary {
+                path: node.binary_path().await.ok()?,
+                env: None,
+                arguments: typescript_server_binary_arguments(&server_path),
+            })
         }
-
-        if self
-            .node
-            .should_install_npm_package(
-                Self::SERVER_PACKAGE_NAME,
-                &server_path,
-                container_dir,
-                VersionStrategy::Latest(version.server_version.as_str()),
-            )
-            .await
-        {
-            return None;
-        }
-
-        Some(LanguageServerBinary {
-            path: self.node.binary_path().await.ok()?,
-            env: None,
-            arguments: typescript_server_binary_arguments(&server_path),
-        })
     }
 
-    async fn fetch_server_binary(
+    fn fetch_server_binary(
         &self,
-        latest_version: TypeScriptVersions,
+        latest_version: Self::BinaryVersion,
         container_dir: PathBuf,
-        _: &dyn LspAdapterDelegate,
-    ) -> Result<LanguageServerBinary> {
-        let server_path = container_dir.join(Self::NEW_SERVER_PATH);
+        _: &Arc<dyn LspAdapterDelegate>,
+    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+        let node = self.node.clone();
 
-        self.node
-            .npm_install_packages(
+        async move {
+            let server_path = container_dir.join(Self::NEW_SERVER_PATH);
+            let typescript_version = latest_version.typescript_version.to_string();
+
+            node.npm_install_packages(
                 &container_dir,
                 &[
-                    (Self::PACKAGE_NAME, latest_version.typescript_version.as_str()),
-                    (Self::SERVER_PACKAGE_NAME, latest_version.server_version.as_str()),
+                    (Self::PACKAGE_NAME, typescript_version.as_str()),
+                    (Self::SERVER_PACKAGE_NAME, "latest"),
                 ],
             )
             .await?;
 
-        Ok(LanguageServerBinary {
-            path: self.node.binary_path().await?,
-            env: None,
-            arguments: typescript_server_binary_arguments(&server_path),
-        })
+            Ok(LanguageServerBinary {
+                path: node.binary_path().await?,
+                env: None,
+                arguments: typescript_server_binary_arguments(&server_path),
+            })
+        }
     }
 
     async fn cached_server_binary(
@@ -706,11 +825,12 @@ impl LspAdapter for TypeScriptLspAdapter {
     async fn initialization_options(
         self: Arc<Self>,
         adapter: &Arc<dyn LspAdapterDelegate>,
+        _: &mut AsyncApp,
     ) -> Result<Option<serde_json::Value>> {
         let tsdk_path = self.tsdk_path(adapter).await;
         Ok(Some(json!({
             "provideFormatter": true,
-            "hostInfo": "gram",
+            "hostInfo": "zed",
             "tsserver": {
                 "path": tsdk_path,
             },
@@ -735,8 +855,9 @@ impl LspAdapter for TypeScriptLspAdapter {
         cx: &mut AsyncApp,
     ) -> Result<Value> {
         let override_options = cx.update(|cx| {
-            language_server_settings(delegate.as_ref(), &Self::SERVER_NAME, cx).and_then(|s| s.settings.clone())
-        })?;
+            language_server_settings(delegate.as_ref(), &Self::SERVER_NAME, cx)
+                .and_then(|s| s.settings.clone())
+        });
         if let Some(options) = override_options {
             return Ok(options);
         }
@@ -756,7 +877,10 @@ impl LspAdapter for TypeScriptLspAdapter {
     }
 }
 
-async fn get_cached_ts_server_binary(container_dir: PathBuf, node: &NodeRuntime) -> Option<LanguageServerBinary> {
+async fn get_cached_ts_server_binary(
+    container_dir: PathBuf,
+    node: &NodeRuntime,
+) -> Option<LanguageServerBinary> {
     maybe!(async {
         let old_server_path = container_dir.join(TypeScriptLspAdapter::OLD_SERVER_PATH);
         let new_server_path = container_dir.join(TypeScriptLspAdapter::NEW_SERVER_PATH);
@@ -784,19 +908,54 @@ async fn get_cached_ts_server_binary(container_dir: PathBuf, node: &NodeRuntime)
 mod tests {
     use std::path::Path;
 
-    use gpui::{AppContext as _, BackgroundExecutor, TestAppContext};
+    use gpui::{AppContext as _, BackgroundExecutor, Hsla, TestAppContext};
     use project::FakeFs;
+    use rope::Rope;
     use serde_json::json;
     use task::TaskTemplates;
+    use theme::SyntaxTheme;
     use unindent::Unindent;
     use util::{path, rel_path::rel_path};
 
-    use crate::typescript::{PackageJsonData, TypeScriptContextProvider, replace_test_name_parameters};
+    use crate::typescript::{
+        PackageJsonData, TypeScriptContextProvider, replace_test_name_parameters,
+    };
+
+    #[test]
+    fn test_class_instantiation_highlighting() {
+        let source = Rope::from("class Dog {}\nconst dog = new Dog();");
+        let theme = SyntaxTheme::new_test([("type", Hsla::blue()), ("type.class", Hsla::green())]);
+
+        for language in [
+            crate::language(
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
+            crate::language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
+            crate::language("javascript", tree_sitter_typescript::LANGUAGE_TSX.into()),
+        ] {
+            language.set_theme(&theme);
+            let class_highlight = language
+                .grammar()
+                .and_then(|grammar| grammar.highlight_id_for_name("type.class"))
+                .expect("type.class highlight should be defined");
+
+            assert_eq!(
+                language.highlight_text(&source, 0..source.len()),
+                vec![(6..9, class_highlight), (29..32, class_highlight)],
+                "{} class instantiations should use the type.class highlight",
+                language.name()
+            );
+        }
+    }
 
     #[gpui::test]
     async fn test_outline(cx: &mut TestAppContext) {
         for language in [
-            crate::language("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            crate::language(
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
             crate::language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ] {
             let text = r#"
@@ -837,7 +996,10 @@ mod tests {
     #[gpui::test]
     async fn test_outline_with_destructuring(cx: &mut TestAppContext) {
         for language in [
-            crate::language("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            crate::language(
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
             crate::language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ] {
             let text = r#"
@@ -913,7 +1075,10 @@ mod tests {
     #[gpui::test]
     async fn test_outline_with_object_properties(cx: &mut TestAppContext) {
         for language in [
-            crate::language("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            crate::language(
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
             crate::language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ] {
             let text = r#"
@@ -973,9 +1138,219 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_outline_with_nested_object_methods(cx: &mut TestAppContext) {
+        for language in [
+            crate::language(
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
+            crate::language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
+            crate::language("javascript", tree_sitter_typescript::LANGUAGE_TSX.into()),
+        ] {
+            let text = r#"
+            // Reproduction from https://github.com/zed-industries/zed/issues/48711
+            const a = {
+              p01: '01',
+              fn01: () => {},
+              fn02() {},
+              deep: {
+                subFn01: () => {},
+                subFn02() {},
+                subP03: '03',
+                deep2: {
+                  subFn01: () => {},
+                  subFn02() {},
+                  subP03: '03',
+                },
+              },
+            };
+
+            // Edge case: async methods in nested objects
+            const b = {
+              async topAsync() {},
+              nested: { async nestedAsync() {} },
+            };
+
+            // Edge case: object literal in function argument
+            foo({ bar() {}, inner: { baz() {} } });
+        "#
+            .unindent();
+
+            let buffer = cx.new(|cx| language::Buffer::local(text, cx).with_language(language, cx));
+            cx.run_until_parked();
+            let outline = buffer.read_with(cx, |buffer, _| buffer.snapshot().outline(None));
+
+            let items: Vec<_> = outline
+                .items
+                .iter()
+                .map(|item| (item.text.as_str(), item.depth))
+                .collect();
+
+            assert_eq!(
+                items,
+                &[
+                    ("const a", 0),
+                    ("p01", 1),
+                    ("fn01", 1),
+                    ("fn02()", 1),
+                    ("deep", 1),
+                    ("subFn01", 2),
+                    ("subFn02()", 2),
+                    ("subP03", 2),
+                    ("deep2", 2),
+                    ("subFn01", 3),
+                    ("subFn02()", 3),
+                    ("subP03", 3),
+                    ("const b", 0),
+                    ("async topAsync()", 1),
+                    ("nested", 1),
+                    ("async nestedAsync()", 2),
+                    ("bar()", 0),
+                    ("inner", 0),
+                    ("baz()", 1),
+                ]
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_outline_with_complex_nested_objects(cx: &mut TestAppContext) {
+        for language in [
+            crate::language(
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
+            crate::language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
+            crate::language("javascript", tree_sitter_typescript::LANGUAGE_TSX.into()),
+        ] {
+            let text = r#"
+            const config = {
+              init() {},
+              destroy() {},
+              api: {
+                baseUrl: "x",
+                fetchData() {},
+                async submitForm() {},
+                errorHandler() {},
+              },
+              features: {
+                auth: {
+                  login() {},
+                  logout() {},
+                  refreshToken() {},
+                },
+                cache: {
+                  get() {},
+                  set() {},
+                  invalidate() {},
+                },
+              },
+              watch: {
+                value() {},
+              },
+              computed: {
+                fullName() {},
+                displayValue() {},
+              },
+            };
+
+            registerPlugin({
+              name: "my-plugin",
+              setup() {},
+              teardown() {},
+              hooks: {
+                beforeMount() {},
+                mounted() {},
+                beforeUnmount() {},
+              },
+            });
+
+            export const store = {
+              state: {},
+              mutations: {
+                setUser() {},
+                clearUser() {},
+              },
+              actions: {
+                async fetchUser() {},
+                logout() {},
+              },
+              getters: {
+                currentUser() {},
+                isAuthenticated() {},
+              },
+            };
+
+            function registerPlugin(_plugin: unknown) {}
+        "#
+            .unindent();
+
+            let buffer = cx.new(|cx| language::Buffer::local(text, cx).with_language(language, cx));
+            cx.run_until_parked();
+            let outline = buffer.read_with(cx, |buffer, _| buffer.snapshot().outline(None));
+
+            let items: Vec<_> = outline
+                .items
+                .iter()
+                .map(|item| (item.text.as_str(), item.depth))
+                .collect();
+
+            assert_eq!(
+                items,
+                &[
+                    ("const config", 0),
+                    ("init()", 1),
+                    ("destroy()", 1),
+                    ("api", 1),
+                    ("baseUrl", 2),
+                    ("fetchData()", 2),
+                    ("async submitForm()", 2),
+                    ("errorHandler()", 2),
+                    ("features", 1),
+                    ("auth", 2),
+                    ("login()", 3),
+                    ("logout()", 3),
+                    ("refreshToken()", 3),
+                    ("cache", 2),
+                    ("get()", 3),
+                    ("set()", 3),
+                    ("invalidate()", 3),
+                    ("watch", 1),
+                    ("value()", 2),
+                    ("computed", 1),
+                    ("fullName()", 2),
+                    ("displayValue()", 2),
+                    ("name", 0),
+                    ("setup()", 0),
+                    ("teardown()", 0),
+                    ("hooks", 0),
+                    ("beforeMount()", 1),
+                    ("mounted()", 1),
+                    ("beforeUnmount()", 1),
+                    ("const store", 0),
+                    ("state", 1),
+                    ("mutations", 1),
+                    ("setUser()", 2),
+                    ("clearUser()", 2),
+                    ("actions", 1),
+                    ("async fetchUser()", 2),
+                    ("logout()", 2),
+                    ("getters", 1),
+                    ("currentUser()", 2),
+                    ("isAuthenticated()", 2),
+                    ("function registerPlugin( )", 0),
+                ]
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn test_outline_with_computed_property_names(cx: &mut TestAppContext) {
         for language in [
-            crate::language("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            crate::language(
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
             crate::language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ] {
             let text = r#"
@@ -1109,6 +1484,184 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_conditional_test_wrappers(cx: &mut TestAppContext) {
+        for language in [
+            crate::language(
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
+            crate::language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
+            crate::language("javascript", tree_sitter_typescript::LANGUAGE_TSX.into()),
+        ] {
+            let text = r#"
+                it.runIf(true)("runIf test", () => {
+                    true;
+                });
+
+                it.skipIf(false)("skipIf test", () => {
+                    true;
+                });
+
+                test.runIf(true)("runIf test 2", () => {
+                    true;
+                });
+
+                test.skipIf(false)("skipIf test 2", () => {
+                    true;
+                });
+
+                describe.runIf(true)("runIf describe", () => {
+                    it("inner test", () => {
+                        true;
+                    });
+                });
+
+                describe.skipIf(false)("skipIf describe", () => {
+                    it("inner test 2", () => {
+                        true;
+                    });
+                });
+
+                it.todoIf(false)("todoIf test", () => {
+                    true;
+                });
+
+                it.if(true)("if test", () => {
+                    true;
+                });
+
+                test.todoIf(false)("todoIf test 2", () => {
+                    true;
+                });
+
+                test.if(true)("if test 2", () => {
+                    true;
+                });
+
+                describe.todoIf(false)("todoIf describe", () => {
+                    it("inner todoIf", () => {
+                        true;
+                    });
+                });
+
+                describe.if(true)("if describe", () => {
+                    it("inner if", () => {
+                        true;
+                    });
+                });
+
+                test.failing("failing test", () => {
+                    true;
+                });
+
+                it.failing("failing it", () => {
+                    true;
+                });
+
+                it.each([1, 2, 3])("each test", () => {
+                    true;
+                });
+
+                describe.each([1, 2])("each describe", () => {
+                    it("inner each", () => {
+                        true;
+                    });
+                });
+
+                it.skip("skip test", () => {
+                    true;
+                });
+
+                it.only("only test", () => {
+                    true;
+                });
+
+                it.todo("todo test");
+            "#
+            .unindent();
+
+            let text_len = text.len();
+            let buffer = cx.new(|cx| language::Buffer::local(text, cx).with_language(language, cx));
+            cx.executor().run_until_parked();
+
+            let outline = buffer.update(cx, |buffer, _cx| buffer.snapshot().outline(None));
+            let outline_names = outline
+                .items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                outline_names,
+                [
+                    "runIf test",
+                    "skipIf test",
+                    "runIf test 2",
+                    "skipIf test 2",
+                    "runIf describe",
+                    "it inner test",
+                    "skipIf describe",
+                    "it inner test 2",
+                    "todoIf test",
+                    "if test",
+                    "todoIf test 2",
+                    "if test 2",
+                    "todoIf describe",
+                    "it inner todoIf",
+                    "if describe",
+                    "it inner if",
+                    "test.failing failing test",
+                    "it.failing failing it",
+                    "each test",
+                    "each describe",
+                    "it inner each",
+                    "it.skip skip test",
+                    "it.only only test",
+                    "it.todo todo test",
+                ]
+            );
+
+            let snapshot = buffer.update(cx, |buffer, _| buffer.snapshot());
+            let runnable_names = snapshot
+                .runnable_ranges(0..text_len)
+                .map(|runnable| {
+                    snapshot
+                        .text_for_range(runnable.run_range)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                runnable_names,
+                [
+                    "runIf test",
+                    "skipIf test",
+                    "runIf test 2",
+                    "skipIf test 2",
+                    "runIf describe",
+                    "inner test",
+                    "skipIf describe",
+                    "inner test 2",
+                    "todoIf test",
+                    "if test",
+                    "todoIf test 2",
+                    "if test 2",
+                    "todoIf describe",
+                    "inner todoIf",
+                    "if describe",
+                    "inner if",
+                    "failing test",
+                    "failing it",
+                    "each test",
+                    "each describe",
+                    "inner each",
+                    "skip test",
+                    "only test",
+                    "todo test",
+                ]
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn test_package_json_discovery(executor: BackgroundExecutor, cx: &mut TestAppContext) {
         cx.update(|cx| {
             settings::init(cx);
@@ -1151,7 +1704,12 @@ mod tests {
         let provider = TypeScriptContextProvider::new(fs.clone());
         let package_json_data = cx
             .update(|cx| {
-                provider.combined_package_json_data(fs.clone(), path!("/root").as_ref(), rel_path("sub/file1.js"), cx)
+                provider.combined_package_json_data(
+                    fs.clone(),
+                    path!("/root").as_ref(),
+                    rel_path("sub/file1.js"),
+                    cx,
+                )
             })
             .await
             .unwrap();
@@ -1165,8 +1723,14 @@ mod tests {
                 bun_package_path: None,
                 node_package_path: None,
                 scripts: [
-                    (Path::new(path!("/root/package.json")).into(), "test".to_owned()),
-                    (Path::new(path!("/root/sub/package.json")).into(), "test".to_owned())
+                    (
+                        Path::new(path!("/root/package.json")).into(),
+                        "test".to_owned()
+                    ),
+                    (
+                        Path::new(path!("/root/sub/package.json")).into(),
+                        "test".to_owned()
+                    )
                 ]
                 .into_iter()
                 .collect(),
@@ -1186,22 +1750,28 @@ mod tests {
             [
                 (
                     "vitest file test".into(),
-                    Some("$GRAM_CUSTOM_TYPESCRIPT_VITEST_PACKAGE_PATH".into()),
+                    Some("$ZED_CUSTOM_TYPESCRIPT_VITEST_PACKAGE_PATH".into()),
                 ),
                 (
-                    "vitest test $GRAM_SYMBOL".into(),
-                    Some("$GRAM_CUSTOM_TYPESCRIPT_VITEST_PACKAGE_PATH".into()),
+                    "vitest test $ZED_SYMBOL".into(),
+                    Some("$ZED_CUSTOM_TYPESCRIPT_VITEST_PACKAGE_PATH".into()),
                 ),
                 (
                     "mocha file test".into(),
-                    Some("$GRAM_CUSTOM_TYPESCRIPT_MOCHA_PACKAGE_PATH".into()),
+                    Some("$ZED_CUSTOM_TYPESCRIPT_MOCHA_PACKAGE_PATH".into()),
                 ),
                 (
-                    "mocha test $GRAM_SYMBOL".into(),
-                    Some("$GRAM_CUSTOM_TYPESCRIPT_MOCHA_PACKAGE_PATH".into()),
+                    "mocha test $ZED_SYMBOL".into(),
+                    Some("$ZED_CUSTOM_TYPESCRIPT_MOCHA_PACKAGE_PATH".into()),
                 ),
-                ("root/package.json > test".into(), Some(path!("/root").into())),
-                ("sub/package.json > test".into(), Some(path!("/root/sub").into())),
+                (
+                    "root/package.json > test".into(),
+                    Some(path!("/root").into())
+                ),
+                (
+                    "sub/package.json > test".into(),
+                    Some(path!("/root/sub").into())
+                ),
             ]
         );
     }
@@ -1248,7 +1818,10 @@ mod tests {
     // preferred testing mechanism. Between runtime-specific options, `bun test` is
     // typically preferred over `node --test` when @types/bun is present.
     #[gpui::test]
-    async fn test_task_ordering_with_multiple_test_runners(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    async fn test_task_ordering_with_multiple_test_runners(
+        executor: BackgroundExecutor,
+        cx: &mut TestAppContext,
+    ) {
         cx.update(|cx| {
             settings::init(cx);
         });
@@ -1283,7 +1856,12 @@ mod tests {
 
         let package_json_data = cx
             .update(|cx| {
-                provider.combined_package_json_data(fs.clone(), path!("/root").as_ref(), rel_path("file.js"), cx)
+                provider.combined_package_json_data(
+                    fs.clone(),
+                    path!("/root").as_ref(),
+                    rel_path("file.js"),
+                    cx,
+                )
             })
             .await
             .unwrap();
@@ -1302,17 +1880,28 @@ mod tests {
             .0
             .iter()
             .filter(|template| {
-                template.tags.contains(&"ts-test".to_owned()) || template.tags.contains(&"js-test".to_owned())
+                template.tags.contains(&"ts-test".to_owned())
+                    || template.tags.contains(&"js-test".to_owned())
             })
             .map(|template| &template.label)
             .collect();
 
-        let node_test_index = test_tasks.iter().position(|label| label.contains("node test"));
+        let node_test_index = test_tasks
+            .iter()
+            .position(|label| label.contains("node test"));
         let jest_test_index = test_tasks.iter().position(|label| label.contains("jest"));
-        let bun_test_index = test_tasks.iter().position(|label| label.contains("bun test"));
+        let bun_test_index = test_tasks
+            .iter()
+            .position(|label| label.contains("bun test"));
 
-        assert!(node_test_index.is_some(), "Node test tasks should be present");
-        assert!(jest_test_index.is_some(), "Jest test tasks should be present");
+        assert!(
+            node_test_index.is_some(),
+            "Node test tasks should be present"
+        );
+        assert!(
+            jest_test_index.is_some(),
+            "Jest test tasks should be present"
+        );
         assert!(bun_test_index.is_some(), "Bun test tasks should be present");
 
         assert!(

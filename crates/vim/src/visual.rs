@@ -10,6 +10,7 @@ use gpui::{Context, Window, actions};
 use language::{Point, Selection, SelectionGoal};
 use multi_buffer::MultiBufferRow;
 use search::BufferSearchBar;
+use text::TransactionId;
 use util::ResultExt;
 use workspace::searchable::Direction;
 
@@ -124,25 +125,33 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         }
     });
 
-    Vim::action(editor, cx, |vim, _: &SelectPreviousSyntaxNode, window, cx| {
-        let count = Vim::take_count(cx).unwrap_or(1);
-        Vim::take_forced_motion(cx);
-        for _ in 0..count {
-            vim.update_editor(cx, |_, editor, cx| {
-                editor.select_prev_syntax_node(&Default::default(), window, cx);
-            });
-        }
-    });
+    Vim::action(
+        editor,
+        cx,
+        |vim, _: &SelectPreviousSyntaxNode, window, cx| {
+            let count = Vim::take_count(cx).unwrap_or(1);
+            Vim::take_forced_motion(cx);
+            for _ in 0..count {
+                vim.update_editor(cx, |_, editor, cx| {
+                    editor.select_prev_syntax_node(&Default::default(), window, cx);
+                });
+            }
+        },
+    );
 
-    Vim::action(editor, cx, |vim, _: &SelectSmallerSyntaxNode, window, cx| {
-        let count = Vim::take_count(cx).unwrap_or(1);
-        Vim::take_forced_motion(cx);
-        for _ in 0..count {
-            vim.update_editor(cx, |_, editor, cx| {
-                editor.select_smaller_syntax_node(&Default::default(), window, cx);
-            });
-        }
-    });
+    Vim::action(
+        editor,
+        cx,
+        |vim, _: &SelectSmallerSyntaxNode, window, cx| {
+            let count = Vim::take_count(cx).unwrap_or(1);
+            Vim::take_forced_motion(cx);
+            for _ in 0..count {
+                vim.update_editor(cx, |_, editor, cx| {
+                    editor.select_smaller_syntax_node(&Default::default(), window, cx);
+                });
+            }
+        },
+    );
 
     Vim::action(editor, cx, |vim, _: &RestoreVisualSelection, window, cx| {
         let Some((stored_mode, reversed)) = vim.stored_visual_mode.take() else {
@@ -175,7 +184,8 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
                 let ranges = ranges
                     .into_iter()
                     .map(|(start, end, reversed)| {
-                        let mut new_end = movement::saturating_right(&map, end.to_display_point(&map));
+                        let mut new_end =
+                            movement::saturating_right(&map, end.to_display_point(&map));
                         let mut new_start = start.to_display_point(&map);
                         if new_start >= new_end {
                             if new_end.column() == 0 {
@@ -201,37 +211,53 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 }
 
 impl Vim {
-    pub fn visual_motion(&mut self, motion: Motion, times: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn visual_motion(
+        &mut self,
+        motion: Motion,
+        times: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.update_editor(cx, |vim, editor, cx| {
-            let text_layout_details = editor.text_layout_details(window);
-            if vim.mode == Mode::VisualBlock && !matches!(motion, Motion::EndOfLine { display_lines: false }) {
+            let text_layout_details = editor.text_layout_details(window, cx);
+            if vim.mode == Mode::VisualBlock
+                && !matches!(
+                    motion,
+                    Motion::EndOfLine {
+                        display_lines: false
+                    }
+                )
+            {
                 let is_up_or_down = matches!(motion, Motion::Up { .. } | Motion::Down { .. });
-                vim.visual_block_motion(is_up_or_down, editor, window, cx, |map, point, goal| {
-                    motion.move_point(map, point, goal, times, &text_layout_details)
-                })
+                vim.visual_block_motion(
+                    is_up_or_down,
+                    editor,
+                    window,
+                    cx,
+                    &mut |map, point, goal| {
+                        motion.move_point(map, point, goal, times, &text_layout_details)
+                    },
+                )
             } else {
                 editor.change_selections(Default::default(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let was_reversed = selection.reversed;
                         let mut current_head = selection.head();
 
                         // our motions assume the current character is after the cursor,
                         // but in (forward) visual mode the current character is just
                         // before the end of the selection.
-
-                        // If the file ends with a newline (which is common) we don't do this.
-                        // so that if you go to the end of such a file you can use "up" to go
-                        // to the previous line and have it work somewhat as expected.
-                        if !selection.reversed
-                            && !selection.is_empty()
-                            && !(selection.end.column() == 0 && selection.end == map.max_point())
-                        {
+                        if !selection.reversed && !selection.is_empty() {
                             current_head = movement::left(map, selection.end)
                         }
 
-                        let Some((new_head, goal)) =
-                            motion.move_point(map, current_head, selection.goal, times, &text_layout_details)
-                        else {
+                        let Some((new_head, goal)) = motion.move_point(
+                            map,
+                            current_head,
+                            selection.goal,
+                            times,
+                            &text_layout_details,
+                        ) else {
                             return;
                         };
 
@@ -245,9 +271,7 @@ impl Vim {
                                 movement::right(map, selection.end)
                             };
 
-                            if !(next_point.column() == 0 && next_point == map.max_point()) {
-                                selection.end = next_point;
-                            }
+                            selection.end = next_point;
                         }
 
                         // vim always ensures the anchor character stays selected.
@@ -270,13 +294,13 @@ impl Vim {
         editor: &mut Editor,
         window: &mut Window,
         cx: &mut Context<Editor>,
-        mut move_selection: impl FnMut(
+        move_selection: &mut dyn FnMut(
             &DisplaySnapshot,
             DisplayPoint,
             SelectionGoal,
         ) -> Option<(DisplayPoint, SelectionGoal)>,
     ) {
-        let text_layout_details = editor.text_layout_details(window);
+        let text_layout_details = editor.text_layout_details(window, cx);
         editor.change_selections(Default::default(), window, cx, |s| {
             let map = &s.display_snapshot();
             let mut head = s.newest_anchor().head().to_display_point(map);
@@ -298,7 +322,10 @@ impl Vim {
             }
 
             let reverse_aware_goal = if was_reversed {
-                SelectionGoal::HorizontalRange { start: end, end: start }
+                SelectionGoal::HorizontalRange {
+                    start: end,
+                    end: start,
+                }
             } else {
                 goal
             };
@@ -322,7 +349,11 @@ impl Vim {
                 head_x = map.x_for_display_point(head, &text_layout_details);
             }
 
-            let positions = if is_reversed { head_x..tail_x } else { tail_x..head_x };
+            let positions = if is_reversed {
+                head_x..tail_x
+            } else {
+                tail_x..head_x
+            };
 
             if !preserve_goal {
                 goal = SelectionGoal::HorizontalRange {
@@ -338,8 +369,12 @@ impl Vim {
 
             loop {
                 let laid_out_line = map.layout_row(row, &text_layout_details);
-                let start = DisplayPoint::new(row, laid_out_line.closest_index_for_x(positions.start) as u32);
-                let mut end = DisplayPoint::new(row, laid_out_line.closest_index_for_x(positions.end) as u32);
+                let start = DisplayPoint::new(
+                    row,
+                    laid_out_line.closest_index_for_x(positions.start) as u32,
+                );
+                let mut end =
+                    DisplayPoint::new(row, laid_out_line.closest_index_for_x(positions.end) as u32);
                 if end <= start {
                     if start.column() == map.line_len(start.row()) {
                         end = start;
@@ -382,7 +417,13 @@ impl Vim {
         })
     }
 
-    pub fn visual_object(&mut self, object: Object, count: Option<usize>, window: &mut Window, cx: &mut Context<Vim>) {
+    pub fn visual_object(
+        &mut self,
+        object: Object,
+        count: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Vim>,
+    ) {
         if let Some(Operator::Object { around }) = self.active_operator() {
             self.pop_operator(window, cx);
             let current_mode = self.mode;
@@ -393,8 +434,8 @@ impl Vim {
 
             self.update_editor(cx, |_, editor, cx| {
                 editor.change_selections(Default::default(), window, cx, |s| {
-                    s.move_with(|map, selection| {
-                        let mut mut_selection = selection.clone();
+                    s.move_with(&mut |map, selection| {
+                        let mut mut_selection = *selection;
 
                         // all our motions assume that the current character is
                         // after the cursor; however in the case of a visual selection
@@ -402,7 +443,10 @@ impl Vim {
                         // But this will affect the judgment of the html tag
                         // so the html tag needs to skip this logic.
                         if !selection.reversed && object != Object::Tag {
-                            mut_selection.set_head(movement::left(map, mut_selection.head()), mut_selection.goal);
+                            mut_selection.set_head(
+                                movement::left(map, mut_selection.head()),
+                                mut_selection.goal,
+                            );
                         }
 
                         let original_point = selection.tail().to_point(map);
@@ -418,7 +462,9 @@ impl Vim {
                                         && selection.end == range.end
                                         && object.always_expands_both_ways()
                                     {
-                                        if let Some(range) = object.range(map, selection.clone(), around, count) {
+                                        if let Some(range) =
+                                            object.range(map, *selection, around, count)
+                                        {
                                             selection.start = range.start;
                                             selection.end = range.end;
                                         }
@@ -462,17 +508,25 @@ impl Vim {
                                 if new_start_point.row == original_point.row {
                                     if selection.end.to_point(map).row > new_start_point.row {
                                         if original_point.column
-                                            == map.buffer_snapshot().line_len(MultiBufferRow(original_point.row))
+                                            == map
+                                                .buffer_snapshot()
+                                                .line_len(MultiBufferRow(original_point.row))
                                         {
-                                            selection.start =
-                                                movement::saturating_left(map, original_point.to_display_point(map))
+                                            selection.start = movement::saturating_left(
+                                                map,
+                                                original_point.to_display_point(map),
+                                            )
                                         } else {
                                             selection.start = original_point.to_display_point(map)
                                         }
                                     } else {
-                                        let original_display_point = original_point.to_display_point(map);
+                                        let original_display_point =
+                                            original_point.to_display_point(map);
                                         if selection.end <= original_display_point {
-                                            selection.end = movement::saturating_right(map, original_display_point);
+                                            selection.end = movement::saturating_right(
+                                                map,
+                                                original_display_point,
+                                            );
                                             if original_point.column > 0 {
                                                 selection.reversed = true
                                             }
@@ -487,11 +541,18 @@ impl Vim {
         }
     }
 
-    fn visual_insert_end_of_line(&mut self, _: &VisualInsertEndOfLine, window: &mut Window, cx: &mut Context<Self>) {
+    fn visual_insert_end_of_line(
+        &mut self,
+        _: &VisualInsertEndOfLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.update_editor(cx, |_, editor, cx| {
             editor.split_selection_into_lines(&Default::default(), window, cx);
             editor.change_selections(Default::default(), window, cx, |s| {
-                s.move_cursors_with(|map, cursor, _| (next_line_end(map, cursor, 1), SelectionGoal::None));
+                s.move_cursors_with(&mut |map, cursor, _| {
+                    (next_line_end(map, cursor, 1), SelectionGoal::None)
+                });
             });
         });
 
@@ -507,7 +568,12 @@ impl Vim {
         self.update_editor(cx, |_, editor, cx| {
             editor.split_selection_into_lines(&Default::default(), window, cx);
             editor.change_selections(Default::default(), window, cx, |s| {
-                s.move_cursors_with(|map, cursor, _| (first_non_whitespace(map, false, cursor), SelectionGoal::None));
+                s.move_cursors_with(&mut |map, cursor, _| {
+                    (
+                        first_non_whitespace(map, false, cursor),
+                        SelectionGoal::None,
+                    )
+                });
             });
         });
 
@@ -525,18 +591,23 @@ impl Vim {
     pub fn other_end(&mut self, _: &OtherEnd, window: &mut Window, cx: &mut Context<Self>) {
         self.update_editor(cx, |_, editor, cx| {
             editor.change_selections(Default::default(), window, cx, |s| {
-                s.move_with(|_, selection| {
+                s.move_with(&mut |_, selection| {
                     selection.reversed = !selection.reversed;
                 });
             })
         });
     }
 
-    pub fn other_end_row_aware(&mut self, _: &OtherEndRowAware, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn other_end_row_aware(
+        &mut self,
+        _: &OtherEndRowAware,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mode = self.mode;
         self.update_editor(cx, |_, editor, cx| {
             editor.change_selections(Default::default(), window, cx, |s| {
-                s.move_with(|_, selection| {
+                s.move_with(&mut |_, selection| {
                     selection.reversed = !selection.reversed;
                 });
                 if mode == Mode::VisualBlock {
@@ -546,16 +617,21 @@ impl Vim {
         });
     }
 
-    pub fn visual_delete(&mut self, line_mode: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn visual_delete(
+        &mut self,
+        line_mode: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<TransactionId> {
         self.store_visual_marks(window, cx);
-        self.update_editor(cx, |vim, editor, cx| {
+        let transaction_id = self.update_editor(cx, |vim, editor, cx| {
             let mut original_columns: HashMap<_, _> = Default::default();
             let line_mode = line_mode || editor.selections.line_mode();
             editor.selections.set_line_mode(false);
 
             editor.transact(window, cx, |editor, window, cx| {
                 editor.change_selections(Default::default(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         if line_mode {
                             let mut position = selection.head();
                             if !selection.reversed {
@@ -570,8 +646,11 @@ impl Vim {
                                 selection.start = map.prev_line_boundary(start).1;
                                 if end.column == 0 && end > start {
                                     let row = end.row.saturating_sub(1);
-                                    selection.end = Point::new(row, map.buffer_snapshot().line_len(MultiBufferRow(row)))
-                                        .to_display_point(map)
+                                    selection.end = Point::new(
+                                        row,
+                                        map.buffer_snapshot().line_len(MultiBufferRow(row)),
+                                    )
+                                    .to_display_point(map)
                                 } else {
                                     selection.end = map.next_line_boundary(end).1;
                                 }
@@ -589,7 +668,7 @@ impl Vim {
 
                 if line_mode && vim.mode != Mode::VisualBlock {
                     editor.change_selections(Default::default(), window, cx, |s| {
-                        s.move_with(|map, selection| {
+                        s.move_with(&mut |map, selection| {
                             let end = selection.end.to_point(map);
                             let start = selection.start.to_point(map);
                             if end.row < map.buffer_snapshot().max_point().row {
@@ -597,19 +676,21 @@ impl Vim {
                             } else if start.row > 0 {
                                 selection.start = Point::new(
                                     start.row - 1,
-                                    map.buffer_snapshot().line_len(MultiBufferRow(start.row - 1)),
+                                    map.buffer_snapshot()
+                                        .line_len(MultiBufferRow(start.row - 1)),
                                 )
                                 .to_display_point(map)
                             }
                         });
                     });
                 }
-                editor.insert("", window, cx);
+                editor.delete_selections_with_linked_edits(window, cx);
 
-                // Fixup cursor position after the deletion
-                editor.set_clip_at_line_ends(true, cx);
+                // Fixup cursor position after the deletion. Helix keeps the
+                // cursor on the trailing newline, so only clip in Vim modes.
+                editor.set_clip_at_line_ends(!vim.mode.is_helix(), cx);
                 editor.change_selections(Default::default(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let mut cursor = selection.head().to_point(map);
 
                         if let Some(column) = original_columns.get(&selection.id) {
@@ -624,7 +705,9 @@ impl Vim {
                 });
             })
         });
+        let transaction_id = transaction_id.flatten();
         self.switch_mode(Mode::Normal, true, window, cx);
+        transaction_id
     }
 
     pub fn visual_yank(&mut self, line_mode: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -635,13 +718,16 @@ impl Vim {
             // For visual line mode, adjust selections to avoid yanking the next line when on \n
             if line_mode && vim.mode != Mode::VisualBlock {
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let start = selection.start.to_point(map);
                         let end = selection.end.to_point(map);
                         if end.column == 0 && end > start {
                             let row = end.row.saturating_sub(1);
-                            selection.end = Point::new(row, map.buffer_snapshot().line_len(MultiBufferRow(row)))
-                                .to_display_point(map);
+                            selection.end = Point::new(
+                                row,
+                                map.buffer_snapshot().line_len(MultiBufferRow(row)),
+                            )
+                            .to_display_point(map);
                         }
                     });
                 });
@@ -655,7 +741,7 @@ impl Vim {
             };
             vim.yank_selections_content(editor, kind, window, cx);
             editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                s.move_with(|map, selection| {
+                s.move_with(&mut |map, selection| {
                     if line_mode {
                         selection.start = start_of_line(map, false, selection.start);
                     };
@@ -669,7 +755,12 @@ impl Vim {
         self.switch_mode(Mode::Normal, true, window, cx);
     }
 
-    pub(crate) fn visual_replace(&mut self, text: Arc<str>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn visual_replace(
+        &mut self,
+        text: Arc<str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.stop_recording(cx);
         self.update_editor(cx, |_, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
@@ -691,11 +782,16 @@ impl Vim {
 
                 let mut edits = Vec::new();
                 for selection in selections.iter() {
-                    let selection = selection.clone();
-                    for row_range in movement::split_display_range_by_lines(&display_map, selection.range()) {
+                    let selection = *selection;
+                    for row_range in
+                        movement::split_display_range_by_lines(&display_map, selection.range())
+                    {
                         let range = row_range.start.to_offset(&display_map, Bias::Right)
                             ..row_range.end.to_offset(&display_map, Bias::Right);
-                        let text = text.repeat(range.end - range.start);
+                        let grapheme_count = display_map
+                            .buffer_snapshot()
+                            .grapheme_count_for_range(&range);
+                        let text = text.repeat(grapheme_count);
                         edits.push((range, text));
                     }
                 }
@@ -711,20 +807,31 @@ impl Vim {
 
     pub fn select_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
         Vim::take_forced_motion(cx);
-        let count = Vim::take_count(cx).unwrap_or_else(|| if self.mode.is_visual() { 1 } else { 2 });
+        let count =
+            Vim::take_count(cx).unwrap_or_else(|| if self.mode.is_visual() { 1 } else { 2 });
         self.update_editor(cx, |_, editor, cx| {
             editor.set_clip_at_line_ends(false, cx);
             for _ in 0..count {
-                if editor.select_next(&Default::default(), window, cx).log_err().is_none() {
+                if editor
+                    .select_next(&Default::default(), window, cx)
+                    .log_err()
+                    .is_none()
+                {
                     break;
                 }
             }
         });
     }
 
-    pub fn select_previous(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn select_previous(
+        &mut self,
+        _: &SelectPrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         Vim::take_forced_motion(cx);
-        let count = Vim::take_count(cx).unwrap_or_else(|| if self.mode.is_visual() { 1 } else { 2 });
+        let count =
+            Vim::take_count(cx).unwrap_or_else(|| if self.mode.is_visual() { 1 } else { 2 });
         self.update_editor(cx, |_, editor, cx| {
             for _ in 0..count {
                 if editor
@@ -738,7 +845,12 @@ impl Vim {
         });
     }
 
-    pub fn select_match(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn select_match(
+        &mut self,
+        direction: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         Vim::take_forced_motion(cx);
         let count = Vim::take_count(cx).unwrap_or(1);
         let Some(pane) = self.pane(window, cx) else {
@@ -753,7 +865,8 @@ impl Vim {
         });
         if vim_is_normal {
             pane.update(cx, |pane, cx| {
-                if let Some(search_bar) = pane.toolbar().read(cx).item_of_type::<BufferSearchBar>() {
+                if let Some(search_bar) = pane.toolbar().read(cx).item_of_type::<BufferSearchBar>()
+                {
                     search_bar.update(cx, |search_bar, cx| {
                         if !search_bar.has_active_match() || !search_bar.show(window, cx) {
                             return;
@@ -784,6 +897,9 @@ impl Vim {
             }
         });
         if !match_exists {
+            self.update_editor(cx, |_, editor, _| {
+                editor.set_collapse_matches(true);
+            });
             self.clear_operator(window, cx);
             self.stop_replaying(cx);
             return;
@@ -812,7 +928,7 @@ impl Vim {
             Some(Operator::Change) => self.substitute(None, false, window, cx),
             Some(Operator::Delete) => {
                 self.stop_recording(cx);
-                self.visual_delete(false, window, cx)
+                self.visual_delete(false, window, cx);
             }
             Some(Operator::Yank) => self.visual_yank(false, window, cx),
             _ => {} // Ignoring other operators
@@ -822,8 +938,91 @@ impl Vim {
 #[cfg(test)]
 mod test {
     use indoc::indoc;
+    use workspace::item::Item;
 
-    use crate::{state::Mode, test::VimTestContext};
+    use crate::{
+        state::Mode,
+        test::{NeovimBackedTestContext, VimTestContext},
+    };
+
+    #[gpui::test]
+    async fn test_enter_visual_mode(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "The ˇquick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        let cursor = cx.update_editor(|editor, _, cx| editor.pixel_position_of_cursor(cx));
+
+        // entering visual mode should select the character
+        // under cursor
+        cx.simulate_shared_keystrokes("v").await;
+        cx.shared_state()
+            .await
+            .assert_eq(indoc! { "The «qˇ»uick brown
+            fox jumps over
+            the lazy dog"});
+        cx.update_editor(|editor, _, cx| assert_eq!(cursor, editor.pixel_position_of_cursor(cx)));
+
+        // forwards motions should extend the selection
+        cx.simulate_shared_keystrokes("w j").await;
+        cx.shared_state().await.assert_eq(indoc! { "The «quick brown
+            fox jumps oˇ»ver
+            the lazy dog"});
+
+        cx.simulate_shared_keystrokes("escape").await;
+        cx.shared_state().await.assert_eq(indoc! { "The quick brown
+            fox jumps ˇover
+            the lazy dog"});
+
+        // motions work backwards
+        cx.simulate_shared_keystrokes("v k b").await;
+        cx.shared_state()
+            .await
+            .assert_eq(indoc! { "The «ˇquick brown
+            fox jumps o»ver
+            the lazy dog"});
+
+        // works on empty lines
+        cx.set_shared_state(indoc! {"
+            a
+            ˇ
+            b
+            "})
+            .await;
+        let cursor = cx.update_editor(|editor, _, cx| editor.pixel_position_of_cursor(cx));
+        cx.simulate_shared_keystrokes("v").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            a
+            «
+            ˇ»b
+        "});
+        cx.update_editor(|editor, _, cx| assert_eq!(cursor, editor.pixel_position_of_cursor(cx)));
+
+        // toggles off again
+        cx.simulate_shared_keystrokes("v").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            a
+            ˇ
+            b
+            "});
+
+        // works at the end of a document
+        cx.set_shared_state(indoc! {"
+            a
+            b
+            ˇ"})
+            .await;
+
+        cx.simulate_shared_keystrokes("v").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            a
+            b
+            ˇ"});
+    }
 
     #[gpui::test]
     async fn test_visual_insert_first_non_whitespace(cx: &mut gpui::TestAppContext) {
@@ -872,6 +1071,686 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_enter_visual_line_mode(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "The ˇquick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("shift-v").await;
+        cx.shared_state()
+            .await
+            .assert_eq(indoc! { "The «qˇ»uick brown
+            fox jumps over
+            the lazy dog"});
+        cx.simulate_shared_keystrokes("x").await;
+        cx.shared_state().await.assert_eq(indoc! { "fox ˇjumps over
+        the lazy dog"});
+
+        // it should work on empty lines
+        cx.set_shared_state(indoc! {"
+            a
+            ˇ
+            b"})
+            .await;
+        cx.simulate_shared_keystrokes("shift-v").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            a
+            «
+            ˇ»b"});
+        cx.simulate_shared_keystrokes("x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            a
+            ˇb"});
+
+        // it should work at the end of the document
+        cx.set_shared_state(indoc! {"
+            a
+            b
+            ˇ"})
+            .await;
+        let cursor = cx.update_editor(|editor, _, cx| editor.pixel_position_of_cursor(cx));
+        cx.simulate_shared_keystrokes("shift-v").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            a
+            b
+            ˇ"});
+        cx.update_editor(|editor, _, cx| assert_eq!(cursor, editor.pixel_position_of_cursor(cx)));
+        cx.simulate_shared_keystrokes("x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            a
+            ˇb"});
+    }
+
+    #[gpui::test]
+    async fn test_visual_delete(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.simulate("v w", "The quick ˇbrown")
+            .await
+            .assert_matches();
+
+        cx.simulate("v w x", "The quick ˇbrown")
+            .await
+            .assert_matches();
+        cx.simulate(
+            "v w j x",
+            indoc! {"
+                The ˇquick brown
+                fox jumps over
+                the lazy dog"},
+        )
+        .await
+        .assert_matches();
+        // Test pasting code copied on delete
+        cx.simulate_shared_keystrokes("j p").await;
+        cx.shared_state().await.assert_matches();
+
+        cx.simulate_at_each_offset(
+            "v w j x",
+            indoc! {"
+                The ˇquick brown
+                fox jumps over
+                the ˇlazy dog"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate_at_each_offset(
+            "v b k x",
+            indoc! {"
+                The ˇquick brown
+                fox jumps ˇover
+                the ˇlazy dog"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_visual_line_delete(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {"
+                The quˇick brown
+                fox jumps over
+                the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("shift-v x").await;
+        cx.shared_state().await.assert_matches();
+
+        // Test pasting code copied on delete
+        cx.simulate_shared_keystrokes("p").await;
+        cx.shared_state().await.assert_matches();
+
+        cx.set_shared_state(indoc! {"
+                The quick brown
+                fox jumps over
+                the laˇzy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("shift-v x").await;
+        cx.shared_state().await.assert_matches();
+        cx.shared_clipboard().await.assert_eq("the lazy dog\n");
+
+        cx.set_shared_state(indoc! {"
+                                The quˇick brown
+                                fox jumps over
+                                the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("shift-v j x").await;
+        cx.shared_state().await.assert_matches();
+        // Test pasting code copied on delete
+        cx.simulate_shared_keystrokes("p").await;
+        cx.shared_state().await.assert_matches();
+
+        cx.set_shared_state(indoc! {"
+            The ˇlong line
+            should not
+            crash
+            "})
+            .await;
+        cx.simulate_shared_keystrokes("shift-v $ x").await;
+        cx.shared_state().await.assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_visual_yank(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("The quick ˇbrown").await;
+        cx.simulate_shared_keystrokes("v w y").await;
+        cx.shared_state().await.assert_eq("The quick ˇbrown");
+        cx.shared_clipboard().await.assert_eq("brown");
+
+        cx.set_shared_state(indoc! {"
+                The ˇquick brown
+                fox jumps over
+                the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("v w j y").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    The ˇquick brown
+                    fox jumps over
+                    the lazy dog"});
+        cx.shared_clipboard().await.assert_eq(indoc! {"
+                quick brown
+                fox jumps o"});
+
+        cx.set_shared_state(indoc! {"
+                    The quick brown
+                    fox jumps over
+                    the ˇlazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("v w j y").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    The quick brown
+                    fox jumps over
+                    the ˇlazy dog"});
+        cx.shared_clipboard().await.assert_eq("lazy d");
+        cx.simulate_shared_keystrokes("shift-v y").await;
+        cx.shared_clipboard().await.assert_eq("the lazy dog\n");
+
+        cx.set_shared_state(indoc! {"
+                    The ˇquick brown
+                    fox jumps over
+                    the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("v b k y").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    ˇThe quick brown
+                    fox jumps over
+                    the lazy dog"});
+        assert_eq!(
+            cx.read_from_clipboard()
+                .map(|item| item.text().unwrap())
+                .unwrap(),
+            "The q"
+        );
+
+        cx.set_shared_state(indoc! {"
+                    The quick brown
+                    fox ˇjumps over
+                    the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("shift-v shift-g shift-y")
+            .await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    The quick brown
+                    ˇfox jumps over
+                    the lazy dog"});
+        cx.shared_clipboard()
+            .await
+            .assert_eq("fox jumps over\nthe lazy dog\n");
+
+        cx.set_shared_state(indoc! {"
+                    The quick brown
+                    fox ˇjumps over
+                    the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("shift-v $ shift-y").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    The quick brown
+                    ˇfox jumps over
+                    the lazy dog"});
+        cx.shared_clipboard().await.assert_eq("fox jumps over\n");
+    }
+
+    #[gpui::test]
+    async fn test_visual_block_mode(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "The ˇquick brown
+             fox jumps over
+             the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("ctrl-v").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «qˇ»uick brown
+            fox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("2 down").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «qˇ»uick brown
+            fox «jˇ»umps over
+            the «lˇ»azy dog"
+        });
+        cx.simulate_shared_keystrokes("e").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «quicˇ»k brown
+            fox «jumpˇ»s over
+            the «lazyˇ» dog"
+        });
+        cx.simulate_shared_keystrokes("^").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "«ˇThe q»uick brown
+            «ˇfox j»umps over
+            «ˇthe l»azy dog"
+        });
+        cx.simulate_shared_keystrokes("$").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «quick brownˇ»
+            fox «jumps overˇ»
+            the «lazy dogˇ»"
+        });
+        cx.simulate_shared_keystrokes("shift-f space").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «quickˇ» brown
+            fox «jumpsˇ» over
+            the «lazy ˇ»dog"
+        });
+
+        // toggling through visual mode works as expected
+        cx.simulate_shared_keystrokes("v").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «quick brown
+            fox jumps over
+            the lazy ˇ»dog"
+        });
+        cx.simulate_shared_keystrokes("ctrl-v").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «quickˇ» brown
+            fox «jumpsˇ» over
+            the «lazy ˇ»dog"
+        });
+
+        cx.set_shared_state(indoc! {
+            "The ˇquick
+             brown
+             fox
+             jumps over the
+
+             lazy dog
+            "
+        })
+        .await;
+        cx.simulate_shared_keystrokes("ctrl-v down down").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The«ˇ q»uick
+            bro«ˇwn»
+            foxˇ
+            jumps over the
+
+            lazy dog
+            "
+        });
+        cx.simulate_shared_keystrokes("down").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «qˇ»uick
+            brow«nˇ»
+            fox
+            jump«sˇ» over the
+
+            lazy dog
+            "
+        });
+        cx.simulate_shared_keystrokes("left").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The«ˇ q»uick
+            bro«ˇwn»
+            foxˇ
+            jum«ˇps» over the
+
+            lazy dog
+            "
+        });
+        cx.simulate_shared_keystrokes("s o escape").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "Theˇouick
+            broo
+            foxo
+            jumo over the
+
+            lazy dog
+            "
+        });
+
+        // https://github.com/zed-industries/zed/issues/6274
+        cx.set_shared_state(indoc! {
+            "Theˇ quick brown
+
+            fox jumps over
+            the lazy dog
+            "
+        })
+        .await;
+        cx.simulate_shared_keystrokes("l ctrl-v j j").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «qˇ»uick brown
+
+            fox «jˇ»umps over
+            the lazy dog
+            "
+        });
+    }
+
+    #[gpui::test]
+    async fn test_visual_block_issue_2123(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "The ˇquick brown
+            fox jumps over
+            the lazy dog
+            "
+        })
+        .await;
+        cx.simulate_shared_keystrokes("ctrl-v right down").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «quˇ»ick brown
+            fox «juˇ»mps over
+            the lazy dog
+            "
+        });
+    }
+    #[gpui::test]
+    async fn test_visual_block_mode_down_right(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+            The ˇquick brown
+            fox jumps over
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("ctrl-v l l l l l j").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The «quick ˇ»brown
+            fox «jumps ˇ»over
+            the lazy dog"});
+    }
+
+    #[gpui::test]
+    async fn test_visual_block_mode_up_left(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+            The quick brown
+            fox jumpsˇ over
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("ctrl-v h h h h h k").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The «ˇquick »brown
+            fox «ˇjumps »over
+            the lazy dog"});
+    }
+
+    #[gpui::test]
+    async fn test_visual_block_mode_other_end(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+            The quick brown
+            fox jˇumps over
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("ctrl-v l l l l j").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            fox j«umps ˇ»over
+            the l«azy dˇ»og"});
+        cx.simulate_shared_keystrokes("o k").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The q«ˇuick »brown
+            fox j«ˇumps »over
+            the l«ˇazy d»og"});
+    }
+
+    #[gpui::test]
+    async fn test_visual_block_mode_shift_other_end(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+            The quick brown
+            fox jˇumps over
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("ctrl-v l l l l j").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            fox j«umps ˇ»over
+            the l«azy dˇ»og"});
+        cx.simulate_shared_keystrokes("shift-o k").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            fox j«ˇumps »over
+            the lazy dog"});
+    }
+
+    #[gpui::test]
+    async fn test_visual_block_insert(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "ˇThe quick brown
+            fox jumps over
+            the lazy dog
+            "
+        })
+        .await;
+        cx.simulate_shared_keystrokes("ctrl-v 9 down").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "«Tˇ»he quick brown
+            «fˇ»ox jumps over
+            «tˇ»he lazy dog
+            ˇ"
+        });
+
+        cx.simulate_shared_keystrokes("shift-i k escape").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇkThe quick brown
+            kfox jumps over
+            kthe lazy dog
+            k"
+        });
+
+        cx.set_shared_state(indoc! {
+            "ˇThe quick brown
+            fox jumps over
+            the lazy dog
+            "
+        })
+        .await;
+        cx.simulate_shared_keystrokes("ctrl-v 9 down").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "«Tˇ»he quick brown
+            «fˇ»ox jumps over
+            «tˇ»he lazy dog
+            ˇ"
+        });
+        cx.simulate_shared_keystrokes("c k escape").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇkhe quick brown
+            kox jumps over
+            khe lazy dog
+            k"
+        });
+    }
+
+    #[gpui::test]
+    async fn test_visual_block_insert_after_ctrl_d_scroll(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        let shared_state_lines = (1..=10)
+            .map(|line_number| format!("{line_number:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let shared_state = format!("ˇ{shared_state_lines}\n");
+
+        cx.set_scroll_height(5).await;
+        cx.set_shared_state(&shared_state).await;
+
+        cx.simulate_shared_keystrokes("ctrl-v ctrl-d").await;
+        cx.shared_state().await.assert_matches();
+
+        cx.simulate_shared_keystrokes("shift-i x escape").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "
+            ˇx01
+            x02
+            x03
+            x04
+            x05
+            06
+            07
+            08
+            09
+            10
+            "
+        });
+    }
+
+    #[gpui::test]
+    async fn test_visual_block_wrapping_selection(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // Ensure that the editor is wrapping lines at 12 columns so that each
+        // of the lines ends up being wrapped.
+        cx.set_shared_wrap(12).await;
+        cx.set_shared_state(indoc! {
+            "ˇ12345678901234567890
+            12345678901234567890
+            12345678901234567890
+            "
+        })
+        .await;
+        cx.simulate_shared_keystrokes("ctrl-v j").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "«1ˇ»2345678901234567890
+            «1ˇ»2345678901234567890
+            12345678901234567890
+            "
+        });
+
+        // Test with lines taking up different amounts of display rows to ensure
+        // that, even in that case, only the buffer rows are taken into account.
+        cx.set_shared_state(indoc! {
+            "ˇ123456789012345678901234567890123456789012345678901234567890
+            1234567890123456789012345678901234567890
+            12345678901234567890
+            "
+        })
+        .await;
+        cx.simulate_shared_keystrokes("ctrl-v 2 j").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "«1ˇ»23456789012345678901234567890123456789012345678901234567890
+            «1ˇ»234567890123456789012345678901234567890
+            «1ˇ»2345678901234567890
+            "
+        });
+
+        // Same scenario as above, but using the up motion to ensure that the
+        // result is the same.
+        cx.set_shared_state(indoc! {
+            "123456789012345678901234567890123456789012345678901234567890
+            1234567890123456789012345678901234567890
+            ˇ12345678901234567890
+            "
+        })
+        .await;
+        cx.simulate_shared_keystrokes("ctrl-v 2 k").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "«1ˇ»23456789012345678901234567890123456789012345678901234567890
+            «1ˇ»234567890123456789012345678901234567890
+            «1ˇ»2345678901234567890
+            "
+        });
+    }
+
+    #[gpui::test]
+    async fn test_visual_object(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("hello (in [parˇens] o)").await;
+        cx.simulate_shared_keystrokes("ctrl-v l").await;
+        cx.simulate_shared_keystrokes("a ]").await;
+        cx.shared_state()
+            .await
+            .assert_eq("hello (in «[parens]ˇ» o)");
+        cx.simulate_shared_keystrokes("i (").await;
+        cx.shared_state()
+            .await
+            .assert_eq("hello («in [parens] oˇ»)");
+
+        cx.set_shared_state("hello in a wˇord again.").await;
+        cx.simulate_shared_keystrokes("ctrl-v l i w").await;
+        cx.shared_state()
+            .await
+            .assert_eq("hello in a w«ordˇ» again.");
+        assert_eq!(cx.mode(), Mode::VisualBlock);
+        cx.simulate_shared_keystrokes("o a s").await;
+        cx.shared_state()
+            .await
+            .assert_eq("«ˇhello in a word» again.");
+    }
+
+    #[gpui::test]
+    async fn test_visual_object_expands(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "{
+                {
+               ˇ }
+            }
+            {
+            }
+            "
+        })
+        .await;
+        cx.simulate_shared_keystrokes("v l").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "{
+                {
+               « }ˇ»
+            }
+            {
+            }
+            "
+        });
+        cx.simulate_shared_keystrokes("a {").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "{
+                «{
+                }ˇ»
+            }
+            {
+            }
+            "
+        });
+        cx.simulate_shared_keystrokes("a {").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "«{
+                {
+                }
+            }ˇ»
+            {
+            }
+            "
+        });
+        // cx.simulate_shared_keystrokes("a {").await;
+        // cx.shared_state().await.assert_eq(indoc! {
+        //     "{
+        //         «{
+        //         }ˇ»
+        //     }
+        //     {
+        //     }
+        //     "
+        // });
+    }
+
+    #[gpui::test]
+    async fn test_visual_move_trailing_newline(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        cx.set_state("This is a newlinˇe\n", Mode::Normal);
+        cx.simulate_keystrokes("v");
+        cx.assert_state("This is a newlin«eˇ»\n", Mode::Visual);
+        cx.simulate_keystrokes("l");
+        cx.assert_state("This is a newlin«e\nˇ»", Mode::Visual);
+    }
+
+    #[gpui::test]
     async fn test_mode_across_command(cx: &mut gpui::TestAppContext) {
         let mut cx = VimTestContext::new(cx, true).await;
 
@@ -883,6 +1762,35 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_gn(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("aaˇ aa aa aa aa").await;
+        cx.simulate_shared_keystrokes("/ a a enter").await;
+        cx.shared_state().await.assert_eq("aa ˇaa aa aa aa");
+        cx.simulate_shared_keystrokes("g n").await;
+        cx.shared_state().await.assert_eq("aa «aaˇ» aa aa aa");
+        cx.simulate_shared_keystrokes("g n").await;
+        cx.shared_state().await.assert_eq("aa «aa aaˇ» aa aa");
+        cx.simulate_shared_keystrokes("escape d g n").await;
+        cx.shared_state().await.assert_eq("aa aa ˇ aa aa");
+
+        cx.set_shared_state("aaˇ aa aa aa aa").await;
+        cx.simulate_shared_keystrokes("/ a a enter").await;
+        cx.shared_state().await.assert_eq("aa ˇaa aa aa aa");
+        cx.simulate_shared_keystrokes("3 g n").await;
+        cx.shared_state().await.assert_eq("aa aa aa «aaˇ» aa");
+
+        cx.set_shared_state("aaˇ aa aa aa aa").await;
+        cx.simulate_shared_keystrokes("/ a a enter").await;
+        cx.shared_state().await.assert_eq("aa ˇaa aa aa aa");
+        cx.simulate_shared_keystrokes("g shift-n").await;
+        cx.shared_state().await.assert_eq("aa «ˇaa» aa aa aa");
+        cx.simulate_shared_keystrokes("g shift-n").await;
+        cx.shared_state().await.assert_eq("«ˇaa aa» aa aa aa");
+    }
+
+    #[gpui::test]
     async fn test_gl(cx: &mut gpui::TestAppContext) {
         let mut cx = VimTestContext::new(cx, true).await;
 
@@ -891,6 +1799,207 @@ mod test {
         cx.assert_state("«aaˇ» «aaˇ»\naa", Mode::Visual);
         cx.simulate_keystrokes("g >");
         cx.assert_state("«aaˇ» aa\n«aaˇ»", Mode::Visual);
+    }
+
+    #[gpui::test]
+    async fn test_dgn_repeat(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("aaˇ aa aa aa aa").await;
+        cx.simulate_shared_keystrokes("/ a a enter").await;
+        cx.shared_state().await.assert_eq("aa ˇaa aa aa aa");
+        cx.simulate_shared_keystrokes("d g n").await;
+
+        cx.shared_state().await.assert_eq("aa ˇ aa aa aa");
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq("aa  ˇ aa aa");
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq("aa   ˇ aa");
+    }
+
+    #[gpui::test]
+    async fn test_cgn_repeat(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("aaˇ aa aa aa aa").await;
+        cx.simulate_shared_keystrokes("/ a a enter").await;
+        cx.shared_state().await.assert_eq("aa ˇaa aa aa aa");
+        cx.simulate_shared_keystrokes("c g n x escape").await;
+        cx.shared_state().await.assert_eq("aa ˇx aa aa aa");
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq("aa x ˇx aa aa");
+    }
+
+    #[gpui::test]
+    async fn test_cgn_nomatch(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("aaˇ aa aa aa aa").await;
+        cx.simulate_shared_keystrokes("/ b b enter").await;
+        cx.shared_state().await.assert_eq("aaˇ aa aa aa aa");
+        cx.simulate_shared_keystrokes("c g n x escape").await;
+        cx.shared_state().await.assert_eq("aaˇaa aa aa aa");
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq("aaˇa aa aa aa");
+
+        cx.set_shared_state("aaˇ bb aa aa aa").await;
+        cx.simulate_shared_keystrokes("/ b b enter").await;
+        cx.shared_state().await.assert_eq("aa ˇbb aa aa aa");
+        cx.simulate_shared_keystrokes("c g n x escape").await;
+        cx.shared_state().await.assert_eq("aa ˇx aa aa aa");
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq("aa ˇx aa aa aa");
+    }
+
+    #[gpui::test]
+    async fn test_visual_shift_d(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "The ˇquick brown
+            fox jumps over
+            the lazy dog
+            "
+        })
+        .await;
+        cx.simulate_shared_keystrokes("v down shift-d").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "the ˇlazy dog\n"
+        });
+
+        cx.set_shared_state(indoc! {
+            "The ˇquick brown
+            fox jumps over
+            the lazy dog
+            "
+        })
+        .await;
+        cx.simulate_shared_keystrokes("ctrl-v down shift-d").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "Theˇ•
+            fox•
+            the lazy dog
+            "
+        });
+    }
+
+    #[gpui::test]
+    async fn test_shift_y(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "The ˇquick brown\n"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("v i w shift-y").await;
+        cx.shared_clipboard().await.assert_eq(indoc! {
+            "The quick brown\n"
+        });
+    }
+
+    #[gpui::test]
+    async fn test_gv(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "The ˇquick brown"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("v i w escape g v").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «quickˇ» brown"
+        });
+
+        cx.simulate_shared_keystrokes("o escape g v").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «ˇquick» brown"
+        });
+
+        cx.simulate_shared_keystrokes("escape ^ ctrl-v l").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "«Thˇ»e quick brown"
+        });
+        cx.simulate_shared_keystrokes("g v").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The «ˇquick» brown"
+        });
+        cx.simulate_shared_keystrokes("g v").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "«Thˇ»e quick brown"
+        });
+
+        cx.set_state(
+            indoc! {"
+            fiˇsh one
+            fish two
+            fish red
+            fish blue
+        "},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("4 g l escape escape g v");
+        cx.assert_state(
+            indoc! {"
+                «fishˇ» one
+                «fishˇ» two
+                «fishˇ» red
+                «fishˇ» blue
+            "},
+            Mode::Visual,
+        );
+        cx.simulate_keystrokes("y g v");
+        cx.assert_state(
+            indoc! {"
+                «fishˇ» one
+                «fishˇ» two
+                «fishˇ» red
+                «fishˇ» blue
+            "},
+            Mode::Visual,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_p_g_v_y(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "The
+            quicˇk
+            brown
+            fox"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("y y j shift-v p g v y").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "The
+            quick
+            ˇquick
+            fox"
+        });
+        cx.shared_clipboard().await.assert_eq("quick\n");
+    }
+
+    #[gpui::test]
+    async fn test_v2ap(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "The
+            quicˇk
+
+            brown
+            fox"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("v 2 a p").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "«The
+            quick
+
+            brown
+            fˇ»ox"
+        });
     }
 
     #[gpui::test]
@@ -924,5 +2033,22 @@ mod test {
         // The specific behavior of syntax sibling selection in vim mode
         // would depend on the key bindings configured, but the actions
         // are now available for use
+    }
+
+    #[gpui::test]
+    async fn test_visual_replace_uses_graphemes(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        cx.set_state("«Hällöˇ» Wörld", Mode::Visual);
+        cx.simulate_keystrokes("r 1");
+        cx.assert_state("ˇ11111 Wörld", Mode::Normal);
+
+        cx.set_state("«e\u{301}ˇ»", Mode::Visual);
+        cx.simulate_keystrokes("r 1");
+        cx.assert_state("ˇ1", Mode::Normal);
+
+        cx.set_state("«🙂ˇ»", Mode::Visual);
+        cx.simulate_keystrokes("r 1");
+        cx.assert_state("ˇ1", Mode::Normal);
     }
 }

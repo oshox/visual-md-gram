@@ -1,4 +1,4 @@
-//! The Gram Rust Extension API allows you write extensions in Rust.
+//! The Zed Rust Extension API allows you write extensions for [Zed](https://zed.dev/) in Rust.
 
 pub mod http_client;
 pub mod process;
@@ -15,20 +15,28 @@ pub use serde_json;
 // We explicitly enumerate the symbols we want to re-export, as there are some
 // that we may want to shadow to provide a cleaner Rust API.
 pub use wit::{
-    CodeLabel, CodeLabelSpan, CodeLabelSpanLiteral, Command, DownloadedFileType, EnvVars, KeyValueStore,
-    LanguageServerInstallationStatus, Project, Range, Worktree, download_file, make_file_executable,
+    CodeLabel, CodeLabelSpan, CodeLabelSpanLiteral, Command, DownloadedFileType, EnvVars,
+    KeyValueStore, LanguageServerInstallationStatus, Project, Range, Worktree, download_file,
+    make_file_executable,
+    zed::extension::context_server::ContextServerConfiguration,
     zed::extension::dap::{
-        AttachRequest, BuildTaskDefinition, BuildTaskDefinitionTemplatePayload, BuildTaskTemplate, DebugAdapterBinary,
-        DebugConfig, DebugRequest, DebugScenario, DebugTaskDefinition, LaunchRequest, StartDebuggingRequestArguments,
-        StartDebuggingRequestArgumentsRequest, TaskTemplate, TcpArguments, TcpArgumentsTemplate, resolve_tcp_template,
+        AttachRequest, BuildTaskDefinition, BuildTaskDefinitionTemplatePayload, BuildTaskTemplate,
+        DebugAdapterBinary, DebugConfig, DebugRequest, DebugScenario, DebugTaskDefinition,
+        LaunchRequest, StartDebuggingRequestArguments, StartDebuggingRequestArgumentsRequest,
+        TaskTemplate, TcpArguments, TcpArgumentsTemplate, resolve_tcp_template,
     },
     zed::extension::github::{
-        GithubRelease, GithubReleaseAsset, GithubReleaseOptions, github_release_by_tag_name, latest_github_release,
+        GithubRelease, GithubReleaseAsset, GithubReleaseOptions, github_release_by_tag_name,
+        latest_github_release,
     },
     zed::extension::nodejs::{
-        node_binary_path, npm_install_package, npm_package_installed_version, npm_package_latest_version,
+        node_binary_path, npm_install_package, npm_package_installed_version,
+        npm_package_latest_version,
     },
     zed::extension::platform::{Architecture, Os, current_platform},
+    zed::extension::slash_command::{
+        SlashCommand, SlashCommandArgumentCompletion, SlashCommandOutput, SlashCommandOutputSection,
+    },
 };
 
 // Undocumented WIT re-exports.
@@ -41,10 +49,12 @@ pub use wit::Guest;
 /// Constructs for interacting with language servers over the
 /// Language Server Protocol (LSP).
 pub mod lsp {
-    pub use crate::wit::zed::extension::lsp::{Completion, CompletionKind, InsertTextFormat, Symbol, SymbolKind};
+    pub use crate::wit::zed::extension::lsp::{
+        Completion, CompletionKind, InsertTextFormat, Symbol, SymbolKind,
+    };
 }
 
-/// A result returned from a Gram extension.
+/// A result returned from a Zed extension.
 pub type Result<T, E = String> = core::result::Result<T, E>;
 
 /// Updates the installation status for the given language server.
@@ -55,7 +65,7 @@ pub fn set_language_server_installation_status(
     wit::set_language_server_installation_status(&language_server_id.0, status)
 }
 
-/// A Gram extension.
+/// A Zed extension.
 pub trait Extension: Send + Sync {
     /// Returns a new instance of the extension.
     fn new() -> Self
@@ -90,6 +100,28 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
+    /// Returns the JSON schema for the initialization options.
+    ///
+    /// The schema must conform to the JSON Schema speification.
+    fn language_server_initialization_options_schema(
+        &mut self,
+        _language_server_id: &LanguageServerId,
+        _worktree: &Worktree,
+    ) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Returns the JSON schema for the workspace configuration.
+    ///
+    /// The schema must conform to the JSON Schema specification.
+    fn language_server_workspace_configuration_schema(
+        &mut self,
+        _language_server_id: &LanguageServerId,
+        _worktree: &Worktree,
+    ) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Returns the initialization options to pass to the other language server.
     fn language_server_additional_initialization_options(
         &mut self,
@@ -120,8 +152,49 @@ pub trait Extension: Send + Sync {
     }
 
     /// Returns the label for the given symbol.
-    fn label_for_symbol(&self, _language_server_id: &LanguageServerId, _symbol: Symbol) -> Option<CodeLabel> {
+    fn label_for_symbol(
+        &self,
+        _language_server_id: &LanguageServerId,
+        _symbol: Symbol,
+    ) -> Option<CodeLabel> {
         None
+    }
+
+    /// Returns the completions that should be shown when completing the provided slash command with the given query.
+    fn complete_slash_command_argument(
+        &self,
+        _command: SlashCommand,
+        _args: Vec<String>,
+    ) -> Result<Vec<SlashCommandArgumentCompletion>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Returns the output from running the provided slash command.
+    fn run_slash_command(
+        &self,
+        _command: SlashCommand,
+        _args: Vec<String>,
+        _worktree: Option<&Worktree>,
+    ) -> Result<SlashCommandOutput, String> {
+        Err("`run_slash_command` not implemented".to_string())
+    }
+
+    /// Returns the command used to start a context server.
+    fn context_server_command(
+        &mut self,
+        _context_server_id: &ContextServerId,
+        _project: &Project,
+    ) -> Result<Command> {
+        Err("`context_server_command` not implemented".to_string())
+    }
+
+    /// Returns the configuration options for the specified context server.
+    fn context_server_configuration(
+        &mut self,
+        _context_server_id: &ContextServerId,
+        _project: &Project,
+    ) -> Result<Option<ContextServerConfiguration>> {
+        Ok(None)
     }
 
     /// Returns a list of package names as suggestions to be included in the
@@ -134,7 +207,12 @@ pub trait Extension: Send + Sync {
     }
 
     /// Indexes the docs for the specified package.
-    fn index_docs(&self, _provider: String, _package: String, _database: &KeyValueStore) -> Result<(), String> {
+    fn index_docs(
+        &self,
+        _provider: String,
+        _package: String,
+        _database: &KeyValueStore,
+    ) -> Result<(), String> {
         Err("`index_docs` not implemented".to_string())
     }
 
@@ -167,10 +245,10 @@ pub trait Extension: Send + Sync {
         Err("`dap_config_to_scenario` not implemented".to_string())
     }
 
-    /// Locators are entities that convert a Gram task into a debug scenario.
+    /// Locators are entities that convert a Zed task into a debug scenario.
     ///
     /// They can be provided even by extensions that don't provide a debug adapter.
-    /// For all tasks applicable to a given buffer, Gram will query all locators to find one that can turn the task into a debug scenario.
+    /// For all tasks applicable to a given buffer, Zed will query all locators to find one that can turn the task into a debug scenario.
     /// A converted debug scenario can include a build task (it shouldn't contain any configuration in such case); a build task result will later
     /// be resolved with [`Extension::run_dap_locator`].
     ///
@@ -182,7 +260,7 @@ pub trait Extension: Send + Sync {
     ///    found the artifact path by themselves.
     ///
     /// Note that you're not obliged to use build tasks with locators. Specifically, it is sufficient to provide a debug configuration directly in the return value of
-    /// `dap_locator_create_scenario` if you're able to do that. Make sure to not fill out `build` field in that case, as that will prevent Gram from running second phase of resolution in such case.
+    /// `dap_locator_create_scenario` if you're able to do that. Make sure to not fill out `build` field in that case, as that will prevent Zed from running second phase of resolution in such case.
     /// This might be of particular relevance to interpreted languages.
     fn dap_locator_create_scenario(
         &mut self,
@@ -196,12 +274,16 @@ pub trait Extension: Send + Sync {
 
     /// Runs the second phase of locator resolution.
     /// See [`Extension::dap_locator_create_scenario`] for a hefty comment on locators.
-    fn run_dap_locator(&mut self, _locator_name: String, _build_task: TaskTemplate) -> Result<DebugRequest, String> {
+    fn run_dap_locator(
+        &mut self,
+        _locator_name: String,
+        _build_task: TaskTemplate,
+    ) -> Result<DebugRequest, String> {
         Err("`run_dap_locator` not implemented".to_string())
     }
 }
 
-/// Registers the provided type as a Gram extension.
+/// Registers the provided type as a Zed extension.
 ///
 /// The type must implement the [`Extension`] trait.
 #[macro_export]
@@ -244,9 +326,9 @@ macro_rules! register_extension {
             #[cfg(target_os = "wasi")]
             wasi_ext::init_cwd();
 
-            zed_extension_api::register_extension(
-                || Box::new(<$extension_type as zed_extension_api::Extension>::new()),
-            );
+            zed_extension_api::register_extension(|| {
+                Box::new(<$extension_type as zed_extension_api::Extension>::new())
+            });
         }
     };
 }
@@ -266,15 +348,14 @@ fn extension() -> &'static mut dyn Extension {
 static mut EXTENSION: Option<Box<dyn Extension>> = None;
 
 #[cfg(target_arch = "wasm32")]
-#[unsafe(link_section = "gram:api-version")]
+#[unsafe(link_section = "zed:api-version")]
 #[doc(hidden)]
-pub static GRAM_API_VERSION: [u8; 6] = *include_bytes!(concat!(env!("OUT_DIR"), "/version_bytes"));
+pub static ZED_API_VERSION: [u8; 6] = *include_bytes!(concat!(env!("OUT_DIR"), "/version_bytes"));
 
 mod wit {
-
     wit_bindgen::generate!({
         skip: ["init-extension"],
-        path: "./wit/since_v0.6.0",
+        path: "./wit/since_v0.8.0",
     });
 }
 
@@ -283,7 +364,10 @@ wit::export!(Component);
 struct Component;
 
 impl wit::Guest for Component {
-    fn language_server_command(language_server_id: String, worktree: &wit::Worktree) -> Result<wit::Command> {
+    fn language_server_command(
+        language_server_id: String,
+        worktree: &wit::Worktree,
+    ) -> Result<wit::Command> {
         let language_server_id = LanguageServerId(language_server_id);
         extension().language_server_command(&language_server_id, worktree)
     }
@@ -306,6 +390,26 @@ impl wit::Guest for Component {
         Ok(extension()
             .language_server_workspace_configuration(&language_server_id, worktree)?
             .and_then(|value| serde_json::to_string(&value).ok()))
+    }
+
+    fn language_server_initialization_options_schema(
+        language_server_id: String,
+        worktree: &Worktree,
+    ) -> Option<String> {
+        let language_server_id = LanguageServerId(language_server_id);
+        extension()
+            .language_server_initialization_options_schema(&language_server_id, worktree)
+            .and_then(|value| serde_json::to_string(&value).ok())
+    }
+
+    fn language_server_workspace_configuration_schema(
+        language_server_id: String,
+        worktree: &Worktree,
+    ) -> Option<String> {
+        let language_server_id = LanguageServerId(language_server_id);
+        extension()
+            .language_server_workspace_configuration_schema(&language_server_id, worktree)
+            .and_then(|value| serde_json::to_string(&value).ok())
     }
 
     fn language_server_additional_initialization_options(
@@ -356,7 +460,10 @@ impl wit::Guest for Component {
         Ok(labels)
     }
 
-    fn labels_for_symbols(language_server_id: String, symbols: Vec<Symbol>) -> Result<Vec<Option<CodeLabel>>, String> {
+    fn labels_for_symbols(
+        language_server_id: String,
+        symbols: Vec<Symbol>,
+    ) -> Result<Vec<Option<CodeLabel>>, String> {
         let language_server_id = LanguageServerId(language_server_id);
         let mut labels = Vec::new();
         for (ix, symbol) in symbols.into_iter().enumerate() {
@@ -369,11 +476,46 @@ impl wit::Guest for Component {
         Ok(labels)
     }
 
+    fn complete_slash_command_argument(
+        command: SlashCommand,
+        args: Vec<String>,
+    ) -> Result<Vec<SlashCommandArgumentCompletion>, String> {
+        extension().complete_slash_command_argument(command, args)
+    }
+
+    fn run_slash_command(
+        command: SlashCommand,
+        args: Vec<String>,
+        worktree: Option<&Worktree>,
+    ) -> Result<SlashCommandOutput, String> {
+        extension().run_slash_command(command, args, worktree)
+    }
+
+    fn context_server_command(
+        context_server_id: String,
+        project: &Project,
+    ) -> Result<wit::Command> {
+        let context_server_id = ContextServerId(context_server_id);
+        extension().context_server_command(&context_server_id, project)
+    }
+
+    fn context_server_configuration(
+        context_server_id: String,
+        project: &Project,
+    ) -> Result<Option<ContextServerConfiguration>, String> {
+        let context_server_id = ContextServerId(context_server_id);
+        extension().context_server_configuration(&context_server_id, project)
+    }
+
     fn suggest_docs_packages(provider: String) -> Result<Vec<String>, String> {
         extension().suggest_docs_packages(provider)
     }
 
-    fn index_docs(provider: String, package: String, database: &KeyValueStore) -> Result<(), String> {
+    fn index_docs(
+        provider: String,
+        package: String,
+        database: &KeyValueStore,
+    ) -> Result<(), String> {
         extension().index_docs(provider, package, database)
     }
 
@@ -386,7 +528,10 @@ impl wit::Guest for Component {
         extension().get_dap_binary(adapter_name, config, user_installed_path, worktree)
     }
 
-    fn dap_request_kind(adapter_name: String, config: String) -> Result<StartDebuggingRequestArgumentsRequest, String> {
+    fn dap_request_kind(
+        adapter_name: String,
+        config: String,
+    ) -> Result<StartDebuggingRequestArgumentsRequest, String> {
         extension().dap_request_kind(
             adapter_name,
             serde_json::from_str(&config).map_err(|e| format!("Failed to parse config: {e}"))?,
@@ -401,9 +546,17 @@ impl wit::Guest for Component {
         resolved_label: String,
         debug_adapter_name: String,
     ) -> Option<DebugScenario> {
-        extension().dap_locator_create_scenario(locator_name, build_task, resolved_label, debug_adapter_name)
+        extension().dap_locator_create_scenario(
+            locator_name,
+            build_task,
+            resolved_label,
+            debug_adapter_name,
+        )
     }
-    fn run_dap_locator(locator_name: String, build_task: TaskTemplate) -> Result<DebugRequest, String> {
+    fn run_dap_locator(
+        locator_name: String,
+        build_task: TaskTemplate,
+    ) -> Result<DebugRequest, String> {
         extension().run_dap_locator(locator_name, build_task)
     }
 }
@@ -412,6 +565,12 @@ impl wit::Guest for Component {
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
 pub struct LanguageServerId(String);
 
+impl LanguageServerId {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
 impl AsRef<str> for LanguageServerId {
     fn as_ref(&self) -> &str {
         &self.0
@@ -419,6 +578,28 @@ impl AsRef<str> for LanguageServerId {
 }
 
 impl fmt::Display for LanguageServerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// The ID of a context server.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+pub struct ContextServerId(String);
+
+impl ContextServerId {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for ContextServerId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ContextServerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }

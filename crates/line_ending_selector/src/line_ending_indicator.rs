@@ -1,8 +1,10 @@
 use editor::Editor;
-use gpui::{Entity, Subscription, WeakEntity};
+use gpui::{App, Entity, Subscription, WeakEntity};
 use language::LineEnding;
 use ui::{Tooltip, prelude::*};
-use workspace::{StatusBarSettings, StatusItemView, item::ItemHandle, item::Settings};
+use workspace::{
+    HideStatusItem, StatusBarSettings, StatusItemView, item::ItemHandle, item::Settings,
+};
 
 use crate::{LineEndingSelector, Toggle};
 
@@ -18,7 +20,7 @@ impl LineEndingIndicator {
         self.line_ending = None;
         self.active_editor = None;
 
-        if let Some((_, buffer, _)) = editor.read(cx).active_excerpt(cx) {
+        if let Some(buffer) = editor.read(cx).active_buffer(cx) {
             let line_ending = buffer.read(cx).line_ending();
             self.line_ending = Some(line_ending);
             self.active_editor = Some(editor.downgrade());
@@ -33,12 +35,12 @@ impl Render for LineEndingIndicator {
         if !StatusBarSettings::get_global(cx).line_endings_button {
             return div();
         }
-        let icon_size = StatusBarSettings::get_global(cx).icon_size;
 
         div().when_some(self.line_ending.as_ref(), |el, line_ending| {
             el.child(
                 Button::new("change-line-ending", line_ending.label())
-                    .label_size(icon_size.label_size())
+                    .label_size(LabelSize::Small)
+                    .tab_index(0isize)
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(editor) = this.active_editor.as_ref() {
                             LineEndingSelector::toggle(editor, window, cx);
@@ -65,5 +67,14 @@ impl StatusItemView for LineEndingIndicator {
             self._observe_active_editor = None;
         }
         cx.notify();
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        Some(HideStatusItem::new(|settings| {
+            settings
+                .status_bar
+                .get_or_insert_default()
+                .line_endings_button = Some(false);
+        }))
     }
 }

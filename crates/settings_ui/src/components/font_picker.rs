@@ -13,13 +13,13 @@ pub struct FontPickerDelegate {
     filtered_fonts: Vec<StringMatch>,
     selected_index: usize,
     current_font: SharedString,
-    on_font_changed: Arc<dyn Fn(SharedString, &mut App) + 'static>,
+    on_font_changed: Arc<dyn Fn(SharedString, &mut Window, &mut App) + 'static>,
 }
 
 impl FontPickerDelegate {
     fn new(
         current_font: SharedString,
-        on_font_changed: impl Fn(SharedString, &mut App) + 'static,
+        on_font_changed: impl Fn(SharedString, &mut Window, &mut App) + 'static,
         cx: &mut Context<FontPicker>,
     ) -> Self {
         let font_family_cache = FontFamilyCache::global(cx);
@@ -27,7 +27,10 @@ impl FontPickerDelegate {
         let fonts = font_family_cache
             .try_list_font_families()
             .unwrap_or_else(|| vec![current_font.clone()]);
-        let selected_index = fonts.iter().position(|font| *font == current_font).unwrap_or(0);
+        let selected_index = fonts
+            .iter()
+            .position(|font| *font == current_font)
+            .unwrap_or(0);
 
         let filtered_fonts = fonts
             .iter()
@@ -53,6 +56,10 @@ impl FontPickerDelegate {
 impl PickerDelegate for FontPickerDelegate {
     type ListItem = AnyElement;
 
+    fn name() -> &'static str {
+        "font picker"
+    }
+
     fn match_count(&self) -> usize {
         self.filtered_fonts.len()
     }
@@ -70,7 +77,12 @@ impl PickerDelegate for FontPickerDelegate {
         "Search fonts…".into()
     }
 
-    fn update_matches(&mut self, query: String, _window: &mut Window, cx: &mut Context<FontPicker>) -> Task<()> {
+    fn update_matches(
+        &mut self,
+        query: String,
+        _window: &mut Window,
+        cx: &mut Context<FontPicker>,
+    ) -> Task<()> {
         let fonts = self.fonts.clone();
         let current_font = self.current_font.clone();
 
@@ -106,7 +118,10 @@ impl PickerDelegate for FontPickerDelegate {
         };
 
         let selected_index = if query.is_empty() {
-            fonts.iter().position(|font| *font == current_font).unwrap_or(0)
+            fonts
+                .iter()
+                .position(|font| *font == current_font)
+                .unwrap_or(0)
         } else {
             matches
                 .iter()
@@ -121,10 +136,10 @@ impl PickerDelegate for FontPickerDelegate {
         Task::ready(())
     }
 
-    fn confirm(&mut self, _secondary: bool, _window: &mut Window, cx: &mut Context<FontPicker>) {
+    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<FontPicker>) {
         if let Some(font_match) = self.filtered_fonts.get(self.selected_index) {
             let font = font_match.string.clone();
-            (self.on_font_changed)(font.into(), cx);
+            (self.on_font_changed)(font.into(), window, cx);
         }
     }
 
@@ -157,7 +172,7 @@ impl PickerDelegate for FontPickerDelegate {
 
 pub fn font_picker(
     current_font: SharedString,
-    on_font_changed: impl Fn(SharedString, &mut App) + 'static,
+    on_font_changed: impl Fn(SharedString, &mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut Context<FontPicker>,
 ) -> FontPicker {
@@ -165,6 +180,7 @@ pub fn font_picker(
 
     Picker::uniform_list(delegate, window, cx)
         .show_scrollbar(true)
-        .width(rems_from_px(210.0_f32))
-        .max_height(Some(rems(18.).into()))
+        .initial_width(rems_from_px(210_f32))
+        .max_height(rems(18.))
+        .popover()
 }

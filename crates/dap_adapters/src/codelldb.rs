@@ -1,13 +1,13 @@
-use std::{path::PathBuf, sync::OnceLock};
+use std::{env::consts, path::PathBuf, sync::OnceLock};
 
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use collections::HashMap;
-use dap::{adapters::DebugTaskDefinition, settings::DapSettings};
+use dap::adapters::{DebugTaskDefinition, latest_github_release};
 use futures::StreamExt;
 use gpui::AsyncApp;
 use serde_json::Value;
-use task::{DebugRequest, DebugScenario, GramDebugConfig};
+use task::{DebugRequest, DebugScenario, ZedDebugConfig};
 use util::fs::remove_matching;
 
 use crate::*;
@@ -31,19 +31,26 @@ impl CodeLldbDebugAdapter {
             .context("CodeLLDB is not a valid json object")?;
 
         // CodeLLDB uses `name` for a terminal label.
-        obj.entry("name").or_insert(Value::String(String::from(label)));
+        obj.entry("name")
+            .or_insert(Value::String(String::from(label)));
 
         obj.entry("cwd")
             .or_insert(delegate.worktree_root_path().to_string_lossy().into());
 
         let request = self.request_kind(&configuration).await?;
 
-        Ok(dap::StartDebuggingRequestArguments { request, configuration })
+        Ok(dap::StartDebuggingRequestArguments {
+            request,
+            configuration,
+        })
     }
 
-    async fn fetch_latest_adapter_version(&self, delegate: &Arc<dyn DapDelegate>) -> Result<AdapterVersion> {
+    async fn fetch_latest_adapter_version(
+        &self,
+        delegate: &Arc<dyn DapDelegate>,
+    ) -> Result<AdapterVersion> {
         let release =
-            http_client::github::latest_github_release("vadimcn/codelldb", true, false, delegate.http_client()).await?;
+            latest_github_release("vadimcn/codelldb", true, false, delegate.http_client()).await?;
 
         let arch = match std::env::consts::ARCH {
             "aarch64" => "arm64",
@@ -82,17 +89,20 @@ impl DebugAdapter for CodeLldbDebugAdapter {
         DebugAdapterName(Self::ADAPTER_NAME.into())
     }
 
-    async fn config_from_gram_format(&self, gram_scenario: GramDebugConfig) -> Result<DebugScenario> {
+    async fn config_from_zed_format(&self, zed_scenario: ZedDebugConfig) -> Result<DebugScenario> {
         let mut configuration = json!({
-            "request": match gram_scenario.request {
+            "request": match zed_scenario.request {
                 DebugRequest::Launch(_) => "launch",
                 DebugRequest::Attach(_) => "attach",
             },
         });
         let map = configuration.as_object_mut().unwrap();
         // CodeLLDB uses `name` for a terminal label.
-        map.insert("name".into(), Value::String(String::from(gram_scenario.label.as_ref())));
-        match &gram_scenario.request {
+        map.insert(
+            "name".into(),
+            Value::String(String::from(zed_scenario.label.as_ref())),
+        );
+        match &zed_scenario.request {
             DebugRequest::Attach(attach) => {
                 map.insert("pid".into(), attach.process_id.into());
             }
@@ -105,7 +115,7 @@ impl DebugAdapter for CodeLldbDebugAdapter {
                 if !launch.env.is_empty() {
                     map.insert("env".into(), launch.env_json());
                 }
-                if let Some(stop_on_entry) = gram_scenario.stop_on_entry {
+                if let Some(stop_on_entry) = zed_scenario.stop_on_entry {
                     map.insert("stopOnEntry".into(), stop_on_entry.into());
                 }
                 if let Some(cwd) = launch.cwd.as_ref() {
@@ -115,8 +125,8 @@ impl DebugAdapter for CodeLldbDebugAdapter {
         }
 
         Ok(DebugScenario {
-            adapter: gram_scenario.adapter,
-            label: gram_scenario.label,
+            adapter: zed_scenario.adapter,
+            label: zed_scenario.label,
             config: configuration,
             build: None,
             tcp_connection: None,
@@ -321,21 +331,13 @@ impl DebugAdapter for CodeLldbDebugAdapter {
         user_installed_path: Option<PathBuf>,
         user_args: Option<Vec<String>>,
         user_env: Option<HashMap<String, String>>,
-        settings: &DapSettings,
         _: &mut AsyncApp,
     ) -> Result<DebugAdapterBinary> {
-        if user_installed_path.is_none() && settings.ignore_system_version {
-            anyhow::bail!("No user provided codelldb binary and ignore_system_version not set");
-        }
-
         let mut command = user_installed_path
             .map(|p| p.to_string_lossy().into_owned())
             .or(self.path_to_codelldb.get().cloned());
 
         if command.is_none() {
-            if !settings.allow_binary_download {
-                anyhow::bail!("No installed codelldb binary found and allow_binary_download not set");
-            }
             delegate.output_to_console(format!("Checking latest version of {}...", self.name()));
             let adapter_path = paths::debug_adapters_dir().join(&Self::ADAPTER_NAME);
             let version_path = match self.fetch_latest_adapter_version(delegate).await {
@@ -347,14 +349,18 @@ impl DebugAdapter for CodeLldbDebugAdapter {
                         delegate.as_ref(),
                     )
                     .await?;
-                    let version_path = adapter_path.join(format!("{}_{}", Self::ADAPTER_NAME, version.tag_name));
+                    let version_path =
+                        adapter_path.join(format!("{}_{}", Self::ADAPTER_NAME, version.tag_name));
                     remove_matching(&adapter_path, |entry| entry != version_path).await;
                     version_path
                 }
                 Err(e) => {
                     delegate.output_to_console("Unable to fetch latest version".to_string());
                     log::error!("Error fetching latest version of {}: {}", self.name(), e);
-                    delegate.output_to_console(format!("Searching for adapters in: {}", adapter_path.display()));
+                    delegate.output_to_console(format!(
+                        "Searching for adapters in: {}",
+                        adapter_path.display()
+                    ));
                     let mut paths = delegate
                         .fs()
                         .read_dir(&adapter_path)
@@ -368,20 +374,40 @@ impl DebugAdapter for CodeLldbDebugAdapter {
                 }
             };
             let adapter_dir = version_path.join("extension").join("adapter");
-            let path = adapter_dir.join("codelldb").to_string_lossy().into_owned();
+            let path = adapter_dir
+                .join(format!("codelldb{}", consts::EXE_SUFFIX))
+                .to_string_lossy()
+                .into_owned();
             self.path_to_codelldb.set(path.clone()).ok();
             command = Some(path);
         };
         let mut json_config = config.config.clone();
+
+        // Auto-detect Rust projects and add sourceLanguages if not present.
+        // This enables panic breakpoints to work correctly with CodeLLDB.
+        if let Some(config_obj) = json_config.as_object_mut() {
+            if !config_obj.contains_key("sourceLanguages") {
+                // Check if this looks like a Rust binary (Cargo build output)
+                if let Some(program) = config_obj.get("program").and_then(|p| p.as_str()) {
+                    let path_str = program.replace('\\', "/");
+                    if path_str.contains("/target/debug/") || path_str.contains("/target/release/")
+                    {
+                        config_obj.insert("sourceLanguages".to_owned(), json!(["rust"]));
+                    }
+                }
+            }
+        }
 
         Ok(DebugAdapterBinary {
             command: Some(command.unwrap()),
             cwd: Some(delegate.worktree_root_path().to_path_buf()),
             arguments: user_args.unwrap_or_else(|| {
                 if let Some(config) = json_config.as_object_mut()
-                    && let Some(source_languages) = config
-                        .get("sourceLanguages")
-                        .filter(|value| value.as_array().is_some_and(|array| array.iter().all(Value::is_string)))
+                    && let Some(source_languages) = config.get("sourceLanguages").filter(|value| {
+                        value
+                            .as_array()
+                            .is_some_and(|array| array.iter().all(Value::is_string))
+                    })
                 {
                     let ret = vec![
                         "--settings".into(),
@@ -393,7 +419,9 @@ impl DebugAdapter for CodeLldbDebugAdapter {
                     vec![]
                 }
             }),
-            request_args: self.request_args(delegate, json_config, &config.label).await?,
+            request_args: self
+                .request_args(delegate, json_config, &config.label)
+                .await?,
             envs: user_env.unwrap_or_default(),
             connection: None,
         })

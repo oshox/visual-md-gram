@@ -1,9 +1,13 @@
-use gpui::{ClipboardItem, Context, Empty, EventEmitter, IntoElement, ParentElement, Render, SharedString, Window};
+use gpui::{
+    App, Context, Empty, EventEmitter, IntoElement, ParentElement, Render, SharedString, Window,
+};
 use settings::Settings;
 use ui::{Button, Tooltip, prelude::*};
 use util::paths::PathStyle;
 
-use crate::{StatusItemView, item::ItemHandle, workspace_settings::StatusBarSettings};
+use crate::{
+    HideStatusItem, StatusItemView, item::ItemHandle, workspace_settings::StatusBarSettings,
+};
 
 pub struct ActiveFileName {
     project_path: Option<SharedString>,
@@ -21,9 +25,7 @@ impl ActiveFileName {
 
 impl Render for ActiveFileName {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let icon_size = StatusBarSettings::get_global(cx).icon_size;
-
-        if !StatusBarSettings::get_global(cx).active_file {
+        if !StatusBarSettings::get_global(cx).show_active_file {
             return Empty.into_any_element();
         }
 
@@ -31,17 +33,16 @@ impl Render for ActiveFileName {
             return Empty.into_any_element();
         };
 
-        let tooltip_text = self.full_path.clone().unwrap_or_else(|| project_path.clone());
+        let tooltip_text = self
+            .full_path
+            .clone()
+            .unwrap_or_else(|| project_path.clone());
 
         div()
             .child(
                 Button::new("active-file-name-button", project_path)
-                    .label_size(icon_size.label_size())
-                    .color(Color::Hidden)
-                    .tooltip(Tooltip::text(tooltip_text.clone()))
-                    .on_click(move |_event, _window, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(tooltip_text.to_string()));
-                    }),
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text(tooltip_text)),
             )
             .into_any_element()
     }
@@ -66,5 +67,11 @@ impl StatusItemView for ActiveFileName {
             self.full_path = None;
         }
         cx.notify();
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        Some(HideStatusItem::new(|settings| {
+            settings.status_bar.get_or_insert_default().show_active_file = Some(false);
+        }))
     }
 }

@@ -25,7 +25,7 @@ pub struct VsCodeTokenColorSettings {
 }
 
 #[derive(Debug, PartialEq, Copy, Clone, EnumIter)]
-pub enum GramSyntaxToken {
+pub enum ZedSyntaxToken {
     Attribute,
     Boolean,
     Comment,
@@ -67,57 +67,57 @@ pub enum GramSyntaxToken {
     Variant,
 }
 
-impl std::fmt::Display for GramSyntaxToken {
+impl std::fmt::Display for ZedSyntaxToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "{}",
             match self {
-                GramSyntaxToken::Attribute => "attribute",
-                GramSyntaxToken::Boolean => "boolean",
-                GramSyntaxToken::Comment => "comment",
-                GramSyntaxToken::CommentDoc => "comment.doc",
-                GramSyntaxToken::Constant => "constant",
-                GramSyntaxToken::Constructor => "constructor",
-                GramSyntaxToken::Embedded => "embedded",
-                GramSyntaxToken::Emphasis => "emphasis",
-                GramSyntaxToken::EmphasisStrong => "emphasis.strong",
-                GramSyntaxToken::Enum => "enum",
-                GramSyntaxToken::Function => "function",
-                GramSyntaxToken::Hint => "hint",
-                GramSyntaxToken::Keyword => "keyword",
-                GramSyntaxToken::Label => "label",
-                GramSyntaxToken::LinkText => "link_text",
-                GramSyntaxToken::LinkUri => "link_uri",
-                GramSyntaxToken::Number => "number",
-                GramSyntaxToken::Operator => "operator",
-                GramSyntaxToken::Predictive => "predictive",
-                GramSyntaxToken::Preproc => "preproc",
-                GramSyntaxToken::Primary => "primary",
-                GramSyntaxToken::Property => "property",
-                GramSyntaxToken::Punctuation => "punctuation",
-                GramSyntaxToken::PunctuationBracket => "punctuation.bracket",
-                GramSyntaxToken::PunctuationDelimiter => "punctuation.delimiter",
-                GramSyntaxToken::PunctuationListMarker => "punctuation.list_marker",
-                GramSyntaxToken::PunctuationSpecial => "punctuation.special",
-                GramSyntaxToken::String => "string",
-                GramSyntaxToken::StringEscape => "string.escape",
-                GramSyntaxToken::StringRegex => "string.regex",
-                GramSyntaxToken::StringSpecial => "string.special",
-                GramSyntaxToken::StringSpecialSymbol => "string.special.symbol",
-                GramSyntaxToken::Tag => "tag",
-                GramSyntaxToken::TextLiteral => "text.literal",
-                GramSyntaxToken::Title => "title",
-                GramSyntaxToken::Type => "type",
-                GramSyntaxToken::Variable => "variable",
-                GramSyntaxToken::VariableSpecial => "variable.special",
-                GramSyntaxToken::Variant => "variant",
+                ZedSyntaxToken::Attribute => "attribute",
+                ZedSyntaxToken::Boolean => "boolean",
+                ZedSyntaxToken::Comment => "comment",
+                ZedSyntaxToken::CommentDoc => "comment.doc",
+                ZedSyntaxToken::Constant => "constant",
+                ZedSyntaxToken::Constructor => "constructor",
+                ZedSyntaxToken::Embedded => "embedded",
+                ZedSyntaxToken::Emphasis => "emphasis",
+                ZedSyntaxToken::EmphasisStrong => "emphasis.strong",
+                ZedSyntaxToken::Enum => "enum",
+                ZedSyntaxToken::Function => "function",
+                ZedSyntaxToken::Hint => "hint",
+                ZedSyntaxToken::Keyword => "keyword",
+                ZedSyntaxToken::Label => "label",
+                ZedSyntaxToken::LinkText => "link_text",
+                ZedSyntaxToken::LinkUri => "link_uri",
+                ZedSyntaxToken::Number => "number",
+                ZedSyntaxToken::Operator => "operator",
+                ZedSyntaxToken::Predictive => "predictive",
+                ZedSyntaxToken::Preproc => "preproc",
+                ZedSyntaxToken::Primary => "primary",
+                ZedSyntaxToken::Property => "property",
+                ZedSyntaxToken::Punctuation => "punctuation",
+                ZedSyntaxToken::PunctuationBracket => "punctuation.bracket",
+                ZedSyntaxToken::PunctuationDelimiter => "punctuation.delimiter",
+                ZedSyntaxToken::PunctuationListMarker => "punctuation.list_marker",
+                ZedSyntaxToken::PunctuationSpecial => "punctuation.special",
+                ZedSyntaxToken::String => "string",
+                ZedSyntaxToken::StringEscape => "string.escape",
+                ZedSyntaxToken::StringRegex => "string.regex",
+                ZedSyntaxToken::StringSpecial => "string.special",
+                ZedSyntaxToken::StringSpecialSymbol => "string.special.symbol",
+                ZedSyntaxToken::Tag => "tag",
+                ZedSyntaxToken::TextLiteral => "text.literal",
+                ZedSyntaxToken::Title => "title",
+                ZedSyntaxToken::Type => "type",
+                ZedSyntaxToken::Variable => "variable",
+                ZedSyntaxToken::VariableSpecial => "variable.special",
+                ZedSyntaxToken::Variant => "variant",
             }
         )
     }
 }
 
-impl GramSyntaxToken {
+impl ZedSyntaxToken {
     pub fn find_best_token_color_match<'a>(
         &self,
         token_colors: &'a [VsCodeTokenColor],
@@ -175,40 +175,49 @@ impl GramSyntaxToken {
 
     pub fn fallbacks(&self) -> &[Self] {
         match self {
-            GramSyntaxToken::CommentDoc => &[GramSyntaxToken::Comment],
-            GramSyntaxToken::Number => &[GramSyntaxToken::Constant],
-            GramSyntaxToken::VariableSpecial => &[GramSyntaxToken::Variable],
-            GramSyntaxToken::PunctuationBracket
-            | GramSyntaxToken::PunctuationDelimiter
-            | GramSyntaxToken::PunctuationListMarker
-            | GramSyntaxToken::PunctuationSpecial => &[GramSyntaxToken::Punctuation],
-            GramSyntaxToken::StringEscape
-            | GramSyntaxToken::StringRegex
-            | GramSyntaxToken::StringSpecial
-            | GramSyntaxToken::StringSpecialSymbol => &[GramSyntaxToken::String],
+            ZedSyntaxToken::CommentDoc => &[ZedSyntaxToken::Comment],
+            ZedSyntaxToken::Number => &[ZedSyntaxToken::Constant],
+            ZedSyntaxToken::VariableSpecial => &[ZedSyntaxToken::Variable],
+            ZedSyntaxToken::PunctuationBracket
+            | ZedSyntaxToken::PunctuationDelimiter
+            | ZedSyntaxToken::PunctuationListMarker
+            | ZedSyntaxToken::PunctuationSpecial => &[ZedSyntaxToken::Punctuation],
+            ZedSyntaxToken::StringEscape
+            | ZedSyntaxToken::StringRegex
+            | ZedSyntaxToken::StringSpecial
+            | ZedSyntaxToken::StringSpecialSymbol => &[ZedSyntaxToken::String],
             _ => &[],
         }
     }
 
     fn to_vscode(self) -> Vec<&'static str> {
         match self {
-            GramSyntaxToken::Attribute => vec!["entity.other.attribute-name"],
-            GramSyntaxToken::Boolean => vec!["constant.language"],
-            GramSyntaxToken::Comment => vec!["comment"],
-            GramSyntaxToken::CommentDoc => vec!["comment.block.documentation"],
-            GramSyntaxToken::Constant => vec!["constant", "constant.language", "constant.character"],
-            GramSyntaxToken::Constructor => {
-                vec!["entity.name.tag", "entity.name.function.definition.special.constructor"]
+            ZedSyntaxToken::Attribute => vec!["entity.other.attribute-name"],
+            ZedSyntaxToken::Boolean => vec!["constant.language"],
+            ZedSyntaxToken::Comment => vec!["comment"],
+            ZedSyntaxToken::CommentDoc => vec!["comment.block.documentation"],
+            ZedSyntaxToken::Constant => vec!["constant", "constant.language", "constant.character"],
+            ZedSyntaxToken::Constructor => {
+                vec![
+                    "entity.name.tag",
+                    "entity.name.function.definition.special.constructor",
+                ]
             }
-            GramSyntaxToken::Embedded => vec!["meta.embedded"],
-            GramSyntaxToken::Emphasis => vec!["markup.italic"],
-            GramSyntaxToken::EmphasisStrong => {
-                vec!["markup.bold", "markup.italic markup.bold", "markup.bold markup.italic"]
-            }
-            GramSyntaxToken::Enum => vec!["support.type.enum"],
-            GramSyntaxToken::Function => vec!["entity.function", "entity.name.function", "variable.function"],
-            GramSyntaxToken::Hint => vec![],
-            GramSyntaxToken::Keyword => vec![
+            ZedSyntaxToken::Embedded => vec!["meta.embedded"],
+            ZedSyntaxToken::Emphasis => vec!["markup.italic"],
+            ZedSyntaxToken::EmphasisStrong => vec![
+                "markup.bold",
+                "markup.italic markup.bold",
+                "markup.bold markup.italic",
+            ],
+            ZedSyntaxToken::Enum => vec!["support.type.enum"],
+            ZedSyntaxToken::Function => vec![
+                "entity.function",
+                "entity.name.function",
+                "variable.function",
+            ],
+            ZedSyntaxToken::Hint => vec![],
+            ZedSyntaxToken::Keyword => vec![
                 "keyword",
                 "keyword.other.fn.rust",
                 "keyword.control",
@@ -217,54 +226,63 @@ impl GramSyntaxToken {
                 "punctuation.accessor",
                 "entity.name.tag",
             ],
-            GramSyntaxToken::Label => vec!["label", "entity.name", "entity.name.import", "entity.name.package"],
-            GramSyntaxToken::LinkText => vec!["markup.underline.link", "string.other.link"],
-            GramSyntaxToken::LinkUri => vec!["markup.underline.link", "string.other.link"],
-            GramSyntaxToken::Number => vec!["constant.numeric", "number"],
-            GramSyntaxToken::Operator => vec!["operator", "keyword.operator"],
-            GramSyntaxToken::Predictive => vec![],
-            GramSyntaxToken::Preproc => vec!["preproc", "meta.preprocessor", "punctuation.definition.preprocessor"],
-            GramSyntaxToken::Primary => vec![],
-            GramSyntaxToken::Property => vec![
+            ZedSyntaxToken::Label => vec![
+                "label",
+                "entity.name",
+                "entity.name.import",
+                "entity.name.package",
+            ],
+            ZedSyntaxToken::LinkText => vec!["markup.underline.link", "string.other.link"],
+            ZedSyntaxToken::LinkUri => vec!["markup.underline.link", "string.other.link"],
+            ZedSyntaxToken::Number => vec!["constant.numeric", "number"],
+            ZedSyntaxToken::Operator => vec!["operator", "keyword.operator"],
+            ZedSyntaxToken::Predictive => vec![],
+            ZedSyntaxToken::Preproc => vec![
+                "preproc",
+                "meta.preprocessor",
+                "punctuation.definition.preprocessor",
+            ],
+            ZedSyntaxToken::Primary => vec![],
+            ZedSyntaxToken::Property => vec![
                 "variable.member",
                 "support.type.property-name",
                 "variable.object.property",
                 "variable.other.field",
             ],
-            GramSyntaxToken::Punctuation => vec![
+            ZedSyntaxToken::Punctuation => vec![
                 "punctuation",
                 "punctuation.section",
                 "punctuation.accessor",
                 "punctuation.separator",
                 "punctuation.definition.tag",
             ],
-            GramSyntaxToken::PunctuationBracket => vec![
+            ZedSyntaxToken::PunctuationBracket => vec![
                 "punctuation.bracket",
                 "punctuation.definition.tag.begin",
                 "punctuation.definition.tag.end",
             ],
-            GramSyntaxToken::PunctuationDelimiter => vec![
+            ZedSyntaxToken::PunctuationDelimiter => vec![
                 "punctuation.delimiter",
                 "punctuation.separator",
                 "punctuation.terminator",
             ],
-            GramSyntaxToken::PunctuationListMarker => {
+            ZedSyntaxToken::PunctuationListMarker => {
                 vec!["markup.list punctuation.definition.list.begin"]
             }
-            GramSyntaxToken::PunctuationSpecial => vec!["punctuation.special"],
-            GramSyntaxToken::String => vec!["string"],
-            GramSyntaxToken::StringEscape => {
+            ZedSyntaxToken::PunctuationSpecial => vec!["punctuation.special"],
+            ZedSyntaxToken::String => vec!["string"],
+            ZedSyntaxToken::StringEscape => {
                 vec!["string.escape", "constant.character", "constant.other"]
             }
-            GramSyntaxToken::StringRegex => vec!["string.regex"],
-            GramSyntaxToken::StringSpecial => vec!["string.special", "constant.other.symbol"],
-            GramSyntaxToken::StringSpecialSymbol => {
+            ZedSyntaxToken::StringRegex => vec!["string.regex"],
+            ZedSyntaxToken::StringSpecial => vec!["string.special", "constant.other.symbol"],
+            ZedSyntaxToken::StringSpecialSymbol => {
                 vec!["string.special.symbol", "constant.other.symbol"]
             }
-            GramSyntaxToken::Tag => vec!["tag", "entity.name.tag", "meta.tag.sgml"],
-            GramSyntaxToken::TextLiteral => vec!["text.literal", "string"],
-            GramSyntaxToken::Title => vec!["title", "entity.name"],
-            GramSyntaxToken::Type => vec![
+            ZedSyntaxToken::Tag => vec!["tag", "entity.name.tag", "meta.tag.sgml"],
+            ZedSyntaxToken::TextLiteral => vec!["text.literal", "string"],
+            ZedSyntaxToken::Title => vec!["title", "entity.name"],
+            ZedSyntaxToken::Type => vec![
                 "entity.name.type",
                 "entity.name.type.primitive",
                 "entity.name.type.numeric",
@@ -273,20 +291,20 @@ impl GramSyntaxToken {
                 "support.type.primitive",
                 "support.class",
             ],
-            GramSyntaxToken::Variable => vec![
+            ZedSyntaxToken::Variable => vec![
                 "variable",
                 "variable.language",
                 "variable.member",
                 "variable.parameter",
                 "variable.parameter.function-call",
             ],
-            GramSyntaxToken::VariableSpecial => vec![
+            ZedSyntaxToken::VariableSpecial => vec![
                 "variable.special",
                 "variable.member",
                 "variable.annotation",
                 "variable.language",
             ],
-            GramSyntaxToken::Variant => vec!["variant"],
+            ZedSyntaxToken::Variant => vec!["variant"],
         }
     }
 }

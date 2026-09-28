@@ -20,6 +20,7 @@ struct SnippetRegistryProxy {
 
 impl ExtensionSnippetProxy for SnippetRegistryProxy {
     fn register_snippet(&self, path: &PathBuf, snippet_contents: &str) -> Result<()> {
-        self.snippet_registry.register_snippets(path, snippet_contents)
+        self.snippet_registry
+            .register_snippets(path, snippet_contents)
     }
 }

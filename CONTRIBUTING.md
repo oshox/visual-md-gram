@@ -1,82 +1,83 @@
-# Contributing
+# Contributing to Zed
 
-The over-arching goal for now is to excise the Gram codebase of all the shady
-stuff so that only the good parts remain. First and foremost, that means
-removing all AI integration and telemetry.
+Thank you for helping us make Zed better!
 
-Unfortunately, this means that some genuinely useful functionality may be lost
-in the process. Thus, this is the plan for this project:
+## Before you start
 
-- [x] Strip out the AI, the telemetry, the subscriptions, the auto installation.
-- [x] Make the automatic installation of language servers optional and prompt
-      the user before installing anything (letting them decline).
-- [ ] Make everything that broke in the process work again.
-- [ ] Replace anything that was lost with better, open and respectful
-      alternatives.
+- **Keep no more than three PRs open at a time.**
+  This limit helps us keep up with reviews and ensures all contributors get a fair share of our reviewing capacity.
+  Start with one and see it through; we're lucky to get a lot of contributions, and the pattern we've seen is that landing your first PR dramatically improves the odds for every PR after it.
+  A stack of open PRs on the other hand tends to go stale as `main` changes.
+- **Discuss features with us before you start writing code for them**.
+  If there isn't a GitHub issue with staff confirmation that we want it, start a [GitHub discussion](https://github.com/zed-industries/zed/discussions), not a PR or a new issue.
+  This especially applies to changes to the Zed Extension API.
+  - Before proposing a larger feature, read the [Zed Feature Process](./docs/src/development/feature-process.md) for the context, integration points, and design decisions to cover.
 
-AI will never return. Some form of peer-to-peer collaboration support would be
-cool to have, though.
+All activity in Zed forums is subject to our [Code of Conduct](https://zed.dev/code-of-conduct).
 
-Automatic installation of pre-built extensions is gone. Is there a way to make
-the editor more extensible without losing that? Maybe an option is to add
-something like the extensions planned for Helix.
+### Things we will (probably) not merge
 
-Another option is to drop the extensions entirely and just build everything into
-the editor: Support as many languages and themes as possible out of the box.
+There are few hard-and-fast rules, but we typically don't merge:
 
-If this sounds interesting to you, feel free to help out.
+- **Changes that can be provided by an extension**, such as new languages or themes. See the [extension development docs](https://zed.dev/docs/extensions/developing-extensions).
+- **Extension API changes without prior discussion** involving Zed staff.
+- **New file icons.** Our default icons are hand-designed to fit together; please don't submit off-the-shelf SVGs.
+- **Features whose complexity outweighs their benefit**, in our judgement, for the number of people who would use them.
+- **Giant refactorings.**
+- **Non-trivial changes without tests.**
+- **Style-only code changes that don't alter app logic.** Reducing allocations, removing `.unwrap()`s, and fixing typos are welcome; making code "more readable" alone may not be.
+- **LLM-generated work the author doesn't understand.**
 
-It should go without saying but AI-generated pull requests are strictly banned
-from this project. This codebase is bloated and vibe-coded enough as it is, we
-need to fix and mend and patch and not start adding to the mess as much as
-possible.
+### We love PRs that...
 
-The project policy on AI and LLM use is outlined in the
-[Code of Conduct](./CODE_OF_CONDUCT.md).
+- **Fix or extend the docs**: browse [docs issues](https://github.com/zed-industries/zed/issues?q=is%3Aissue%20state%3Aopen%20type%3ADocs).
+- **Close issues curated for the community:** [good first issues](https://github.com/zed-industries/zed/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22.contrib%2Fgood%20first%20issue%22), [good non-first issues](https://github.com/zed-industries/zed/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22.contrib%2Fgood%20non-first%20issue%22).
+- **Fix bugs**: start with [triaged bugs with confirmed reproduction steps](https://github.com/zed-industries/zed/issues?q=is%3Aissue%20state%3Aopen%20type%3ABug%20label%3Astate%3Areproducible), or browse [area labels](https://github.com/zed-industries/zed/labels?q=area%3A*) for parts of Zed you care about.
+  Select a label, then add `type:Bug` to the search.
+- **Make existing features work for more people** through small enhancements, such as support for more platforms or modes.
+- **Add small features**, like keybindings or actions you miss from other editors.
+- **Join a Community Program** like [Let's Git Together](https://github.com/zed-industries/zed/issues/41541) or [The Guild](https://zed.dev/community/guild).
+- **Build features we've explicitly invited contributions for**, listed on the [community feature board](https://github.com/orgs/zed-industries/projects/78/views/4).
 
-## Bird's-eye view of the code base
+## AI Policy
 
-The [glossary](docs/development/glossary.md) lists and explains some of the
-structures and terms you will see throughout the codebase.
+We welcome the use of LLMs for coding, but we hold a high bar for all contributions, and **we expect a human in the loop who genuinely understands the work an LLM produces** on their behalf.
 
-The editor is made up of several smaller crates. This is an incomplete list of
-crates and their use.
+For that reason, we **don't accept contributions from autonomous agents**. Pull requests that appear to violate this may be closed without notice.
 
-- [`gpui`](/crates/gpui) is a GPU-accelerated UI framework which provides all of
-  the building blocks for the UI. [Documentation](https://www.gpui.rs)
-- [`editor`](/crates/editor) contains the core `Editor` type that drives both
-  the code editor and all various input fields. It also handles a display layer
-  for LSP features such as Inlay Hints or code completions.
-- [`project`](/crates/project) manages files and navigation within the filetree.
-  It is also the editor side of communication with LSP.
-- [`workspace`](/crates/workspace) handles local state serialization and groups
-  projects together.
-- [`vim`](/crates/vim) is a thin implementation of Vim workflow over `editor`.
-- [`lsp`](/crates/lsp) handles communication with external LSP server.
-- [`language`](/crates/language) drives `editor`'s understanding of language -
-  from providing a list of symbols to the syntax map.
-- [`languages`](/crates/languages) contains language support for all of the
-  builtin languages. The API for builtin languages is quite different from the
-  zed extension API, so converting an extension into a builtin language is not
-  always easy. Any language that is built in also needs a tree-sitter module
-  which is up to date, so that excludes some languages from being supported
-  without an extension (unless the tree-sitter module is updated).
-- [`theme`](/crates/theme) defines the theme system and provides a default
-  theme.
-- [`ui`](/crates/ui) is a collection of UI components and common patterns used
-  throughout the editor.
-- [`cli`](/crates/cli) is the CLI crate which invokes the gram binary.
-- [`gram`](/crates/gram) is where all things come together, and the `main` entry
-  point for the project.
+**Don't rely on LLMs to write the whole thing for you when communicating with the maintainers** (meaning replies to comments, PR descriptions, and alike). The readers are humans, and we'd like to hear from you, not from a model (we have models at home).
 
-### Stores
+If you're a non-native English speaker using an LLM to thoroughly edit or translate your messages to the maintainers, we'd encourage you to **put the machine translation in a quote block and include the original text in your native language after it**.
 
-There are a number of global registries referred to as stores in the codebase.
-This is not a complete listing:
+If you think it's helpful/necessary to **share context from a chat with an LLM**, please put the **relevant part of it** in a quote block (e.g., using `>`), **disclose it as AI-generated**, and add your own commentary explaining **why it's relevant and what you take from it**.
 
-- [`settings_store`](/crates/settings/src/settings_store.rs) manages all of the
-  settings and configuration.
-- [`lsp_store`](/crates/project/src/lsp_store.rs) manages all language servers
-  that have been loaded.
-- [`worktree_store`](/crates/project/src/worktree_store.rs) contains information
-  about all of the currently open worktrees.
+This policy was adapted from [ripgrep's AI policy](https://github.com/BurntSushi/ripgrep/blob/f0cec341ab95c25c691ad3d5754d4bd9eedde21f/AI_POLICY.md).
+
+## Sending changes
+
+**Build and run Zed locally, then manually test your changes before opening a PR.** Follow the guide for [macOS](./docs/src/development/macos.md), [Linux](./docs/src/development/linux.md), [Windows](./docs/src/development/windows.md), or [FreeBSD](./docs/src/development/freebsd.md).
+
+When preparing your PR:
+
+- **Review your own work**, including any AI-assisted code. Follow the [pull request template](./.github/pull_request_template.md?plain=1) for testing details and the self-review checklist.
+- **For visual changes, attach screenshots or a video** and work through the [UI/UX checklist](./docs/src/development/ui-checklist.md). For non-visual improvements and changes, include benchmarks or other artifacts produced when testing.
+- **Keep each PR about one thing**, leaving unrelated features and refactoring for another PR.
+- **Sign the [Contributor License Agreement](https://zed.dev/cla)** so that your contribution can be merged.
+
+**Opening a PR does not guarantee a merge.** We may decline a change that doesn't fit Zed's direction or quality standards, even after you've put work into it. Confirming interest early and following this guide give your PR the best chance.
+
+**Pinging maintainers by username or emailing them does not raise your PR's priority**; it takes time away from review.
+
+## Resources
+
+### UI/UX checklist
+
+For UI changes, use the [UI/UX checklist](./docs/src/development/ui-checklist.md) in the development docs.
+
+### Bird's-eye view of Zed
+
+For a tour of the main crates, see the [codebase overview](https://zed.dev/docs/development#birds-eye-view-of-zed) in the development docs.
+
+### Packaging Zed
+
+Check our [notes for packaging Zed](https://zed.dev/docs/development/linux#notes-for-packaging-zed).

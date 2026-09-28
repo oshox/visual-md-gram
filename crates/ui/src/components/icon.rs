@@ -69,11 +69,11 @@ pub enum IconSize {
 impl IconSize {
     pub fn rems(self) -> Rems {
         match self {
-            IconSize::Indicator => rems_from_px(10.0_f32),
-            IconSize::XSmall => rems_from_px(12.0_f32),
-            IconSize::Small => rems_from_px(14.0_f32),
-            IconSize::Medium => rems_from_px(16.0_f32),
-            IconSize::XLarge => rems_from_px(48.0_f32),
+            IconSize::Indicator => rems_from_px(10_f32),
+            IconSize::XSmall => rems_from_px(12_f32),
+            IconSize::Small => rems_from_px(14_f32),
+            IconSize::Medium => rems_from_px(16_f32),
+            IconSize::XLarge => rems_from_px(48_f32),
             IconSize::Custom(size) => size,
         }
     }
@@ -112,9 +112,24 @@ impl From<IconName> for Icon {
     }
 }
 
+pub fn git_hosting_provider_icon(provider_name: &str) -> IconName {
+    match provider_name {
+        "Bitbucket" => IconName::Bitbucket,
+        "Chromium" => IconName::Gerrit,
+        "Codeberg" => IconName::Codeberg,
+        "Forgejo Self-Hosted" => IconName::Forgejo,
+        "GitHub" => IconName::Github,
+        "GitLab" => IconName::Gitlab,
+        "Gitea" => IconName::Gitea,
+        "SourceHut" => IconName::Sourcehut,
+        _ => IconName::Link,
+    }
+}
+
 /// The source of an icon.
+#[derive(Clone)]
 enum IconSource {
-    /// An SVG embedded in the Gram binary.
+    /// An SVG embedded in the Zed binary.
     Embedded(SharedString),
     /// An image file located at the specified path.
     ///
@@ -122,22 +137,11 @@ enum IconSource {
     ///
     /// In order to support icon themes, we render the icons as images instead.
     External(Arc<Path>),
-    /// An SVG not embedded in the Gram binary.
+    /// An SVG not embedded in the Zed binary.
     ExternalSvg(SharedString),
 }
 
-impl IconSource {
-    fn from_path(path: impl Into<SharedString>) -> Self {
-        let path = path.into();
-        if path.starts_with("icons/") {
-            Self::Embedded(path)
-        } else {
-            Self::External(Arc::from(PathBuf::from(path.as_ref())))
-        }
-    }
-}
-
-#[derive(IntoElement, RegisterComponent)]
+#[derive(Clone, IntoElement, RegisterComponent)]
 pub struct Icon {
     source: IconSource,
     color: Color,
@@ -155,9 +159,18 @@ impl Icon {
         }
     }
 
+    /// Create an icon from a path. Uses a heuristic to determine if it's embedded or external:
+    /// - Paths starting with "icons/" are treated as embedded SVGs
+    /// - Other paths are treated as external raster images (from icon themes)
     pub fn from_path(path: impl Into<SharedString>) -> Self {
+        let path = path.into();
+        let source = if path.starts_with("icons/") {
+            IconSource::Embedded(path)
+        } else {
+            IconSource::External(Arc::from(PathBuf::from(path.as_ref())))
+        };
         Self {
-            source: IconSource::from_path(path),
+            source,
             color: Color::default(),
             size: IconSize::default().rems(),
             transformation: Transformation::default(),
@@ -180,6 +193,14 @@ impl Icon {
 
     pub fn size(mut self, size: IconSize) -> Self {
         self.size = size.rems();
+        self
+    }
+
+    /// Sets a custom size for the icon, in [`Rems`].
+    ///
+    /// Not to be exposed outside of the `ui` crate.
+    pub(crate) fn custom_size(mut self, size: Rems) -> Self {
+        self.size = size;
         self
     }
 }
@@ -281,65 +302,54 @@ impl Component for Icon {
         ComponentScope::Images
     }
 
-    fn description() -> Option<&'static str> {
-        Some(
-            "A versatile icon component that supports SVG and image-based icons with customizable size, color, and transformations.",
-        )
+    fn description() -> &'static str {
+        "A versatile icon component that supports SVG and image-based icons \
+        with customizable size, color, and transformations."
     }
 
-    fn preview(_window: &mut Window, cx: &mut App) -> Option<AnyElement> {
-        Some(
-            v_flex()
-                .gap_6()
-                .children(vec![
-                    example_group_with_title(
-                        "Sizes",
-                        vec![single_example(
-                            "XSmall, Small, Default, Large",
-                            h_flex()
-                                .gap_1()
-                                .child(Icon::new(IconName::Star).size(IconSize::XSmall).into_any_element())
-                                .child(Icon::new(IconName::Star).size(IconSize::Small).into_any_element())
-                                .child(Icon::new(IconName::Star).into_any_element())
-                                .child(Icon::new(IconName::Star).size(IconSize::XLarge).into_any_element())
-                                .into_any_element(),
-                        )],
-                    ),
-                    example_group_with_title(
-                        "Colors",
-                        vec![single_example(
-                            "Default & Custom",
-                            h_flex()
-                                .gap_1()
-                                .child(Icon::new(IconName::Star).into_any_element())
-                                .child(Icon::new(IconName::Star).color(Color::Error).into_any_element())
-                                .into_any_element(),
-                        )],
-                    ),
-                    example_group_with_title(
-                        "All Icons",
-                        vec![single_example(
-                            "All Icons",
-                            h_flex()
-                                .image_cache(gpui::retain_all("all icons"))
-                                .flex_wrap()
-                                .gap_2()
-                                .children(<IconName as strum::IntoEnumIterator>::iter().map(|icon_name| {
-                                    h_flex()
-                                        .p_1()
-                                        .gap_1()
-                                        .border_1()
-                                        .border_color(cx.theme().colors().border_variant)
-                                        .bg(cx.theme().colors().element_disabled)
-                                        .rounded_sm()
-                                        .child(Icon::new(icon_name).into_any_element())
-                                        .child(SharedString::new_static(icon_name.into()))
-                                }))
-                                .into_any_element(),
-                        )],
-                    ),
-                ])
-                .into_any_element(),
-        )
+    fn preview(_window: &mut Window, cx: &mut App) -> AnyElement {
+        v_flex()
+            .gap_6()
+            .children(vec![
+                example_group_with_title(
+                    "Sizes",
+                    vec![single_example(
+                        "XSmall, Small, Default, Large",
+                        h_flex()
+                            .gap_1()
+                            .child(Icon::new(IconName::Star).size(IconSize::XSmall))
+                            .child(Icon::new(IconName::Star).size(IconSize::Small))
+                            .child(Icon::new(IconName::Star))
+                            .child(Icon::new(IconName::Star).size(IconSize::XLarge))
+                            .into_any_element(),
+                    )],
+                ),
+                example_group(vec![single_example(
+                    "All Icons",
+                    h_flex()
+                        .image_cache(gpui::retain_all("all icons"))
+                        .flex_wrap()
+                        .gap_2()
+                        .children(<IconName as strum::IntoEnumIterator>::iter().map(
+                            |icon_name: IconName| {
+                                let name: SharedString = format!("{icon_name:?}").into();
+                                v_flex()
+                                    .min_w_0()
+                                    .w_24()
+                                    .p_1p5()
+                                    .gap_2()
+                                    .border_1()
+                                    .border_color(cx.theme().colors().border_variant)
+                                    .bg(cx.theme().colors().element_disabled)
+                                    .rounded_sm()
+                                    .items_center()
+                                    .child(Icon::new(icon_name))
+                                    .child(Label::new(name).size(LabelSize::XSmall).truncate())
+                            },
+                        ))
+                        .into_any_element(),
+                )]),
+            ])
+            .into_any_element()
     }
 }

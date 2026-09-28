@@ -10,14 +10,14 @@ pub mod consts {
     //! on their communication protocol.
 
     /// The suffix on the actual test function.
-    pub const SUF_NORMAL: &str = "__GRAM_PERF_FN";
+    pub const SUF_NORMAL: &str = "__ZED_PERF_FN";
     /// The suffix on an extra function which prints metadata about a test to stdout.
-    pub const SUF_MDATA: &str = "__GRAM_PERF_MDATA";
+    pub const SUF_MDATA: &str = "__ZED_PERF_MDATA";
     /// The env var in which we pass the iteration count to our tests.
-    pub const ITER_ENV_VAR: &str = "GRAM_PERF_ITER";
+    pub const ITER_ENV_VAR: &str = "ZED_PERF_ITER";
     /// The prefix printed on all benchmark test metadata lines, to distinguish it from
     /// possible output by the test harness itself.
-    pub const MDATA_LINE_PREF: &str = "GRAM_MDATA_";
+    pub const MDATA_LINE_PREF: &str = "ZED_MDATA_";
     /// The version number for the data returned from the test metadata function.
     /// Increment on non-backwards-compatible changes.
     pub const MDATA_VER: u32 = 0;
@@ -133,7 +133,10 @@ pub struct Timings {
 
 impl Timings {
     /// How many iterations does this test seem to do per second?
-    #[expect(clippy::cast_precision_loss, reason = "We only care about a couple sig figs anyways")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "We only care about a couple sig figs anyways"
+    )]
     #[must_use]
     pub fn iters_per_sec(&self, total_iters: NonZero<usize>) -> f64 {
         (1000. / self.mean.as_millis() as f64) * total_iters.get() as f64
@@ -163,9 +166,16 @@ impl Output {
     }
 
     /// Reports a success and adds it to this run's `Output`.
-    pub fn success(&mut self, name: impl AsRef<str>, mut mdata: TestMdata, iters: NonZero<usize>, timings: Timings) {
+    pub fn success(
+        &mut self,
+        name: impl AsRef<str>,
+        mut mdata: TestMdata,
+        iters: NonZero<usize>,
+        timings: Timings,
+    ) {
         mdata.iterations = Some(iters);
-        self.tests.push((name.as_ref().to_string(), Some(mdata), Ok(timings)));
+        self.tests
+            .push((name.as_ref().to_string(), Some(mdata), Ok(timings)));
     }
 
     /// Reports a failure and adds it to this run's `Output`. If this test was tried
@@ -183,7 +193,8 @@ impl Output {
         if let Some(ref mut mdata) = mdata {
             mdata.iterations = attempted_iters;
         }
-        self.tests.push((name.as_ref().to_string(), mdata, Err(kind)));
+        self.tests
+            .push((name.as_ref().to_string(), mdata, Err(kind)));
     }
 
     /// True if no tests executed this run.
@@ -262,7 +273,8 @@ impl Output {
                     let Some((o_timings, o_iters, _)) = other_data.remove(&name) else {
                         continue;
                     };
-                    let shift = (o_timings.iters_per_sec(o_iters) / s_timings.iters_per_sec(s_iters)) - 1.;
+                    let shift =
+                        (o_timings.iters_per_sec(o_iters) / s_timings.iters_per_sec(s_iters)) - 1.;
                     if shift > max {
                         max = shift;
                     }
@@ -358,7 +370,9 @@ impl std::fmt::Display for Output {
                         "| ({}) {} | N/A | N/A | N/A | {} | {} ({}) |",
                         err,
                         name,
-                        metadata.iterations.map_or_else(|| "N/A".to_owned(), |i| format!("{i}")),
+                        metadata
+                            .iterations
+                            .map_or_else(|| "N/A".to_owned(), |i| format!("{i}")),
                         metadata.importance,
                         metadata.weight
                     )?,

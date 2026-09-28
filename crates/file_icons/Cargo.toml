@@ -1,20 +1,23 @@
 [package]
 name = "file_icons"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
-
-[lib]
-doctest = false
-path = "src/file_icons.rs"
-test = false
-
-[dependencies]
-gpui.workspace = true
-theme.workspace = true
-util.workspace = true
+license = "GPL-3.0-or-later"
 
 [lints]
 workspace = true
+
+[lib]
+path = "src/file_icons.rs"
+doctest = false
+
+[dependencies]
+gpui.workspace = true
+settings_content.workspace = true
+theme.workspace = true
+util.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+theme = { workspace = true, features = ["test-support"] }

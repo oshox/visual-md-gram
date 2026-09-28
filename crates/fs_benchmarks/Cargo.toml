@@ -1,14 +1,13 @@
 [package]
 name = "fs_benchmarks"
-version.workspace = true
-edition.workspace = true
-repository.workspace = true
+version = "0.1.0"
 publish.workspace = true
-license.workspace = true
+edition.workspace = true
 
 [dependencies]
 fs.workspace = true
-gpui = { workspace = true, features = ["windows-manifest"] }
+gpui.workspace = true
+gpui_platform.workspace = true
 
 [lints]
 workspace = true

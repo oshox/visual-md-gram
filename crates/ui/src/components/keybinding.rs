@@ -1,13 +1,13 @@
 use std::rc::Rc;
 
 use crate::PlatformStyle;
+use crate::utils::capitalize;
 use crate::{Icon, IconName, IconSize, h_flex, prelude::*};
 use gpui::{
-    Action, AnyElement, App, FocusHandle, Global, IntoElement, KeybindingKeystroke, Keystroke, Modifiers, Window,
-    relative,
+    Action, AnyElement, App, FocusHandle, Global, IntoElement, KeybindingKeystroke, Keystroke,
+    Modifiers, Window, relative,
 };
 use itertools::Itertools;
-use settings::KeybindSource;
 
 #[derive(Debug)]
 enum Source {
@@ -28,7 +28,10 @@ enum Source {
 impl Clone for Source {
     fn clone(&self) -> Self {
         match self {
-            Source::Action { action, focus_handle } => Source::Action {
+            Source::Action {
+                action,
+                focus_handle,
+            } => Source::Action {
                 action: action.boxed_clone(),
                 focus_handle: focus_handle.clone(),
             },
@@ -43,6 +46,8 @@ impl Clone for Source {
 pub struct KeyBinding {
     source: Source,
     size: Option<AbsoluteLength>,
+    style: KeyBindingStyle,
+    color: Option<Color>,
     /// The [`PlatformStyle`] to use when displaying this keybinding.
     platform_style: PlatformStyle,
     /// Determines whether the keybinding is meant for vim mode.
@@ -51,8 +56,27 @@ pub struct KeyBinding {
     disabled: bool,
 }
 
+/// Controls how a [`KeyBinding`] is presented.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyBindingStyle {
+    /// Render each key using compact key dimensions and muted colors.
+    #[default]
+    Default,
+    /// Render keys and modifier symbols using the same metrics and colors as a [`Label`].
+    Label,
+}
+
 struct VimStyle(bool);
 impl Global for VimStyle {}
+
+struct KeyBindingVisibility(bool);
+impl Global for KeyBindingVisibility {}
+
+impl Default for KeyBindingVisibility {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 
 impl KeyBinding {
     /// Returns the highest precedence keybinding for an action. This is the last binding added to
@@ -82,8 +106,20 @@ impl KeyBinding {
         cx.set_global(VimStyle(enabled));
     }
 
-    fn is_vim_mode(cx: &App) -> bool {
+    /// Returns whether keybindings use Vim-style notation.
+    pub fn is_vim_mode(cx: &App) -> bool {
         cx.try_global::<VimStyle>().is_some_and(|g| g.0)
+    }
+
+    /// Sets the application-wide visibility of keybindings.
+    pub fn set_default_visibility(cx: &mut App, visible: bool) {
+        cx.set_global(KeyBindingVisibility(visible));
+        cx.refresh_windows();
+    }
+
+    /// Returns whether keybindings are visible application-wide.
+    pub fn default_visibility(cx: &mut App) -> bool {
+        cx.default_global::<KeyBindingVisibility>().0
     }
 
     pub fn new(action: &dyn Action, focus_handle: Option<FocusHandle>, cx: &App) -> Self {
@@ -93,17 +129,21 @@ impl KeyBinding {
                 focus_handle,
             },
             size: None,
+            style: KeyBindingStyle::Default,
+            color: None,
             vim_mode: KeyBinding::is_vim_mode(cx),
             platform_style: PlatformStyle::platform(),
             disabled: false,
         }
     }
 
-    pub fn from_keystrokes(keystrokes: Rc<[KeybindingKeystroke]>, source: KeybindSource) -> Self {
+    pub fn from_keystrokes(keystrokes: Rc<[KeybindingKeystroke]>, vim_mode: bool) -> Self {
         Self {
             source: Source::Keystrokes { keystrokes },
             size: None,
-            vim_mode: source == KeybindSource::Vim,
+            style: KeyBindingStyle::Default,
+            color: None,
+            vim_mode,
             platform_style: PlatformStyle::platform(),
             disabled: false,
         }
@@ -121,11 +161,72 @@ impl KeyBinding {
         self
     }
 
+    /// Sets how this keybinding is presented.
+    pub fn style(mut self, style: KeyBindingStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Sets the color used to render the keybinding.
+    pub fn color(mut self, color: Color) -> Self {
+        self.color = Some(color);
+        self
+    }
+
     /// Sets whether this keybinding is currently disabled.
     /// Disabled keybinds will be rendered in a dimmed state.
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self
+    }
+
+    fn vim_mode(mut self, vim_mode: bool) -> Self {
+        self.vim_mode = vim_mode;
+        self
+    }
+
+    /// Resolves this keybinding's keystrokes the same way rendering does
+    /// (matching the visible accelerator). Returns `None` when there is no
+    /// binding.
+    fn resolve_keystrokes(&self, window: &Window, cx: &App) -> Option<Vec<KeybindingKeystroke>> {
+        let keystrokes = match &self.source {
+            Source::Action {
+                action,
+                focus_handle,
+            } => {
+                let binding = focus_handle
+                    .clone()
+                    .or_else(|| window.focused(cx))
+                    .and_then(|focus| {
+                        window.highest_precedence_binding_for_action_in(action.as_ref(), &focus)
+                    })
+                    .or_else(|| window.highest_precedence_binding_for_action(action.as_ref()))?;
+                binding.keystrokes().to_vec()
+            }
+            Source::Keystrokes { keystrokes } => keystrokes.to_vec(),
+        };
+        (!keystrokes.is_empty()).then_some(keystrokes)
+    }
+
+    /// Resolves this keybinding to a human-readable shortcut string in the same
+    /// platform format shown to sighted users (e.g. `"Ctrl-S"`, `"Command-S"`,
+    /// or `"Ctrl-K Ctrl-S"` for a chord), matching the visible accelerator. This
+    /// is the format AccessKit's `keyboard_shortcut` property expects. Returns
+    /// `None` when there is no binding.
+    pub fn keyboard_shortcut_text(&self, window: &Window, cx: &App) -> Option<SharedString> {
+        let keystrokes = self.resolve_keystrokes(window, cx)?;
+        let text = keystrokes
+            .iter()
+            .map(|keystroke| {
+                keystroke_text(
+                    keystroke.modifiers(),
+                    keystroke.key(),
+                    self.platform_style,
+                    self.vim_mode,
+                )
+            })
+            .join(" ");
+        Some(text.into())
     }
 }
 
@@ -134,21 +235,36 @@ fn render_key(
     color: Option<Color>,
     platform_style: PlatformStyle,
     size: impl Into<Option<AbsoluteLength>>,
+    style: KeyBindingStyle,
 ) -> AnyElement {
     let key_icon = icon_for_key(key, platform_style);
     match key_icon {
         Some(icon) => KeyIcon::new(icon, color).size(size).into_any_element(),
         None => {
-            let key = util::capitalize(key);
-            Key::new(&key, color).size(size).into_any_element()
+            let key = capitalize(key);
+            match style {
+                KeyBindingStyle::Default => Key::new(&key, color).size(size).into_any_element(),
+                KeyBindingStyle::Label => LabelKey::new(&key, color).size(size).into_any_element(),
+            }
         }
     }
 }
 
 impl RenderOnce for KeyBinding {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        if !Self::default_visibility(cx) {
+            return gpui::Empty.into_any_element();
+        }
+
         let render_keybinding = |keystrokes: &[KeybindingKeystroke]| {
-            let color = self.disabled.then_some(Color::Disabled);
+            let color = if self.disabled {
+                Some(Color::Disabled)
+            } else {
+                self.color.or(match self.style {
+                    KeyBindingStyle::Default => None,
+                    KeyBindingStyle::Label => Some(Color::Default),
+                })
+            };
 
             h_flex()
                 .debug_selector(|| {
@@ -166,24 +282,30 @@ impl RenderOnce for KeyBinding {
                 .children(keystrokes.iter().map(|keystroke| {
                     h_flex()
                         .flex_none()
-                        .py_0p5()
+                        .when(self.style == KeyBindingStyle::Default, |this| this.py_0p5())
                         .rounded_xs()
-                        .text_color(cx.theme().colors().text_muted)
-                        .children(render_keybinding_keystroke(
+                        .text_color(color.unwrap_or(Color::Muted).color(cx))
+                        .children(render_keybinding_keystroke_with_style(
                             keystroke,
                             color,
                             self.size,
                             PlatformStyle::platform(),
                             self.vim_mode,
+                            self.style,
                         ))
                 }))
                 .into_any_element()
         };
 
         match self.source {
-            Source::Action { action, focus_handle } => focus_handle
+            Source::Action {
+                action,
+                focus_handle,
+            } => focus_handle
                 .or_else(|| window.focused(cx))
-                .and_then(|focus| window.highest_precedence_binding_for_action_in(action.as_ref(), &focus))
+                .and_then(|focus| {
+                    window.highest_precedence_binding_for_action_in(action.as_ref(), &focus)
+                })
                 .or_else(|| window.highest_precedence_binding_for_action(action.as_ref()))
                 .map(|binding| render_keybinding(binding.keystrokes())),
             Source::Keystrokes { keystrokes } => Some(render_keybinding(keystrokes.as_ref())),
@@ -199,27 +321,66 @@ pub fn render_keybinding_keystroke(
     platform_style: PlatformStyle,
     vim_mode: bool,
 ) -> Vec<AnyElement> {
-    let use_text = vim_mode || matches!(platform_style, PlatformStyle::Linux | PlatformStyle::Windows);
+    render_keybinding_keystroke_with_style(
+        keystroke,
+        color,
+        size,
+        platform_style,
+        vim_mode,
+        KeyBindingStyle::Default,
+    )
+}
+
+fn render_keybinding_keystroke_with_style(
+    keystroke: &KeybindingKeystroke,
+    color: Option<Color>,
+    size: impl Into<Option<AbsoluteLength>>,
+    platform_style: PlatformStyle,
+    vim_mode: bool,
+    style: KeyBindingStyle,
+) -> Vec<AnyElement> {
+    let use_text = vim_mode
+        || matches!(
+            platform_style,
+            PlatformStyle::Linux | PlatformStyle::Windows
+        );
     let size = size.into();
 
     if use_text {
-        let element = Key::new(
-            keystroke_text(keystroke.modifiers(), keystroke.key(), platform_style, vim_mode),
-            color,
-        )
-        .size(size)
-        .into_any_element();
+        let text = keystroke_text(
+            keystroke.modifiers(),
+            keystroke.key(),
+            platform_style,
+            vim_mode,
+        );
+        let element = match style {
+            KeyBindingStyle::Default => Key::new(text, color).size(size).into_any_element(),
+            KeyBindingStyle::Label => LabelKey::new(text, color).size(size).into_any_element(),
+        };
         vec![element]
     } else {
         let mut elements = Vec::new();
-        elements.extend(render_modifiers(
+        let modifiers = render_modifiers_with_style(
             keystroke.modifiers(),
             platform_style,
             color,
             size,
             true,
+            style,
+        )
+        .collect::<Vec<_>>();
+        if style == KeyBindingStyle::Label && !modifiers.is_empty() {
+            elements.push(h_flex().children(modifiers).mr_0p5().into_any_element());
+        } else {
+            elements.extend(modifiers);
+        }
+        elements.push(render_key(
+            keystroke.key(),
+            color,
+            platform_style,
+            size,
+            style,
         ));
-        elements.push(render_key(keystroke.key(), color, platform_style, size));
         elements
     }
 }
@@ -255,6 +416,24 @@ pub fn render_modifiers(
     size: Option<AbsoluteLength>,
     trailing_separator: bool,
 ) -> impl Iterator<Item = AnyElement> {
+    render_modifiers_with_style(
+        modifiers,
+        platform_style,
+        color,
+        size,
+        trailing_separator,
+        KeyBindingStyle::Default,
+    )
+}
+
+fn render_modifiers_with_style(
+    modifiers: &Modifiers,
+    platform_style: PlatformStyle,
+    color: Option<Color>,
+    size: Option<AbsoluteLength>,
+    trailing_separator: bool,
+    style: KeyBindingStyle,
+) -> impl Iterator<Item = AnyElement> {
     #[derive(Clone)]
     enum KeyOrIcon {
         Key(&'static str),
@@ -269,37 +448,42 @@ pub fn render_modifiers(
         windows: KeyOrIcon,
     }
 
+    let mac_modifier = |icon, label| match style {
+        KeyBindingStyle::Default => KeyOrIcon::Icon(icon),
+        KeyBindingStyle::Label => KeyOrIcon::Key(label),
+    };
+
     let table = {
         use KeyOrIcon::*;
 
         [
             Modifier {
                 enabled: modifiers.function,
-                mac: Icon(IconName::Control),
+                mac: mac_modifier(IconName::Control, "Fn"),
                 linux: Key("Fn"),
                 windows: Key("Fn"),
             },
             Modifier {
                 enabled: modifiers.control,
-                mac: Icon(IconName::Control),
+                mac: mac_modifier(IconName::Control, "⌃"),
                 linux: Key("Ctrl"),
                 windows: Key("Ctrl"),
             },
             Modifier {
                 enabled: modifiers.alt,
-                mac: Icon(IconName::Option),
+                mac: mac_modifier(IconName::Option, "⌥"),
                 linux: Key("Alt"),
                 windows: Key("Alt"),
             },
             Modifier {
                 enabled: modifiers.platform,
-                mac: Icon(IconName::Command),
+                mac: mac_modifier(IconName::Command, "⌘"),
                 linux: Key("Super"),
                 windows: Key("Win"),
             },
             Modifier {
                 enabled: modifiers.shift,
-                mac: Icon(IconName::Shift),
+                mac: mac_modifier(IconName::Shift, "⇧"),
                 linux: Key("Shift"),
                 windows: Key("Shift"),
             },
@@ -311,11 +495,13 @@ pub fn render_modifiers(
         .filter(|modifier| modifier.enabled)
         .collect::<Vec<_>>();
 
-    let platform_keys = filtered.into_iter().map(move |modifier| match platform_style {
-        PlatformStyle::Mac => Some(modifier.mac),
-        PlatformStyle::Linux => Some(modifier.linux),
-        PlatformStyle::Windows => Some(modifier.windows),
-    });
+    let platform_keys = filtered
+        .into_iter()
+        .map(move |modifier| match platform_style {
+            PlatformStyle::Mac => Some(modifier.mac),
+            PlatformStyle::Linux => Some(modifier.linux),
+            PlatformStyle::Windows => Some(modifier.windows),
+        });
 
     let separator = match platform_style {
         PlatformStyle::Mac => None,
@@ -333,9 +519,15 @@ pub fn render_modifiers(
         })
         .flatten()
         .map(move |key_or_icon| match key_or_icon {
-            KeyOrIcon::Key(key) => Key::new(key, color).size(size).into_any_element(),
+            KeyOrIcon::Key(key) => match style {
+                KeyBindingStyle::Default => Key::new(key, color).size(size).into_any_element(),
+                KeyBindingStyle::Label => LabelKey::new(key, color).size(size).into_any_element(),
+            },
             KeyOrIcon::Icon(icon) => KeyIcon::new(icon, color).size(size).into_any_element(),
-            KeyOrIcon::Plus => "+".into_any_element(),
+            KeyOrIcon::Plus => match style {
+                KeyBindingStyle::Default => "+".into_any_element(),
+                KeyBindingStyle::Label => LabelKey::new("+", color).size(size).into_any_element(),
+            },
         })
 }
 
@@ -349,7 +541,9 @@ pub struct Key {
 impl RenderOnce for Key {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let single_char = self.key.len() == 1;
-        let size = self.size.unwrap_or_else(|| TextSize::default().rems(cx).into());
+        let size = self
+            .size
+            .unwrap_or_else(|| TextSize::default().rems(cx).into());
 
         div()
             .py_0()
@@ -378,6 +572,41 @@ impl Key {
     }
 
     pub fn size(mut self, size: impl Into<Option<AbsoluteLength>>) -> Self {
+        self.size = size.into();
+        self
+    }
+}
+
+#[derive(IntoElement)]
+struct LabelKey {
+    key: SharedString,
+    color: Option<Color>,
+    size: Option<AbsoluteLength>,
+}
+
+impl RenderOnce for LabelKey {
+    fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let size = self
+            .size
+            .map(|size| LabelSize::Custom(size.to_rems(window.rem_size())))
+            .unwrap_or_default();
+
+        Label::new(self.key)
+            .size(size)
+            .color(self.color.unwrap_or(Color::Default))
+    }
+}
+
+impl LabelKey {
+    fn new(key: impl Into<SharedString>, color: Option<Color>) -> Self {
+        Self {
+            key: key.into(),
+            color,
+            size: None,
+        }
+    }
+
+    fn size(mut self, size: impl Into<Option<AbsoluteLength>>) -> Self {
         self.size = size.into();
         self
     }
@@ -426,7 +655,14 @@ pub fn text_for_keystrokes(keystrokes: &[Keystroke], cx: &App) -> String {
     let vim_enabled = KeyBinding::is_vim_mode(cx);
     keystrokes
         .iter()
-        .map(|keystroke| keystroke_text(&keystroke.modifiers, &keystroke.key, platform_style, vim_enabled))
+        .map(|keystroke| {
+            keystroke_text(
+                &keystroke.modifiers,
+                &keystroke.key,
+                platform_style,
+                vim_enabled,
+            )
+        })
         .join(" ")
 }
 
@@ -435,7 +671,14 @@ pub fn text_for_keybinding_keystrokes(keystrokes: &[KeybindingKeystroke], cx: &A
     let vim_enabled = KeyBinding::is_vim_mode(cx);
     keystrokes
         .iter()
-        .map(|keystroke| keystroke_text(keystroke.modifiers(), keystroke.key(), platform_style, vim_enabled))
+        .map(|keystroke| {
+            keystroke_text(
+                keystroke.modifiers(),
+                keystroke.key(),
+                platform_style,
+                vim_enabled,
+            )
+        })
         .join(" ")
 }
 
@@ -445,7 +688,12 @@ pub fn text_for_keystroke(modifiers: &Modifiers, key: &str, cx: &App) -> String 
 }
 
 /// Returns a textual representation of the given [`Keystroke`].
-fn keystroke_text(modifiers: &Modifiers, key: &str, platform_style: PlatformStyle, vim_mode: bool) -> String {
+fn keystroke_text(
+    modifiers: &Modifiers,
+    key: &str,
+    platform_style: PlatformStyle,
+    vim_mode: bool,
+) -> String {
     let mut text = String::new();
     let delimiter = '-';
 
@@ -506,7 +754,7 @@ fn keystroke_text(modifiers: &Modifiers, key: &str, platform_style: PlatformStyl
         let key = match key {
             "pageup" => "PageUp",
             "pagedown" => "PageDown",
-            key => &util::capitalize(key),
+            key => &capitalize(key),
         };
         text.push_str(key);
     }
@@ -523,83 +771,77 @@ impl Component for KeyBinding {
         "KeyBinding"
     }
 
-    fn description() -> Option<&'static str> {
-        Some("A component that displays a key binding, supporting different platform styles and vim mode.")
+    fn description() -> &'static str {
+        "A component that displays a key binding, \
+        supporting different platform styles and vim mode."
     }
 
-    // fn preview(_window: &mut Window, cx: &mut App) -> Option<AnyElement> {
-    //     Some(
-    //         v_flex()
-    //             .gap_6()
-    //             .children(vec![
-    //                 example_group_with_title(
-    //                     "Basic Usage",
-    //                     vec![
-    //                         single_example(
-    //                             "Default",
-    //                             KeyBinding::new_from_gpui(
-    //                                 gpui::KeyBinding::new("ctrl-s", gpui::NoAction, None),
-    //                                 cx,
-    //                             )
-    //                             .into_any_element(),
-    //                         ),
-    //                         single_example(
-    //                             "Mac Style",
-    //                             KeyBinding::new_from_gpui(
-    //                                 gpui::KeyBinding::new("cmd-s", gpui::NoAction, None),
-    //                                 cx,
-    //                             )
-    //                             .platform_style(PlatformStyle::Mac)
-    //                             .into_any_element(),
-    //                         ),
-    //                         single_example(
-    //                             "Windows Style",
-    //                             KeyBinding::new_from_gpui(
-    //                                 gpui::KeyBinding::new("ctrl-s", gpui::NoAction, None),
-    //                                 cx,
-    //                             )
-    //                             .platform_style(PlatformStyle::Windows)
-    //                             .into_any_element(),
-    //                         ),
-    //                     ],
-    //                 ),
-    //                 example_group_with_title(
-    //                     "Vim Mode",
-    //                     vec![single_example(
-    //                         "Vim Mode Enabled",
-    //                         KeyBinding::new_from_gpui(
-    //                             gpui::KeyBinding::new("dd", gpui::NoAction, None),
-    //                             cx,
-    //                         )
-    //                         .vim_mode(true)
-    //                         .into_any_element(),
-    //                     )],
-    //                 ),
-    //                 example_group_with_title(
-    //                     "Complex Bindings",
-    //                     vec![
-    //                         single_example(
-    //                             "Multiple Keys",
-    //                             KeyBinding::new_from_gpui(
-    //                                 gpui::KeyBinding::new("ctrl-k ctrl-b", gpui::NoAction, None),
-    //                                 cx,
-    //                             )
-    //                             .into_any_element(),
-    //                         ),
-    //                         single_example(
-    //                             "With Shift",
-    //                             KeyBinding::new_from_gpui(
-    //                                 gpui::KeyBinding::new("shift-cmd-p", gpui::NoAction, None),
-    //                                 cx,
-    //                             )
-    //                             .into_any_element(),
-    //                         ),
-    //                     ],
-    //                 ),
-    //             ])
-    //             .into_any_element(),
-    //     )
-    // }
+    fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
+        fn keybinding(input: &str) -> KeyBinding {
+            let keystrokes: Rc<[KeybindingKeystroke]> = input
+                .split_whitespace()
+                .filter_map(|chunk| Keystroke::parse(chunk).ok())
+                .map(KeybindingKeystroke::from_keystroke)
+                .collect::<Vec<_>>()
+                .into();
+            KeyBinding::from_keystrokes(keystrokes, false)
+        }
+
+        v_flex()
+            .gap_6()
+            .children(vec![
+                example_group_with_title(
+                    "Platform Styles",
+                    vec![
+                        single_example(
+                            "Mac Style",
+                            keybinding("cmd-s")
+                                .platform_style(PlatformStyle::Mac)
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "Linux Style",
+                            keybinding("ctrl-s")
+                                .platform_style(PlatformStyle::Linux)
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "Windows Style",
+                            keybinding("ctrl-s")
+                                .platform_style(PlatformStyle::Windows)
+                                .into_any_element(),
+                        ),
+                    ],
+                ),
+                example_group_with_title(
+                    "Vim Mode Style",
+                    vec![
+                        single_example(
+                            "Simple",
+                            keybinding("s")
+                                .platform_style(PlatformStyle::Mac)
+                                .vim_mode(true)
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "With Modifiers",
+                            keybinding("ctrl-s")
+                                .platform_style(PlatformStyle::Linux)
+                                .vim_mode(true)
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "With other special key",
+                            keybinding("ctrl-escape")
+                                .platform_style(PlatformStyle::Windows)
+                                .vim_mode(true)
+                                .into_any_element(),
+                        ),
+                    ],
+                ),
+            ])
+            .into_any_element()
+    }
 }
 
 #[cfg(test)]
@@ -610,43 +852,88 @@ mod tests {
     fn test_text_for_keystroke() {
         let keystroke = Keystroke::parse("cmd-c").unwrap();
         assert_eq!(
-            keystroke_text(&keystroke.modifiers, &keystroke.key, PlatformStyle::Mac, false),
+            keystroke_text(
+                &keystroke.modifiers,
+                &keystroke.key,
+                PlatformStyle::Mac,
+                false
+            ),
             "Command-C".to_string()
         );
         assert_eq!(
-            keystroke_text(&keystroke.modifiers, &keystroke.key, PlatformStyle::Linux, false),
+            keystroke_text(
+                &keystroke.modifiers,
+                &keystroke.key,
+                PlatformStyle::Linux,
+                false
+            ),
             "Super-C".to_string()
         );
         assert_eq!(
-            keystroke_text(&keystroke.modifiers, &keystroke.key, PlatformStyle::Windows, false),
+            keystroke_text(
+                &keystroke.modifiers,
+                &keystroke.key,
+                PlatformStyle::Windows,
+                false
+            ),
             "Win-C".to_string()
         );
 
         let keystroke = Keystroke::parse("ctrl-alt-delete").unwrap();
         assert_eq!(
-            keystroke_text(&keystroke.modifiers, &keystroke.key, PlatformStyle::Mac, false),
+            keystroke_text(
+                &keystroke.modifiers,
+                &keystroke.key,
+                PlatformStyle::Mac,
+                false
+            ),
             "Control-Option-Delete".to_string()
         );
         assert_eq!(
-            keystroke_text(&keystroke.modifiers, &keystroke.key, PlatformStyle::Linux, false),
+            keystroke_text(
+                &keystroke.modifiers,
+                &keystroke.key,
+                PlatformStyle::Linux,
+                false
+            ),
             "Ctrl-Alt-Delete".to_string()
         );
         assert_eq!(
-            keystroke_text(&keystroke.modifiers, &keystroke.key, PlatformStyle::Windows, false),
+            keystroke_text(
+                &keystroke.modifiers,
+                &keystroke.key,
+                PlatformStyle::Windows,
+                false
+            ),
             "Ctrl-Alt-Delete".to_string()
         );
 
         let keystroke = Keystroke::parse("shift-pageup").unwrap();
         assert_eq!(
-            keystroke_text(&keystroke.modifiers, &keystroke.key, PlatformStyle::Mac, false),
+            keystroke_text(
+                &keystroke.modifiers,
+                &keystroke.key,
+                PlatformStyle::Mac,
+                false
+            ),
             "Shift-PageUp".to_string()
         );
         assert_eq!(
-            keystroke_text(&keystroke.modifiers, &keystroke.key, PlatformStyle::Linux, false,),
+            keystroke_text(
+                &keystroke.modifiers,
+                &keystroke.key,
+                PlatformStyle::Linux,
+                false,
+            ),
             "Shift-PageUp".to_string()
         );
         assert_eq!(
-            keystroke_text(&keystroke.modifiers, &keystroke.key, PlatformStyle::Windows, false),
+            keystroke_text(
+                &keystroke.modifiers,
+                &keystroke.key,
+                PlatformStyle::Windows,
+                false
+            ),
             "Shift-PageUp".to_string()
         );
     }

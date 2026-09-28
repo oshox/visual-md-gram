@@ -1,3 +1,4 @@
+mod azure;
 mod bitbucket;
 mod chromium;
 mod forgejo;
@@ -6,7 +7,9 @@ mod gitee;
 mod github;
 mod gitlab;
 mod sourcehut;
+mod tangled;
 
+pub use azure::*;
 pub use bitbucket::*;
 pub use chromium::*;
 pub use forgejo::*;
@@ -15,3 +18,4 @@ pub use gitee::*;
 pub use github::*;
 pub use gitlab::*;
 pub use sourcehut::*;
+pub use tangled::*;

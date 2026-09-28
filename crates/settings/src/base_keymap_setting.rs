@@ -7,30 +7,34 @@ use settings::{RegisterSetting, Settings};
 
 /// Base key bindings scheme. Base keymaps can be overridden with user keymaps.
 ///
-/// Default: VSCode
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default, RegisterSetting)]
+/// Default: Zed
+#[derive(
+    Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default, RegisterSetting,
+)]
 pub enum BaseKeymap {
+    #[default]
+    Zed,
     VSCode,
     JetBrains,
     SublimeText,
     Atom,
     TextMate,
-    #[default]
     Emacs,
-    Minimal,
+    Cursor,
     None,
 }
 
 impl From<BaseKeymapContent> for BaseKeymap {
     fn from(value: BaseKeymapContent) -> Self {
         match value {
+            BaseKeymapContent::Zed => Self::Zed,
             BaseKeymapContent::VSCode => Self::VSCode,
             BaseKeymapContent::JetBrains => Self::JetBrains,
             BaseKeymapContent::SublimeText => Self::SublimeText,
             BaseKeymapContent::Atom => Self::Atom,
             BaseKeymapContent::TextMate => Self::TextMate,
             BaseKeymapContent::Emacs => Self::Emacs,
-            BaseKeymapContent::Minimal => Self::Minimal,
+            BaseKeymapContent::Cursor => Self::Cursor,
             BaseKeymapContent::None => Self::None,
         }
     }
@@ -38,13 +42,14 @@ impl From<BaseKeymapContent> for BaseKeymap {
 impl Into<BaseKeymapContent> for BaseKeymap {
     fn into(self) -> BaseKeymapContent {
         match self {
+            BaseKeymap::Zed => BaseKeymapContent::Zed,
             BaseKeymap::VSCode => BaseKeymapContent::VSCode,
             BaseKeymap::JetBrains => BaseKeymapContent::JetBrains,
             BaseKeymap::SublimeText => BaseKeymapContent::SublimeText,
             BaseKeymap::Atom => BaseKeymapContent::Atom,
             BaseKeymap::TextMate => BaseKeymapContent::TextMate,
             BaseKeymap::Emacs => BaseKeymapContent::Emacs,
-            BaseKeymap::Minimal => BaseKeymapContent::Minimal,
+            BaseKeymap::Cursor => BaseKeymapContent::Cursor,
             BaseKeymap::None => BaseKeymapContent::None,
         }
     }
@@ -53,13 +58,14 @@ impl Into<BaseKeymapContent> for BaseKeymap {
 impl Display for BaseKeymap {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            BaseKeymap::Zed => write!(f, "Zed"),
             BaseKeymap::VSCode => write!(f, "VS Code"),
             BaseKeymap::JetBrains => write!(f, "JetBrains"),
             BaseKeymap::SublimeText => write!(f, "Sublime Text"),
             BaseKeymap::Atom => write!(f, "Atom"),
             BaseKeymap::TextMate => write!(f, "TextMate"),
-            BaseKeymap::Emacs => write!(f, "Emacs"),
-            BaseKeymap::Minimal => write!(f, "Minimal"),
+            BaseKeymap::Emacs => write!(f, "Emacs (beta)"),
+            BaseKeymap::Cursor => write!(f, "Cursor (beta)"),
             BaseKeymap::None => write!(f, "None"),
         }
     }
@@ -67,49 +73,53 @@ impl Display for BaseKeymap {
 
 impl BaseKeymap {
     #[cfg(target_os = "macos")]
-    pub const OPTIONS: [(&'static str, Self); 7] = [
+    pub const OPTIONS: [(&'static str, Self); 8] = [
+        ("Zed (Default)", Self::Zed),
         ("VS Code", Self::VSCode),
         ("Atom", Self::Atom),
         ("JetBrains", Self::JetBrains),
         ("Sublime Text", Self::SublimeText),
-        ("Emacs", Self::Emacs),
+        ("Emacs (beta)", Self::Emacs),
         ("TextMate", Self::TextMate),
-        ("Minimal", Self::Minimal),
+        ("Cursor", Self::Cursor),
     ];
 
     #[cfg(not(target_os = "macos"))]
-    pub const OPTIONS: [(&'static str, Self); 6] = [
+    pub const OPTIONS: [(&'static str, Self); 7] = [
+        ("Zed (Default)", Self::Zed),
         ("VS Code", Self::VSCode),
         ("Atom", Self::Atom),
         ("JetBrains", Self::JetBrains),
         ("Sublime Text", Self::SublimeText),
-        ("Emacs", Self::Emacs),
-        ("Minimal", Self::Minimal),
+        ("Emacs (beta)", Self::Emacs),
+        ("Cursor", Self::Cursor),
     ];
 
     pub fn asset_path(&self) -> Option<&'static str> {
         #[cfg(target_os = "macos")]
         match self {
-            BaseKeymap::Atom => Some("keymaps/macos/atom.jsonc"),
-            BaseKeymap::Emacs => Some("keymaps/macos/emacs.jsonc"),
-            BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.jsonc"),
-            BaseKeymap::Minimal => Some("keymaps/macos/minimal.jsonc"),
+            BaseKeymap::JetBrains => Some("keymaps/macos/jetbrains.json"),
+            BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.json"),
+            BaseKeymap::Atom => Some("keymaps/macos/atom.json"),
+            BaseKeymap::TextMate => Some("keymaps/macos/textmate.json"),
+            BaseKeymap::Emacs => Some("keymaps/macos/emacs.json"),
+            BaseKeymap::Cursor => Some("keymaps/macos/cursor.json"),
+            BaseKeymap::VSCode => Some("keymaps/macos/vscode.json"),
+            BaseKeymap::Zed => None,
             BaseKeymap::None => None,
-            BaseKeymap::SublimeText => Some("keymaps/macos/sublime_text.jsonc"),
-            BaseKeymap::TextMate => Some("keymaps/macos/textmate.jsonc"),
-            BaseKeymap::VSCode => None,
         }
 
         #[cfg(not(target_os = "macos"))]
         match self {
-            BaseKeymap::Atom => Some("keymaps/linux/atom.jsonc"),
-            BaseKeymap::Emacs => Some("keymaps/linux/emacs.jsonc"),
-            BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.jsonc"),
-            BaseKeymap::Minimal => Some("keymaps/linux/minimal.jsonc"),
-            BaseKeymap::None => None,
-            BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.jsonc"),
+            BaseKeymap::JetBrains => Some("keymaps/linux/jetbrains.json"),
+            BaseKeymap::SublimeText => Some("keymaps/linux/sublime_text.json"),
+            BaseKeymap::Atom => Some("keymaps/linux/atom.json"),
+            BaseKeymap::Emacs => Some("keymaps/linux/emacs.json"),
+            BaseKeymap::Cursor => Some("keymaps/linux/cursor.json"),
             BaseKeymap::TextMate => None,
-            BaseKeymap::VSCode => None,
+            BaseKeymap::VSCode => Some("keymaps/linux/vscode.json"),
+            BaseKeymap::Zed => None,
+            BaseKeymap::None => None,
         }
     }
 

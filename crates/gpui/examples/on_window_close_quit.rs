@@ -1,7 +1,13 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
+#[path = "example_support/fonts.rs"]
+mod example_support;
+
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, KeyBinding, Window, WindowBounds, WindowOptions, actions, div,
-    prelude::*, px, rgb, size,
+    App, Bounds, Context, FocusHandle, KeyBinding, Window, WindowBounds, WindowOptions, actions,
+    div, prelude::*, px, rgb, size,
 };
+use gpui_platform::application;
 
 actions!(example, [CloseWindow]);
 
@@ -28,16 +34,21 @@ impl Render for ExampleWindow {
             .border_color(rgb(0x0000ff))
             .text_xl()
             .text_color(rgb(0xffffff))
-            .child("Closing this window with cmd-w or the traffic lights should quit the application!")
+            .child(
+                "Closing this window with cmd-w or the traffic lights should quit the application!",
+            )
     }
 }
 
-fn main() {
-    Application::new().run(|cx: &mut App| {
+fn run_example() {
+    application().run(|cx: &mut App| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         let mut bounds = Bounds::centered(None, size(px(500.), px(500.0)), cx);
 
         cx.bind_keys([KeyBinding::new("cmd-w", CloseWindow, None)]);
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _window_id| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -50,7 +61,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                cx.activate();
+                cx.activate(false);
                 cx.new(|cx| {
                     let focus_handle = cx.focus_handle();
                     focus_handle.focus(window, cx);
@@ -77,4 +88,16 @@ fn main() {
         )
         .unwrap();
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

@@ -34,7 +34,11 @@ impl Manager {
         cx.global::<GlobalManager>().0.clone()
     }
 
-    pub fn maintain_project_connection(&mut self, project: &Entity<Project>, cx: &mut Context<Self>) {
+    pub fn maintain_project_connection(
+        &mut self,
+        project: &Entity<Project>,
+        cx: &mut Context<Self>,
+    ) {
         let manager = cx.weak_entity();
         project.update(cx, |_, cx| {
             let manager = manager.clone();
@@ -61,7 +65,11 @@ impl Manager {
         if self.maintain_connection.is_none() {
             self.maintain_connection = Some(cx.spawn({
                 let client = self.client.clone();
-                async move |_, cx| Self::maintain_connection(manager, client.clone(), cx).await.log_err()
+                async move |_, cx| {
+                    Self::maintain_connection(manager, client.clone(), cx)
+                        .await
+                        .log_err()
+                }
             }));
         }
     }
@@ -133,7 +141,11 @@ impl Manager {
         self.maintain_connection.take();
     }
 
-    async fn maintain_connection(this: WeakEntity<Self>, client: Arc<Client>, cx: &mut AsyncApp) -> Result<()> {
+    async fn maintain_connection(
+        this: WeakEntity<Self>,
+        client: Arc<Client>,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
         let mut client_status = client.status();
         loop {
             let _ = client_status.try_recv();
@@ -145,7 +157,8 @@ impl Manager {
 
                 // Wait for client to re-establish a connection to the server.
                 {
-                    let mut reconnection_timeout = cx.background_executor().timer(RECONNECT_TIMEOUT).fuse();
+                    let mut reconnection_timeout =
+                        cx.background_executor().timer(RECONNECT_TIMEOUT).fuse();
                     let client_reconnection = async {
                         let mut remaining_attempts = 3;
                         while remaining_attempts > 0 {
@@ -153,15 +166,11 @@ impl Manager {
                                 log::info!("client reconnected, attempting to rejoin projects");
 
                                 let Some(this) = this.upgrade() else { break };
-                                match this.update(cx, |this, cx| this.reconnected(cx)) {
-                                    Ok(task) => {
-                                        if task.await.log_err().is_some() {
-                                            return true;
-                                        } else {
-                                            remaining_attempts -= 1;
-                                        }
-                                    }
-                                    Err(_app_dropped) => return false,
+                                let task = this.update(cx, |this, cx| this.reconnected(cx));
+                                if task.await.log_err().is_some() {
+                                    return true;
+                                } else {
+                                    remaining_attempts -= 1;
                                 }
                             } else if client_status.borrow().is_signed_out() {
                                 return false;
@@ -202,7 +211,7 @@ impl Manager {
         // we leave the room and return an error.
         if let Some(this) = this.upgrade() {
             log::info!("reconnection failed, disconnecting projects");
-            this.update(cx, |this, cx| this.connection_lost(cx))?;
+            this.update(cx, |this, cx| this.connection_lost(cx));
         }
 
         Ok(())
