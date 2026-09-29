@@ -13,7 +13,9 @@ use async_trait::async_trait;
 use codelldb::CodeLldbDebugAdapter;
 use dap::{
     DapRegistry,
-    adapters::{self, AdapterVersion, DapDelegate, DebugAdapter, DebugAdapterBinary, DebugAdapterName},
+    adapters::{
+        self, AdapterVersion, DapDelegate, DebugAdapter, DebugAdapterBinary, DebugAdapterName,
+    },
     configure_tcp_connection,
 };
 use gdb::GdbDebugAdapter;
@@ -22,7 +24,7 @@ use gpui::{App, BorrowAppContext};
 use javascript::JsDebugAdapter;
 use python::PythonDebugAdapter;
 use serde_json::json;
-use task::{DebugScenario, GramDebugConfig};
+use task::{DebugScenario, ZedDebugConfig};
 
 pub fn init(cx: &mut App) {
     cx.update_default_global(|registry: &mut DapRegistry, _cx| {

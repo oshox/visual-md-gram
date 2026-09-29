@@ -4,7 +4,6 @@ pub use ::proto::*;
 
 use async_tungstenite::tungstenite::Message as WebSocketMessage;
 use futures::{SinkExt as _, StreamExt as _};
-use proto::Message as _;
 use std::time::Instant;
 use std::{fmt::Debug, io};
 
@@ -47,19 +46,29 @@ where
 
         match message {
             Message::Envelope(message) => {
-                self.encoding_buffer.reserve(message.encoded_len());
-                message.encode(&mut self.encoding_buffer).map_err(io::Error::from)?;
-                let buffer = zstd::stream::encode_all(self.encoding_buffer.as_slice(), COMPRESSION_LEVEL).unwrap();
+                self.encoding_buffer.reserve(message.encoded_size());
+                message
+                    .encode_to_buffer(&mut self.encoding_buffer)
+                    .map_err(io::Error::from)?;
+                let buffer =
+                    zstd::stream::encode_all(self.encoding_buffer.as_slice(), COMPRESSION_LEVEL)
+                        .unwrap();
 
                 self.encoding_buffer.clear();
                 self.encoding_buffer.shrink_to(MAX_BUFFER_LEN);
-                self.stream.send(WebSocketMessage::Binary(buffer.into())).await?;
+                self.stream
+                    .send(WebSocketMessage::Binary(buffer.into()))
+                    .await?;
             }
             Message::Ping => {
-                self.stream.send(WebSocketMessage::Ping(Default::default())).await?;
+                self.stream
+                    .send(WebSocketMessage::Ping(Default::default()))
+                    .await?;
             }
             Message::Pong => {
-                self.stream.send(WebSocketMessage::Pong(Default::default())).await?;
+                self.stream
+                    .send(WebSocketMessage::Pong(Default::default()))
+                    .await?;
             }
         }
 
@@ -76,8 +85,12 @@ where
             let received_at = Instant::now();
             match bytes? {
                 WebSocketMessage::Binary(bytes) => {
-                    zstd::stream::copy_decode(&bytes[..], &mut self.encoding_buffer)?;
-                    let envelope = Envelope::decode(self.encoding_buffer.as_slice()).map_err(io::Error::from)?;
+                    zstd::stream::copy_decode(
+                        zstd::zstd_safe::WriteBuf::as_slice(&*bytes),
+                        &mut self.encoding_buffer,
+                    )?;
+                    let envelope = Envelope::decode_from_slice(self.encoding_buffer.as_slice())
+                        .map_err(io::Error::from)?;
 
                     self.encoding_buffer.clear();
                     self.encoding_buffer.shrink_to(MAX_BUFFER_LEN);

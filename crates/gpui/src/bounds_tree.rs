@@ -3,6 +3,7 @@ use std::{
     cmp,
     fmt::Debug,
     ops::{Add, Sub},
+    ptr::NonNull,
 };
 
 /// Maximum children per internal node (R-tree style branching factor).
@@ -30,7 +31,7 @@ where
     /// Reusable stack for tree traversal during insertion.
     insert_path: Vec<usize>,
     /// Reusable stack for search operations.
-    search_stack: Vec<usize>,
+    search_stack: Vec<NonNull<Node<U>>>,
 }
 
 /// A node in the bounds tree.
@@ -94,7 +95,14 @@ impl NodeChildren {
 
 impl<U> BoundsTree<U>
 where
-    U: Clone + Debug + PartialEq + PartialOrd + Add<U, Output = U> + Sub<Output = U> + Half + Default,
+    U: Clone
+        + Debug
+        + PartialEq
+        + PartialOrd
+        + Add<U, Output = U>
+        + Sub<Output = U>
+        + Half
+        + Default,
 {
     /// Clears all nodes from the tree.
     pub fn clear(&mut self) {
@@ -143,12 +151,14 @@ where
 
         // Slow path: search the tree
         self.search_stack.clear();
-        self.search_stack.push(root_idx);
+        self.search_stack.push(NonNull::from(&self.nodes[root_idx]));
 
         let mut max_found = 0u32;
 
-        while let Some(node_idx) = self.search_stack.pop() {
-            let node = &self.nodes[node_idx];
+        while let Some(node) = self.search_stack.pop() {
+            // SAFETY: `node` is guaranteed to be valid as the `nodes` stack is unmodified in this function
+            // and the `search_stack` only contains pointers from this function call.
+            let node = unsafe { node.as_ref() };
 
             // Pruning: skip if this subtree can't improve our result
             if node.max_order <= max_found {
@@ -167,11 +177,14 @@ where
                 NodeKind::Internal { children } => {
                     // Children are maintained with highest max_order at the end.
                     // Push in forward order to highest (last) is popped first.
-                    for &child_idx in children.as_slice() {
-                        if self.nodes[child_idx].max_order > max_found {
-                            self.search_stack.push(child_idx);
-                        }
-                    }
+                    self.search_stack.extend(
+                        children
+                            .as_slice()
+                            .iter()
+                            .map(|&child_idx| &self.nodes[child_idx])
+                            .filter(|node| node.max_order > max_found)
+                            .map(NonNull::from),
+                    );
                 }
             }
         }
@@ -235,7 +248,9 @@ where
             // Find the best child to descend into
             let mut best_child_idx = children.as_slice()[0];
             let mut best_child_pos = 0;
-            let mut best_cost = bounds.union(&self.nodes[best_child_idx].bounds).half_perimeter();
+            let mut best_cost = bounds
+                .union(&self.nodes[best_child_idx].bounds)
+                .half_perimeter();
 
             for (pos, &child_idx) in children.as_slice().iter().enumerate().skip(1) {
                 let cost = bounds.union(&self.nodes[child_idx].bounds).half_perimeter();
@@ -285,7 +300,9 @@ where
                     self.nodes.push(Node {
                         bounds: sibling_bounds.union(&bounds),
                         max_order: new_internal_max,
-                        kind: NodeKind::Internal { children: new_children },
+                        kind: NodeKind::Internal {
+                            children: new_children,
+                        },
                     });
 
                     // Replace the leaf with the new internal in parent
@@ -321,7 +338,8 @@ where
                 // Swap updated child to end (skip first iteration since the invariant is already handled by previous cases)
                 if let Some(child_idx) = updated_child_idx {
                     if let NodeKind::Internal { children } = &mut node.kind {
-                        if let Some(pos) = children.as_slice().iter().position(|&c| c == child_idx) {
+                        if let Some(pos) = children.as_slice().iter().position(|&c| c == child_idx)
+                        {
                             let last = children.len() - 1;
                             if pos != last {
                                 children.indices.swap(pos, last);
@@ -357,7 +375,7 @@ where
 mod tests {
     use super::*;
     use crate::{Bounds, Point, Size};
-    use rand::{RngExt, SeedableRng};
+    use rand::{Rng, SeedableRng};
 
     #[test]
     fn test_insert() {

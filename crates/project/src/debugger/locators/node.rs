@@ -3,13 +3,14 @@ use std::borrow::Cow;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use dap::{DapLocator, DebugRequest, adapters::DebugAdapterName};
-use gpui::SharedString;
+use gpui::{BackgroundExecutor, SharedString};
 
 use task::{DebugScenario, SpawnInTerminal, TaskTemplate, VariableName};
 
 pub(crate) struct NodeLocator;
 
-const TYPESCRIPT_RUNNER_VARIABLE: VariableName = VariableName::Custom(Cow::Borrowed("TYPESCRIPT_RUNNER"));
+const TYPESCRIPT_RUNNER_VARIABLE: VariableName =
+    VariableName::Custom(Cow::Borrowed("TYPESCRIPT_RUNNER"));
 
 #[async_trait]
 impl DapLocator for NodeLocator {
@@ -55,7 +56,7 @@ impl DapLocator for NodeLocator {
         })
     }
 
-    async fn run(&self, _: SpawnInTerminal) -> Result<DebugRequest> {
+    async fn run(&self, _: SpawnInTerminal, _executor: BackgroundExecutor) -> Result<DebugRequest> {
         bail!("JavaScript locator should not require DapLocator::run to be ran");
     }
 }

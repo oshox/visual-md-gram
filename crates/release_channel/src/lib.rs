@@ -1,20 +1,37 @@
-//! Provides constructs for the Gram app version and release channel.
+//! Provides constructs for the Zed app version and release channel.
 
 #![deny(missing_docs)]
 
 use std::{env, str::FromStr, sync::LazyLock};
 
-use gpui::{App, Global, SemanticVersion};
+use gpui::{App, Global};
+use semver::Version;
 
-/// stable | dev
+const ZED_DOCS_URL: &str = "https://zed.dev/docs";
+
+/// stable | dev | nightly | preview
 pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
     if cfg!(debug_assertions) {
-        env::var("GRAM_RELEASE_CHANNEL")
-            .unwrap_or_else(|_| include_str!("../../gram/RELEASE_CHANNEL").trim().to_string())
+        env::var("ZED_RELEASE_CHANNEL").unwrap_or_else(|_| compile_time_release_channel_name())
     } else {
-        include_str!("../../gram/RELEASE_CHANNEL").trim().to_string()
+        compile_time_release_channel_name()
     }
 });
+
+/// When a crate in zed is used as a dependency that uses the `crane` nix
+/// library, it vendors each crate separately and builds it in isolation, which
+/// makes the `include_str!` fail.
+///
+/// The build script checks for `$ZED_RELEASE_CHANNEL` and emits the `cfg`
+#[cfg(__do_not_set_zed_release_channel)]
+fn compile_time_release_channel_name() -> String {
+    env!("ZED_RELEASE_CHANNEL").trim().to_string()
+}
+
+#[cfg(not(__do_not_set_zed_release_channel))]
+fn compile_time_release_channel_name() -> String {
+    include_str!("../../zed/RELEASE_CHANNEL").trim().to_string()
+}
 
 #[doc(hidden)]
 pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
@@ -27,12 +44,14 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
 #[cfg(target_os = "windows")]
 pub fn app_identifier() -> &'static str {
     match *RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "Gram-Editor-Dev",
-        ReleaseChannel::Stable => "Gram-Editor-Stable",
+        ReleaseChannel::Dev => "ZedMD-Editor-Dev",
+        ReleaseChannel::Nightly => "ZedMD-Editor-Nightly",
+        ReleaseChannel::Preview => "ZedMD-Editor-Preview",
+        ReleaseChannel::Stable => "ZedMD-Editor-Stable",
     }
 }
 
-/// The Git commit SHA that Gram was built at.
+/// The Git commit SHA that Zed was built at.
 #[derive(Clone, Eq, Debug, PartialEq)]
 pub struct AppCommitSha(String);
 
@@ -48,7 +67,8 @@ impl AppCommitSha {
 
     /// Returns the global [`AppCommitSha`], if one is set.
     pub fn try_global(cx: &App) -> Option<AppCommitSha> {
-        cx.try_global::<GlobalAppCommitSha>().map(|sha| sha.0.clone())
+        cx.try_global::<GlobalAppCommitSha>()
+            .map(|sha| sha.0.clone())
     }
 
     /// Sets the global [`AppCommitSha`].
@@ -67,41 +87,67 @@ impl AppCommitSha {
     }
 }
 
-struct GlobalAppVersion(SemanticVersion);
+struct GlobalAppVersion(Version);
 
 impl Global for GlobalAppVersion {}
 
-/// The version of Gram.
+/// The version of Zed.
 pub struct AppVersion;
 
 impl AppVersion {
     /// Load the app version from env.
-    pub fn load(pkg_version: &str) -> SemanticVersion {
-        if let Ok(from_env) = env::var("GRAM_APP_VERSION") {
-            from_env.parse().expect("invalid GRAM_APP_VERSION")
+    pub fn load(
+        pkg_version: &str,
+        build_id: Option<&str>,
+        commit_sha: Option<AppCommitSha>,
+    ) -> Version {
+        let mut version: Version = if let Ok(from_env) = env::var("ZED_APP_VERSION") {
+            from_env.parse().expect("invalid ZED_APP_VERSION")
         } else {
             pkg_version.parse().expect("invalid version in Cargo.toml")
+        };
+        let mut pre = String::from(RELEASE_CHANNEL.dev_name());
+
+        if let Some(build_id) = build_id {
+            pre.push('.');
+            pre.push_str(&build_id);
         }
+
+        if let Some(sha) = commit_sha {
+            pre.push('.');
+            pre.push_str(&sha.0);
+        }
+        if let Ok(build) = semver::BuildMetadata::new(&pre) {
+            version.build = build;
+        }
+
+        version
     }
 
     /// Returns the global version number.
-    pub fn global(cx: &App) -> SemanticVersion {
+    pub fn global(cx: &App) -> Version {
         if cx.has_global::<GlobalAppVersion>() {
             cx.global::<GlobalAppVersion>().0.clone()
         } else {
-            SemanticVersion::new(0, 1, 0)
+            Version::new(0, 0, 0)
         }
     }
 }
 
-/// A Gram release channel.
+/// A Zed release channel.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum ReleaseChannel {
     /// The development release channel.
     ///
-    /// Used for local debug builds of Gram.
+    /// Used for local debug builds of Zed.
     #[default]
     Dev,
+
+    /// The Nightly release channel.
+    Nightly,
+
+    /// The Preview release channel.
+    Preview,
 
     /// The Stable release channel.
     Stable,
@@ -112,18 +158,34 @@ struct GlobalReleaseChannel(ReleaseChannel);
 impl Global for GlobalReleaseChannel {}
 
 /// Initializes the release channel.
-pub fn init(app_version: SemanticVersion, cx: &mut App) {
+pub fn init(app_version: Version, cx: &mut App) {
     cx.set_global(GlobalAppVersion(app_version));
     cx.set_global(GlobalReleaseChannel(*RELEASE_CHANNEL))
 }
 
 /// Initializes the release channel for tests that rely on fake release channel.
-pub fn init_test(app_version: SemanticVersion, release_channel: ReleaseChannel, cx: &mut App) {
+pub fn init_test(app_version: Version, release_channel: ReleaseChannel, cx: &mut App) {
     cx.set_global(GlobalAppVersion(app_version));
     cx.set_global(GlobalReleaseChannel(release_channel))
 }
 
+/// Returns the Zed docs URL for the current release channel for the given
+/// `slug`.
+pub fn docs_url(slug: &str, cx: &App) -> String {
+    ReleaseChannel::try_global(cx)
+        .unwrap_or(*RELEASE_CHANNEL)
+        .docs_url(slug)
+}
+
 impl ReleaseChannel {
+    /// All release channels.
+    pub const ALL: [ReleaseChannel; 4] = [
+        ReleaseChannel::Dev,
+        ReleaseChannel::Nightly,
+        ReleaseChannel::Preview,
+        ReleaseChannel::Stable,
+    ];
+
     /// Returns the global [`ReleaseChannel`].
     pub fn global(cx: &App) -> Self {
         cx.global::<GlobalReleaseChannel>().0
@@ -131,7 +193,8 @@ impl ReleaseChannel {
 
     /// Returns the global [`ReleaseChannel`], if one is set.
     pub fn try_global(cx: &App) -> Option<Self> {
-        cx.try_global::<GlobalReleaseChannel>().map(|channel| channel.0)
+        cx.try_global::<GlobalReleaseChannel>()
+            .map(|channel| channel.0)
     }
 
     /// Returns whether we want to poll for updates for this [`ReleaseChannel`]
@@ -142,8 +205,10 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Gram Dev",
-            ReleaseChannel::Stable => "Gram",
+            ReleaseChannel::Dev => "Zed MD Dev",
+            ReleaseChannel::Nightly => "Zed MD Nightly",
+            ReleaseChannel::Preview => "Zed MD Preview",
+            ReleaseChannel::Stable => "Zed MD",
         }
     }
 
@@ -151,17 +216,21 @@ impl ReleaseChannel {
     pub fn dev_name(&self) -> &'static str {
         match self {
             ReleaseChannel::Dev => "dev",
+            ReleaseChannel::Nightly => "nightly",
+            ReleaseChannel::Preview => "preview",
             ReleaseChannel::Stable => "stable",
         }
     }
 
     /// Returns the application ID that's used by Wayland as application ID
     /// and WM_CLASS on X11.
-    /// This also has to match the bundle identifier for Gram on macOS.
+    /// This also has to match the bundle identifier for Zed on macOS.
     pub fn app_id(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "app.liten.Gram-Dev",
-            ReleaseChannel::Stable => "app.liten.Gram",
+            ReleaseChannel::Dev => "dev.zedmd.ZedMD-Dev",
+            ReleaseChannel::Nightly => "dev.zedmd.ZedMD-Nightly",
+            ReleaseChannel::Preview => "dev.zedmd.ZedMD-Preview",
+            ReleaseChannel::Stable => "dev.zedmd.ZedMD",
         }
     }
 
@@ -169,7 +238,26 @@ impl ReleaseChannel {
     pub fn release_query_param(&self) -> Option<&'static str> {
         match self {
             Self::Dev => None,
+            Self::Nightly => Some("nightly=1"),
+            Self::Preview => Some("preview=1"),
             Self::Stable => None,
+        }
+    }
+
+    /// Returns the Zed docs URL for this [`ReleaseChannel`] for the given
+    /// `slug`.
+    pub fn docs_url(&self, slug: &str) -> String {
+        let channel_path_segment = match self {
+            Self::Dev | Self::Nightly => Some("nightly"),
+            Self::Preview => Some("preview"),
+            Self::Stable => None,
+        };
+
+        match channel_path_segment {
+            Some(channel) if slug.is_empty() => format!("{ZED_DOCS_URL}/{channel}"),
+            Some(channel) => format!("{ZED_DOCS_URL}/{channel}/{slug}"),
+            None if slug.is_empty() => ZED_DOCS_URL.to_string(),
+            None => format!("{ZED_DOCS_URL}/{slug}"),
         }
     }
 }
@@ -184,8 +272,35 @@ impl FromStr for ReleaseChannel {
     fn from_str(channel: &str) -> Result<Self, Self::Err> {
         Ok(match channel {
             "dev" => ReleaseChannel::Dev,
+            "nightly" => ReleaseChannel::Nightly,
+            "preview" => ReleaseChannel::Preview,
             "stable" => ReleaseChannel::Stable,
             _ => return Err(InvalidReleaseChannel),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReleaseChannel;
+
+    #[test]
+    fn test_docs_url_for_release_channel() {
+        assert_eq!(
+            ReleaseChannel::Dev.docs_url("settings"),
+            "https://zed.dev/docs/nightly/settings"
+        );
+        assert_eq!(
+            ReleaseChannel::Nightly.docs_url("settings"),
+            "https://zed.dev/docs/nightly/settings"
+        );
+        assert_eq!(
+            ReleaseChannel::Preview.docs_url("settings"),
+            "https://zed.dev/docs/preview/settings"
+        );
+        assert_eq!(
+            ReleaseChannel::Stable.docs_url("settings"),
+            "https://zed.dev/docs/settings"
+        );
     }
 }

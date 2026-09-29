@@ -45,7 +45,13 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 }
 
 impl Vim {
-    fn increment(&mut self, mut delta: i64, step: i32, window: &mut Window, cx: &mut Context<Self>) {
+    fn increment(
+        &mut self,
+        mut delta: i64,
+        step: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.store_visual_marks(window, cx);
         self.update_editor(cx, |vim, editor, cx| {
             let mut edits = Vec::new();
@@ -53,7 +59,9 @@ impl Vim {
 
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             for selection in editor.selections.all_adjusted(&editor.display_snapshot(cx)) {
-                if !selection.is_empty() && (vim.mode != Mode::VisualBlock || new_anchors.is_empty()) {
+                if !selection.is_empty()
+                    && (vim.mode != Mode::VisualBlock || new_anchors.is_empty())
+                {
                     new_anchors.push((true, snapshot.anchor_before(selection.start)))
                 }
                 for row in selection.start.row..=selection.end.row {
@@ -195,18 +203,36 @@ fn find_target(
     let start_offset = start.to_offset(snapshot);
     let end_offset = end.to_offset(snapshot);
 
-    let mut offset = start_offset;
     let mut first_char_is_num = snapshot
-        .chars_at(offset)
+        .chars_at(start_offset)
         .next()
         .map_or(false, |ch| ch.is_ascii_hexdigit());
     let mut pre_char = String::new();
 
-    let next_offset = offset + snapshot.chars_at(start_offset).next().map_or(0, |ch| ch.len_utf8());
-    // Backward scan to find the start of the number, but stop at start_offset
+    let next_offset = start_offset
+        + snapshot
+            .chars_at(start_offset)
+            .next()
+            .map_or(0, |ch| ch.len_utf8());
+    // Backward scan to find the start of the number, but stop at start_offset.
+    // We track `offset` as the start position of the current character. Initialize
+    // to `next_offset` and decrement at the start of each iteration so that `offset`
+    // always lands on a valid character boundary (not in the middle of a multibyte char).
+    let mut offset = next_offset;
     for ch in snapshot.reversed_chars_at(next_offset) {
+        offset -= ch.len_utf8();
+
         // Search boundaries
         if offset.0 == 0 || ch.is_whitespace() || (need_range && offset <= start_offset) {
+            break;
+        }
+
+        // vim's ctrl-a/ctrl-x operate on the number at or after the cursor and
+        // do not require it to be whitespace-separated. Stop the backward scan
+        // at a '-' so we keep the number the cursor is on (e.g. `05` in
+        // `2025-05-10`) instead of scanning past the '-' to an earlier number on
+        // the line. vim folds a leading '-' into the number, making it negative.
+        if ch == '-' {
             break;
         }
 
@@ -226,7 +252,15 @@ fn find_target(
         }
 
         pre_char.insert(0, ch);
-        offset -= ch.len_utf8();
+    }
+
+    // The backward scan breaks on whitespace, including newlines. Without this
+    // skip, the forward scan would start on the newline and immediately break
+    // (since it also breaks on newlines), finding nothing on the current line.
+    if let Some(ch) = snapshot.chars_at(offset).next() {
+        if ch == '\n' {
+            offset += ch.len_utf8();
+        }
     }
 
     let mut begin = None;
@@ -242,7 +276,11 @@ fn find_target(
             break; // stop at end of selection
         }
 
-        if target == "0" && (ch == 'b' || ch == 'B') && chars.peek().is_some() && chars.peek().unwrap().is_digit(2) {
+        if target == "0"
+            && (ch == 'b' || ch == 'B')
+            && chars.peek().is_some()
+            && chars.peek().unwrap().is_digit(2)
+        {
             radix = 2;
             begin = None;
             target = String::new();
@@ -255,6 +293,21 @@ fn find_target(
             begin = None;
             target = String::new();
         } else if ch == '.' {
+            // vim treats '.' as a separator, not a decimal point: ctrl-a/ctrl-x
+            // act on the whole digit run, not a float. So when the cursor is on
+            // the current number, terminate the match at the dot regardless of
+            // what follows it, so `ˇ1. item` and version strings like `0.8ˇ1.46`
+            // (-> `0.82.46`) both increment the number under the cursor. When the
+            // cursor is past the number (`111.ˇ.2`), `on_number` is false and we
+            // still reset so the forward scan finds the number after the dots.
+            let on_number =
+                is_num && begin.is_some_and(|begin| begin >= start_offset || start_offset < offset);
+
+            if on_number {
+                end = Some(offset);
+                break;
+            }
+
             is_num = false;
             begin = None;
             target = String::new();
@@ -301,7 +354,11 @@ fn find_target(
         }
 
         let end = end.unwrap_or(offset);
-        Some((begin.to_point(snapshot)..end.to_point(snapshot), target, radix))
+        Some((
+            begin.to_point(snapshot)..end.to_point(snapshot),
+            target,
+            radix,
+        ))
     } else {
         None
     }
@@ -333,7 +390,9 @@ fn is_numeric_string(s: &str) -> bool {
 
 fn is_toggle_word(word: &str) -> bool {
     let lower = word.to_lowercase();
-    BOOLEAN_PAIRS.iter().any(|(a, b)| lower == *a || lower == *b)
+    BOOLEAN_PAIRS
+        .iter()
+        .any(|(a, b)| lower == *a || lower == *b)
 }
 
 fn increment_toggle_string(boolean: &str) -> String {
@@ -371,7 +430,383 @@ fn increment_toggle_string(boolean: &str) -> String {
 mod test {
     use indoc::indoc;
 
-    use crate::{state::Mode, test::VimTestContext};
+    use crate::{
+        state::Mode,
+        test::{NeovimBackedTestContext, VimTestContext},
+    };
+
+    #[gpui::test]
+    async fn test_increment(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {"
+            1ˇ2
+            "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            1ˇ3
+            "});
+        cx.simulate_shared_keystrokes("ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            1ˇ2
+            "});
+
+        cx.simulate_shared_keystrokes("9 9 ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            11ˇ1
+            "});
+        cx.simulate_shared_keystrokes("1 1 1 ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            ˇ0
+            "});
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            -11ˇ1
+            "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_with_dot(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {"
+            1ˇ.2
+            "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            1.ˇ3
+            "});
+        cx.simulate_shared_keystrokes("ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            1.ˇ2
+            "});
+
+        // '.' is a separator, not a decimal point, so the number the cursor is
+        // on is incremented even without surrounding whitespace.
+        cx.simulate("ctrl-a", "0.8ˇ1.46").await.assert_matches();
+        cx.simulate("ctrl-x", "0.8ˇ1.46").await.assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_increment_with_leading_zeros(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {"
+            000ˇ9
+            "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            001ˇ0
+            "});
+        cx.simulate_shared_keystrokes("2 ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            000ˇ8
+            "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_with_leading_zeros_and_zero(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {"
+            01ˇ1
+            "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            01ˇ2
+            "});
+        cx.simulate_shared_keystrokes("1 2 ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            00ˇ0
+            "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_with_changing_leading_zeros(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {"
+            099ˇ9
+            "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            100ˇ0
+            "});
+        cx.simulate_shared_keystrokes("2 ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            99ˇ8
+            "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_with_two_dots(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {"
+            111.ˇ.2
+            "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            111..ˇ3
+            "});
+        cx.simulate_shared_keystrokes("ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            111..ˇ2
+            "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_sign_change(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+                ˇ0
+                "})
+            .await;
+        cx.simulate_shared_keystrokes("ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                -ˇ1
+                "});
+        cx.simulate_shared_keystrokes("2 ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                ˇ1
+                "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_sign_change_with_leading_zeros(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+                00ˇ1
+                "})
+            .await;
+        cx.simulate_shared_keystrokes("ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                00ˇ0
+                "});
+        cx.simulate_shared_keystrokes("ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                -00ˇ1
+                "});
+        cx.simulate_shared_keystrokes("2 ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                00ˇ1
+                "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_bin_wrapping_and_padding(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+                    0b111111111111111111111111111111111111111111111111111111111111111111111ˇ1
+                    "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    0b000000111111111111111111111111111111111111111111111111111111111111111ˇ1
+                    "});
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    0b000000000000000000000000000000000000000000000000000000000000000000000ˇ0
+                    "});
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    0b000000000000000000000000000000000000000000000000000000000000000000000ˇ1
+                    "});
+        cx.simulate_shared_keystrokes("2 ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    0b000000111111111111111111111111111111111111111111111111111111111111111ˇ1
+                    "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_hex_wrapping_and_padding(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+                    0xfffffffffffffffffffˇf
+                    "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    0x0000fffffffffffffffˇf
+                    "});
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    0x0000000000000000000ˇ0
+                    "});
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    0x0000000000000000000ˇ1
+                    "});
+        cx.simulate_shared_keystrokes("2 ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    0x0000fffffffffffffffˇf
+                    "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_wrapping(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+                    1844674407370955161ˇ9
+                    "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    1844674407370955161ˇ5
+                    "});
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    -1844674407370955161ˇ5
+                    "});
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    -1844674407370955161ˇ4
+                    "});
+        cx.simulate_shared_keystrokes("3 ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    1844674407370955161ˇ4
+                    "});
+        cx.simulate_shared_keystrokes("2 ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    -1844674407370955161ˇ5
+                    "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_inline(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+                    inline0x3ˇ9u32
+                    "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    inline0x3ˇau32
+                    "});
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    inline0x3ˇbu32
+                    "});
+        cx.simulate_shared_keystrokes("l l l ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    inline0x3bu3ˇ3
+                    "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_hex_casing(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+                        0xFˇa
+                    "})
+            .await;
+
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    0xfˇb
+                    "});
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                    0xfˇc
+                    "});
+    }
+
+    #[gpui::test]
+    async fn test_increment_radix(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.simulate("ctrl-a", "ˇ total: 0xff")
+            .await
+            .assert_matches();
+        cx.simulate("ctrl-x", "ˇ total: 0xff")
+            .await
+            .assert_matches();
+        cx.simulate("ctrl-x", "ˇ total: 0xFF")
+            .await
+            .assert_matches();
+        cx.simulate("ctrl-a", "(ˇ0b10f)").await.assert_matches();
+        cx.simulate("ctrl-a", "ˇ-1").await.assert_matches();
+        cx.simulate("ctrl-a", "-ˇ1").await.assert_matches();
+        cx.simulate("ctrl-a", "banˇana").await.assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_increment_steps(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {"
+            ˇ1
+            1
+            1  2
+            1
+            1"})
+            .await;
+
+        cx.simulate_shared_keystrokes("j v shift-g g ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            1
+            ˇ2
+            3  2
+            4
+            5"});
+
+        cx.simulate_shared_keystrokes("shift-g ctrl-v g g").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            «1ˇ»
+            «2ˇ»
+            «3ˇ»  2
+            «4ˇ»
+            «5ˇ»"});
+
+        cx.simulate_shared_keystrokes("g ctrl-x").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            ˇ0
+            0
+            0  2
+            0
+            0"});
+        cx.simulate_shared_keystrokes("v shift-g g ctrl-a").await;
+        cx.simulate_shared_keystrokes("v shift-g 5 g ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            ˇ6
+            12
+            18  2
+            24
+            30"});
+    }
+
+    #[gpui::test]
+    async fn test_increment_negative_numbers(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // vim folds a leading '-' into the number, so ctrl-a on the `05` here
+        // operates on `-05` and decrements the visible digits to `04`.
+        cx.simulate("ctrl-a", "2025-0ˇ5-10").await.assert_matches();
+
+        // Cursor on or just before a trailing '-' (with or without a following
+        // number) must not scan past the '-' into the earlier number.
+        cx.simulate("ctrl-a", "2025-05ˇ-").await.assert_matches();
+        cx.simulate("ctrl-a", "2025-05ˇ- 345")
+            .await
+            .assert_matches();
+    }
 
     #[gpui::test]
     async fn test_increment_toggle(cx: &mut gpui::TestAppContext) {
@@ -455,5 +890,54 @@ mod test {
         cx.set_state("⚡️ˇ⚡️", Mode::Normal);
         cx.simulate_keystrokes("ctrl-a");
         cx.assert_state("⚡️ˇ⚡️", Mode::Normal);
+    }
+
+    #[gpui::test]
+    async fn test_increment_visual_partial_number(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("ˇ123").await;
+        cx.simulate_shared_keystrokes("v l ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"ˇ133"});
+        cx.simulate_shared_keystrokes("l v l ctrl-a").await;
+        cx.shared_state().await.assert_eq(indoc! {"1ˇ34"});
+        cx.simulate_shared_keystrokes("shift-v y p p ctrl-v k k l ctrl-a")
+            .await;
+        cx.shared_state().await.assert_eq(indoc! {"ˇ144\n144\n144"});
+    }
+
+    #[gpui::test]
+    async fn test_increment_markdown_list_markers_multiline(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("# Title\nˇ1. item\n2. item\n3. item")
+            .await;
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state()
+            .await
+            .assert_eq("# Title\nˇ2. item\n2. item\n3. item");
+        cx.simulate_shared_keystrokes("j").await;
+        cx.shared_state()
+            .await
+            .assert_eq("# Title\n2. item\nˇ2. item\n3. item");
+        cx.simulate_shared_keystrokes("ctrl-a").await;
+        cx.shared_state()
+            .await
+            .assert_eq("# Title\n2. item\nˇ3. item\n3. item");
+        cx.simulate_shared_keystrokes("ctrl-x").await;
+        cx.shared_state()
+            .await
+            .assert_eq("# Title\n2. item\nˇ2. item\n3. item");
+    }
+
+    #[gpui::test]
+    async fn test_increment_with_multibyte_characters(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        // Test cursor after a multibyte character - this would panic before the fix
+        // because the backward scan would land in the middle of the Korean character
+        cx.set_state("지ˇ1", Mode::Normal);
+        cx.simulate_keystrokes("ctrl-a");
+        cx.assert_state("지ˇ2", Mode::Normal);
     }
 }

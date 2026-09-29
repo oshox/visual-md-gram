@@ -1,0 +1,70 @@
+# yaml-language-server: $schema=https://www.schemastore.org/github-workflow.json
+#
+# Checks and tests for the Zed MD changes on top of Zed. Manual only, to
+# avoid burning Actions minutes on every push; trigger it from the Actions tab.
+name: Zed MD CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    name: Check and test (Linux)
+    if: github.repository_owner != 'zed-industries'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Free disk space
+        run: |
+          set -x
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+          df -h /
+
+      - name: Checkout repo
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.3
+        with:
+          shared-key: zed-md-linux-debug
+
+      - name: Install dependencies
+        run: ./script/linux
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check the app builds
+        run: cargo check -p zed
+
+      - name: Test Zed MD and the crates it touches
+        run: >-
+          cargo test
+          -p visual_md
+          -p editor
+          -p gpui
+          -p settings_content
+          -p release_channel
+          -p auto_update

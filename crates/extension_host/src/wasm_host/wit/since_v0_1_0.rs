@@ -1,4 +1,7 @@
-use crate::wasm_host::{WasmState, wit::ToWasmtimeResult};
+use crate::wasm_host::{
+    WasmState,
+    wit::{IntoWasmtimeResult, ToWasmtimeResult},
+};
 use ::http_client::{AsyncBody, HttpRequestExt};
 use ::settings::{Settings, WorktreeId};
 use anyhow::{Context as _, Result, bail};
@@ -11,20 +14,19 @@ use gpui::BackgroundExecutor;
 use language::LanguageName;
 use language::{BinaryStatus, language_settings::AllLanguageSettings};
 use project::project_settings::ProjectSettings;
-use semver::Version as SemanticVersion;
+use semver::Version;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
-use url::Url;
 use util::paths::PathStyle;
 use util::rel_path::RelPath;
 use util::{archive::extract_zip, fs::make_file_executable, maybe};
 use wasmtime::component::{Linker, Resource};
 
-use super::latest;
+use super::{latest, since_v0_6_0};
 
-pub const MIN_VERSION: SemanticVersion = SemanticVersion::new(0, 1, 0);
+pub const MIN_VERSION: Version = Version::new(0, 1, 0);
 
 wasmtime::component::bindgen!({
     imports: {
@@ -35,12 +37,13 @@ wasmtime::component::bindgen!({
     },
     path: "../extension_api/wit/since_v0.1.0",
     with: {
-         "worktree": ExtensionWorktree,
-         "key-value-store": ExtensionKeyValueStore,
-         "zed:extension/http-client/http-response-stream": ExtensionHttpResponseStream,
-         "zed:extension/github": latest::zed::extension::github,
-         "zed:extension/nodejs": latest::zed::extension::nodejs,
-         "zed:extension/platform": latest::zed::extension::platform,
+        "worktree": ExtensionWorktree,
+        "key-value-store": ExtensionKeyValueStore,
+        "zed:extension/http-client.http-response-stream": ExtensionHttpResponseStream,
+        "zed:extension/github": since_v0_6_0::zed::extension::github,
+        "zed:extension/nodejs": latest::zed::extension::nodejs,
+        "zed:extension/platform": since_v0_6_0::zed::extension::platform,
+        "zed:extension/slash-command": latest::zed::extension::slash_command,
     },
 });
 
@@ -77,7 +80,13 @@ impl From<SettingsLocation> for latest::SettingsLocation {
     fn from(value: SettingsLocation) -> Self {
         Self {
             worktree_id: value.worktree_id,
-            path: value.path,
+            // Passing the path here causes project settings reads to fail,
+            // since the extension passes the absolute path to the worktree,
+            // not a relative one like the settings API expects.
+            //
+            // This has been fixed in the API itself as of v0.2.0. Align the behavior
+            // here so that older extensions can also read project settings.
+            path: String::new(),
         }
     }
 }
@@ -249,7 +258,7 @@ impl HostKeyValueStore for WasmState {
         kv_store.insert(key, value).await.to_wasmtime_result()
     }
 
-    async fn drop(&mut self, _worktree: Resource<ExtensionKeyValueStore>) -> Result<()> {
+    async fn drop(&mut self, _worktree: Resource<ExtensionKeyValueStore>) -> wasmtime::Result<()> {
         // We only ever hand out borrows of key-value stores.
         Ok(())
     }
@@ -260,7 +269,10 @@ impl HostWorktree for WasmState {
         latest::HostWorktree::id(self, delegate).await
     }
 
-    async fn root_path(&mut self, delegate: Resource<Arc<dyn WorktreeDelegate>>) -> wasmtime::Result<String> {
+    async fn root_path(
+        &mut self,
+        delegate: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> wasmtime::Result<String> {
         latest::HostWorktree::root_path(self, delegate).await
     }
 
@@ -272,7 +284,10 @@ impl HostWorktree for WasmState {
         latest::HostWorktree::read_text_file(self, delegate, path).await
     }
 
-    async fn shell_env(&mut self, delegate: Resource<Arc<dyn WorktreeDelegate>>) -> wasmtime::Result<EnvVars> {
+    async fn shell_env(
+        &mut self,
+        delegate: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> wasmtime::Result<EnvVars> {
         latest::HostWorktree::shell_env(self, delegate).await
     }
 
@@ -284,7 +299,7 @@ impl HostWorktree for WasmState {
         latest::HostWorktree::which(self, delegate, binary_name).await
     }
 
-    async fn drop(&mut self, _worktree: Resource<Worktree>) -> Result<()> {
+    async fn drop(&mut self, _worktree: Resource<Worktree>) -> wasmtime::Result<()> {
         // We only ever hand out borrows of worktrees.
         Ok(())
     }
@@ -299,8 +314,6 @@ impl http_client::Host for WasmState {
     ) -> wasmtime::Result<Result<http_client::HttpResponse, String>> {
         maybe!(async {
             let url = &request.url;
-            let url_obj = Url::parse(url)?;
-            self.capability_granter.grant_download_file(&url_obj)?;
             let request = convert_request(&request)?;
             let mut response = self.host.http_client.send(request).await?;
 
@@ -317,11 +330,9 @@ impl http_client::Host for WasmState {
         &mut self,
         request: http_client::HttpRequest,
     ) -> wasmtime::Result<Result<Resource<ExtensionHttpResponseStream>, String>> {
-        let url_obj = Url::parse(&request.url)?;
-        let request = convert_request(&request)?;
+        let request = convert_request(&request).into_wasmtime_result()?;
         let response = self.host.http_client.send(request);
         maybe!(async {
-            self.capability_granter.grant_download_file(&url_obj)?;
             let response = response.await?;
             let stream = Arc::new(Mutex::new(response));
             let resource = self.table.push(stream)?;
@@ -353,7 +364,10 @@ impl http_client::HostHttpResponseStream for WasmState {
         .to_wasmtime_result()
     }
 
-    async fn drop(&mut self, _resource: Resource<ExtensionHttpResponseStream>) -> Result<()> {
+    async fn drop(
+        &mut self,
+        _resource: Resource<ExtensionHttpResponseStream>,
+    ) -> wasmtime::Result<()> {
         Ok(())
     }
 }
@@ -372,19 +386,27 @@ impl From<http_client::HttpMethod> for ::http_client::Method {
     }
 }
 
-fn convert_request(extension_request: &http_client::HttpRequest) -> anyhow::Result<::http_client::Request<AsyncBody>> {
+fn convert_request(
+    extension_request: &http_client::HttpRequest,
+) -> anyhow::Result<::http_client::Request<AsyncBody>> {
     let mut request = ::http_client::Request::builder()
         .method(::http_client::Method::from(extension_request.method))
         .uri(&extension_request.url)
         .follow_redirects(match extension_request.redirect_policy {
             http_client::RedirectPolicy::NoFollow => ::http_client::RedirectPolicy::NoFollow,
-            http_client::RedirectPolicy::FollowLimit(limit) => ::http_client::RedirectPolicy::FollowLimit(limit),
+            http_client::RedirectPolicy::FollowLimit(limit) => {
+                ::http_client::RedirectPolicy::FollowLimit(limit)
+            }
             http_client::RedirectPolicy::FollowAll => ::http_client::RedirectPolicy::FollowAll,
         });
     for (key, value) in &extension_request.headers {
         request = request.header(key, value);
     }
-    let body = extension_request.body.clone().map(AsyncBody::from).unwrap_or_default();
+    let body = extension_request
+        .body
+        .clone()
+        .map(AsyncBody::from)
+        .unwrap_or_default();
     request.body(body).map_err(anyhow::Error::from)
 }
 
@@ -402,7 +424,10 @@ async fn convert_response(
             .push((key.to_string(), value.to_str().unwrap_or("").to_string()));
     }
 
-    response.body_mut().read_to_end(&mut extension_response.body).await?;
+    response
+        .body_mut()
+        .read_to_end(&mut extension_response.body)
+        .await?;
 
     Ok(extension_response)
 }
@@ -418,21 +443,25 @@ impl ExtensionImports for WasmState {
     ) -> wasmtime::Result<Result<String, String>> {
         self.on_main_thread(|cx| {
             async move {
-                let path = location
+                let path = location.as_ref().and_then(|location| {
+                    RelPath::new(Path::new(&location.path), PathStyle::Unix).ok()
+                });
+                let location = path
                     .as_ref()
-                    .and_then(|location| RelPath::new(Path::new(&location.path), PathStyle::Posix).ok());
-                let location =
-                    path.as_ref()
-                        .zip(location.as_ref())
-                        .map(|(path, location)| ::settings::SettingsLocation {
-                            worktree_id: WorktreeId::from_proto(location.worktree_id),
-                            path,
-                        });
+                    .zip(location.as_ref())
+                    .map(|(path, location)| ::settings::SettingsLocation {
+                        worktree_id: WorktreeId::from_proto(location.worktree_id),
+                        path,
+                    });
 
                 cx.update(|cx| match category.as_str() {
                     "language" => {
                         let key = key.map(|k| LanguageName::new(&k));
-                        let settings = AllLanguageSettings::get(location, cx).language(location, key.as_ref(), cx);
+                        let settings = AllLanguageSettings::get(location, cx).language(
+                            location,
+                            key.as_ref(),
+                            cx,
+                        );
                         Ok(serde_json::to_string(&settings::LanguageSettings {
                             tab_size: settings.tab_size,
                         })?)
@@ -462,7 +491,7 @@ impl ExtensionImports for WasmState {
             }
             .boxed_local()
         })
-        .await?
+        .await
         .to_wasmtime_result()
     }
 
@@ -478,9 +507,11 @@ impl ExtensionImports for WasmState {
             LanguageServerInstallationStatus::Failed(error) => BinaryStatus::Failed { error },
         };
 
-        self.host
-            .proxy
-            .update_language_server_status(::lsp::LanguageServerName(server_name.into()), status);
+        self.host.proxy.update_language_server_status(
+            self.language_server_status_source,
+            ::lsp::LanguageServerName(server_name.into()),
+            status,
+        );
 
         Ok(())
     }
@@ -492,15 +523,15 @@ impl ExtensionImports for WasmState {
         file_type: DownloadedFileType,
     ) -> wasmtime::Result<Result<(), String>> {
         maybe!(async {
-            let parsed_url = Url::parse(&url)?;
-            self.capability_granter.grant_download_file(&parsed_url)?;
-
             let path = PathBuf::from(path);
             let extension_work_dir = self.host.work_dir.join(self.manifest.id.as_ref());
 
             self.host.fs.create_dir(&extension_work_dir).await?;
 
-            let destination_path = self.host.writeable_path_from_extension(&self.manifest.id, &path)?;
+            let destination_path = self
+                .host
+                .writeable_path_from_extension(&self.manifest.id, &path)
+                .await?;
 
             let mut response = self
                 .host
@@ -519,21 +550,28 @@ impl ExtensionImports for WasmState {
             match file_type {
                 DownloadedFileType::Uncompressed => {
                     futures::pin_mut!(body);
-                    self.host.fs.create_file_with(&destination_path, body).await?;
+                    self.host
+                        .fs
+                        .create_file_with(&destination_path, body)
+                        .await?;
                 }
                 DownloadedFileType::Gzip => {
                     let body = GzipDecoder::new(body);
                     futures::pin_mut!(body);
-                    self.host.fs.create_file_with(&destination_path, body).await?;
+                    self.host
+                        .fs
+                        .create_file_with(&destination_path, body)
+                        .await?;
                 }
                 DownloadedFileType::GzipTar => {
                     let mut tar_gz_bytes = Vec::new();
                     body.read_to_end(&mut tar_gz_bytes).await?;
-                    let body = GzipDecoder::new(BufReader::new(tar_gz_bytes.as_slice()));
-                    futures::pin_mut!(body);
+                    let decompressed_bytes =
+                        GzipDecoder::new(BufReader::new(tar_gz_bytes.as_slice()));
+                    futures::pin_mut!(decompressed_bytes);
                     self.host
                         .fs
-                        .extract_tar_file(&destination_path, Archive::new(body))
+                        .extract_tar_file(&destination_path, Archive::new(decompressed_bytes))
                         .await?;
                 }
                 DownloadedFileType::Zip => {
@@ -551,11 +589,11 @@ impl ExtensionImports for WasmState {
     }
 
     async fn make_file_executable(&mut self, path: String) -> wasmtime::Result<Result<(), String>> {
-        self.capability_granter.grant_exec("chmod", &["+x", &path])?;
-
         let path = self
             .host
-            .writeable_path_from_extension(&self.manifest.id, Path::new(&path))?;
+            .writeable_path_from_extension(&self.manifest.id, Path::new(&path))
+            .await
+            .into_wasmtime_result()?;
 
         make_file_executable(&path)
             .await

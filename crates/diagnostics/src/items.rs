@@ -2,16 +2,17 @@ use std::time::Duration;
 
 use editor::{Editor, MultiBufferOffset};
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, ParentElement, Render, Styled, Subscription, Task, WeakEntity, Window,
+    App, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, Styled, Subscription,
+    Task, WeakEntity, Window,
 };
 use language::Diagnostic;
 use project::project_settings::{GoToDiagnosticSeverityFilter, ProjectSettings};
 use settings::Settings;
 use ui::{Button, ButtonLike, Color, Icon, IconName, Label, Tooltip, h_flex, prelude::*};
 use util::ResultExt;
-use workspace::{StatusBarSettings, StatusItemView, ToolbarItemEvent, Workspace, item::ItemHandle};
+use workspace::{HideStatusItem, StatusItemView, ToolbarItemEvent, Workspace, item::ItemHandle};
 
-use crate::{IncludeWarnings, ProjectDiagnosticsEditor, Toggle};
+use crate::{Deploy, IncludeWarnings, ProjectDiagnosticsEditor};
 
 /// The status bar item that displays diagnostic counts.
 pub struct DiagnosticIndicator {
@@ -27,17 +28,15 @@ pub struct DiagnosticIndicator {
 
 impl Render for DiagnosticIndicator {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let indicator = h_flex().gap_2();
+        let indicator = h_flex().gap_2().min_w_0().overflow_x_hidden();
         if !ProjectSettings::get_global(cx).diagnostics.button {
             return indicator.hidden();
         }
 
-        let icon_size = StatusBarSettings::get_global(cx).icon_size;
-
         let diagnostic_indicator = match (self.summary.error_count, self.summary.warning_count) {
             (0, 0) => h_flex().child(
                 Icon::new(IconName::Check)
-                    .size(icon_size.icon_size())
+                    .size(IconSize::Small)
                     .color(Color::Default),
             ),
             (error_count, warning_count) => h_flex()
@@ -45,52 +44,96 @@ impl Render for DiagnosticIndicator {
                 .when(error_count > 0, |this| {
                     this.child(
                         Icon::new(IconName::XCircle)
-                            .size(icon_size.icon_size())
+                            .size(IconSize::Small)
                             .color(Color::Error),
                     )
-                    .child(Label::new(error_count.to_string()).size(icon_size.label_size()))
+                    .child(Label::new(error_count.to_string()).size(LabelSize::Small))
                 })
                 .when(warning_count > 0, |this| {
                     this.child(
                         Icon::new(IconName::Warning)
-                            .size(icon_size.icon_size())
+                            .size(IconSize::Small)
                             .color(Color::Warning),
                     )
-                    .child(Label::new(warning_count.to_string()).size(icon_size.label_size()))
+                    .child(Label::new(warning_count.to_string()).size(LabelSize::Small))
                 }),
         };
 
         let status = if let Some(diagnostic) = &self.current_diagnostic {
             let message = diagnostic
                 .message
+                .as_str()
                 .split_once('\n')
-                .map_or(&*diagnostic.message, |(first, _)| first);
+                .map_or(diagnostic.message.as_str(), |(first, _)| first);
+            let diagnostics_already_active = self.any_active_diagnostics(cx);
+            let tooltip = if !diagnostics_already_active {
+                "Expand Diagnostics"
+            } else {
+                "Next Diagnostic"
+            };
             Some(
                 Button::new("diagnostic_message", SharedString::new(message))
                     .label_size(LabelSize::Small)
-                    .tooltip(|_window, cx| {
-                        Tooltip::for_action("Next Diagnostic", &editor::actions::GoToDiagnostic::default(), cx)
+                    .truncate(true)
+                    .tab_index(0isize)
+                    .tooltip(move |_window, cx| {
+                        Tooltip::for_action(
+                            tooltip,
+                            &editor::actions::GoToDiagnostic::default(),
+                            cx,
+                        )
                     })
-                    .on_click(cx.listener(|this, _, window, cx| this.go_to_next_diagnostic(window, cx))),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.go_to_next_diagnostic(window, cx)),
+                    ),
             )
         } else {
             None
+        };
+
+        let diagnostics_label = match (self.summary.error_count, self.summary.warning_count) {
+            (0, 0) => "Project diagnostics: no problems".to_string(),
+            (errors, warnings) => {
+                let mut parts = Vec::new();
+                if errors > 0 {
+                    parts.push(format!(
+                        "{errors} error{}",
+                        if errors == 1 { "" } else { "s" }
+                    ));
+                }
+                if warnings > 0 {
+                    parts.push(format!(
+                        "{warnings} warning{}",
+                        if warnings == 1 { "" } else { "s" }
+                    ));
+                }
+                format!("Project diagnostics: {}", parts.join(", "))
+            }
         };
 
         indicator
             .child(
                 ButtonLike::new("diagnostic-indicator")
                     .child(diagnostic_indicator)
-                    .tooltip(move |_window, cx| Tooltip::for_action("Project Diagnostics", &Toggle, cx))
+                    .tab_index(0isize)
+                    .aria_label(diagnostics_label)
+                    .tooltip(move |_window, cx| {
+                        Tooltip::for_action("Project Diagnostics", &Deploy, cx)
+                    })
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(workspace) = this.workspace.upgrade() {
                             if this.summary.error_count == 0 && this.summary.warning_count > 0 {
-                                cx.update_default_global(|show_warnings: &mut IncludeWarnings, _| {
-                                    show_warnings.0 = true
-                                });
+                                cx.update_default_global(
+                                    |show_warnings: &mut IncludeWarnings, _| show_warnings.0 = true,
+                                );
                             }
                             workspace.update(cx, |workspace, cx| {
-                                ProjectDiagnosticsEditor::toggle(workspace, &Default::default(), window, cx)
+                                ProjectDiagnosticsEditor::deploy(
+                                    workspace,
+                                    &Default::default(),
+                                    window,
+                                    cx,
+                                )
                             })
                         }
                     })),
@@ -107,14 +150,17 @@ impl DiagnosticIndicator {
                 cx.notify();
             }
 
-            project::Event::DiskBasedDiagnosticsFinished { .. } | project::Event::LanguageServerRemoved(_) => {
+            project::Event::DiskBasedDiagnosticsFinished { .. }
+            | project::Event::LanguageServerRemoved(_) => {
                 this.summary = project.read(cx).diagnostic_summary(false, cx);
                 cx.notify();
             }
 
             project::Event::DiagnosticsUpdated { .. } => {
                 this.diagnostic_summary_update = cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(Duration::from_millis(30)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(30))
+                        .await;
                     this.update(cx, |this, cx| {
                         this.summary = project.read(cx).diagnostic_summary(false, cx);
                         cx.notify();
@@ -138,10 +184,18 @@ impl DiagnosticIndicator {
         }
     }
 
+    fn any_active_diagnostics(&self, cx: &mut Context<Self>) -> bool {
+        if let Some(editor) = self.active_editor.as_ref().and_then(|e| e.upgrade()) {
+            editor.read(cx).any_active_diagnostics()
+        } else {
+            false
+        }
+    }
+
     fn go_to_next_diagnostic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(editor) = self.active_editor.as_ref().and_then(|e| e.upgrade()) {
             editor.update(cx, |editor, cx| {
-                editor.go_to_diagnostic_impl(
+                editor.go_to_diagnostic_at_cursor(
                     editor::Direction::Next,
                     GoToDiagnosticSeverityFilter::default(),
                     window,
@@ -163,19 +217,27 @@ impl DiagnosticIndicator {
         let new_diagnostic = buffer
             .diagnostics_in_range::<MultiBufferOffset>(cursor_position..cursor_position)
             .filter(|entry| !entry.range.is_empty())
-            .min_by_key(|entry| (entry.diagnostic.severity, entry.range.end - entry.range.start))
+            .min_by_key(|entry| {
+                (
+                    entry.diagnostic.severity,
+                    entry.range.end - entry.range.start,
+                )
+            })
             .map(|entry| entry.diagnostic);
         if new_diagnostic != self.current_diagnostic.as_ref() {
             let new_diagnostic = new_diagnostic.cloned();
-            self.diagnostics_update = cx.spawn_in(window, async move |diagnostics_indicator, cx| {
-                cx.background_executor().timer(Duration::from_millis(50)).await;
-                diagnostics_indicator
-                    .update(cx, |diagnostics_indicator, cx| {
-                        diagnostics_indicator.current_diagnostic = new_diagnostic;
-                        cx.notify();
-                    })
-                    .ok();
-            });
+            self.diagnostics_update =
+                cx.spawn_in(window, async move |diagnostics_indicator, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    diagnostics_indicator
+                        .update(cx, |diagnostics_indicator, cx| {
+                            diagnostics_indicator.current_diagnostic = new_diagnostic;
+                            cx.notify();
+                        })
+                        .ok();
+                });
         }
     }
 }
@@ -199,5 +261,11 @@ impl StatusItemView for DiagnosticIndicator {
             self._observe_active_editor = None;
         }
         cx.notify();
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        Some(HideStatusItem::new(|settings| {
+            settings.diagnostics.get_or_insert_default().button = Some(false);
+        }))
     }
 }

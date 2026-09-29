@@ -1,10 +1,13 @@
 use super::*;
 use crate::{
-    LanguageConfig, LanguageMatcher,
-    buffer_tests::{markdown_inline_lang, markdown_lang},
+    LanguageConfig, LanguageMatcher, LanguageName, LanguageQueries,
+    buffer_tests::markdown_inline_lang, markdown_lang, rust_lang,
 };
 use gpui::App;
+use indoc::indoc;
+use pretty_assertions::assert_eq;
 use rand::rngs::StdRng;
+use std::borrow::Cow;
 use std::{env, ops::Range, sync::Arc};
 use text::{Buffer, BufferId, ReplicaId};
 use tree_sitter::Node;
@@ -15,19 +18,31 @@ use util::test::marked_text_ranges;
 fn test_splice_included_ranges() {
     let ranges = vec![ts_range(20..30), ts_range(50..60), ts_range(80..90)];
 
-    let (new_ranges, change) =
-        splice_included_ranges(ranges.clone(), &[54..56, 58..68], &[ts_range(50..54), ts_range(59..67)]);
+    let (new_ranges, change) = splice_included_ranges(
+        ranges.clone(),
+        &[54..56, 58..68],
+        &[ts_range(50..54), ts_range(59..67)],
+    );
     assert_eq!(
         new_ranges,
-        &[ts_range(20..30), ts_range(50..54), ts_range(59..67), ts_range(80..90),]
+        &[
+            ts_range(20..30),
+            ts_range(50..54),
+            ts_range(59..67),
+            ts_range(80..90),
+        ]
     );
     assert_eq!(change, 1..3);
 
     let (new_ranges, change) = splice_included_ranges(ranges.clone(), &[70..71, 91..100], &[]);
-    assert_eq!(new_ranges, &[ts_range(20..30), ts_range(50..60), ts_range(80..90)]);
+    assert_eq!(
+        new_ranges,
+        &[ts_range(20..30), ts_range(50..60), ts_range(80..90)]
+    );
     assert_eq!(change, 2..3);
 
-    let (new_ranges, change) = splice_included_ranges(ranges.clone(), &[], &[ts_range(0..2), ts_range(70..75)]);
+    let (new_ranges, change) =
+        splice_included_ranges(ranges.clone(), &[], &[ts_range(0..2), ts_range(70..75)]);
     assert_eq!(
         new_ranges,
         &[
@@ -40,13 +55,17 @@ fn test_splice_included_ranges() {
     );
     assert_eq!(change, 0..4);
 
-    let (new_ranges, change) = splice_included_ranges(ranges.clone(), &[30..50], &[ts_range(25..55)]);
+    let (new_ranges, change) =
+        splice_included_ranges(ranges.clone(), &[30..50], &[ts_range(25..55)]);
     assert_eq!(new_ranges, &[ts_range(25..55), ts_range(80..90)]);
     assert_eq!(change, 0..1);
 
     // does not create overlapping ranges
     let (new_ranges, change) = splice_included_ranges(ranges, &[0..18], &[ts_range(20..32)]);
-    assert_eq!(new_ranges, &[ts_range(20..32), ts_range(50..60), ts_range(80..90)]);
+    assert_eq!(
+        new_ranges,
+        &[ts_range(20..32), ts_range(50..60), ts_range(80..90)]
+    );
     assert_eq!(change, 0..1);
 
     fn ts_range(range: Range<usize>) -> tree_sitter::Range {
@@ -68,7 +87,7 @@ fn test_splice_included_ranges() {
 #[gpui::test]
 fn test_syntax_map_layers_for_range(cx: &mut App) {
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
-    let language = Arc::new(rust_lang());
+    let language = rust_lang();
     registry.add(language.clone());
 
     let mut buffer = Buffer::new(
@@ -163,13 +182,94 @@ fn test_syntax_map_layers_for_range(cx: &mut App) {
 }
 
 #[gpui::test]
+fn test_syntax_map_languages_match_layers_for_range(cx: &mut App) {
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+    let markdown = markdown_lang();
+    let markdown_inline = Arc::new(markdown_inline_lang());
+    registry.add(markdown.clone());
+    registry.add(markdown_inline);
+    registry.add(rust_lang());
+
+    let buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        r#"
+            This is `inline`.
+
+            ```rs
+            fn a() {}
+            ```
+        "#
+        .unindent(),
+    );
+
+    let mut syntax_map = SyntaxMap::new(&buffer);
+    syntax_map.set_language_registry(registry);
+    syntax_map.reparse(markdown, &buffer);
+
+    let all_language_names = syntax_map
+        .languages(&buffer, true)
+        .map(|language| language.name().to_string())
+        .collect::<Vec<_>>();
+    let all_layer_language_names = syntax_map
+        .layers_for_range(0..buffer.len(), &buffer, true)
+        .map(|layer| layer.language.name().to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(all_language_names, all_layer_language_names);
+    assert!(
+        all_language_names
+            .iter()
+            .any(|language_name| language_name == "Markdown-Inline"),
+        "expected hidden languages to be included when include_hidden is true"
+    );
+    assert!(
+        all_language_names
+            .iter()
+            .any(|language_name| language_name == "Markdown")
+    );
+    assert!(
+        all_language_names
+            .iter()
+            .any(|language_name| language_name == "Rust")
+    );
+
+    let visible_language_names = syntax_map
+        .languages(&buffer, false)
+        .map(|language| language.name().to_string())
+        .collect::<Vec<_>>();
+    let visible_layer_language_names = syntax_map
+        .layers_for_range(0..buffer.len(), &buffer, false)
+        .map(|layer| layer.language.name().to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(visible_language_names, visible_layer_language_names);
+    assert!(
+        !visible_language_names
+            .iter()
+            .any(|language_name| language_name == "Markdown-Inline"),
+        "expected hidden languages to be excluded when include_hidden is false"
+    );
+    assert!(
+        visible_language_names
+            .iter()
+            .any(|language_name| language_name == "Markdown")
+    );
+    assert!(
+        visible_language_names
+            .iter()
+            .any(|language_name| language_name == "Rust")
+    );
+}
+
+#[gpui::test]
 fn test_dynamic_language_injection(cx: &mut App) {
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
-    let markdown = Arc::new(markdown_lang());
+    let markdown = markdown_lang();
     let markdown_inline = Arc::new(markdown_inline_lang());
     registry.add(markdown.clone());
     registry.add(markdown_inline.clone());
-    registry.add(Arc::new(rust_lang()));
+    registry.add(rust_lang());
     registry.add(Arc::new(ruby_lang()));
 
     let mut buffer = Buffer::new(
@@ -251,6 +351,56 @@ fn test_dynamic_language_injection(cx: &mut App) {
 }
 
 #[gpui::test]
+fn test_rust_json_macro_empty_string_highlighting(cx: &mut App) {
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+    let language = rust_lang();
+    registry.add(language.clone());
+
+    let buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        r#"
+            serde_json::json!({
+                "email": "",
+                "password": "password123",
+                "requires2FA": false
+            })
+        "#
+        .unindent(),
+    );
+
+    let mut syntax_map = SyntaxMap::new(&buffer);
+    syntax_map.set_language_registry(registry);
+    syntax_map.reparse(language, &buffer);
+
+    assert_capture_ranges(
+        &syntax_map,
+        &buffer,
+        &["string"],
+        r#"
+            serde_json::json!({
+                «"email"»: «""»,
+                «"password"»: «"password123"»,
+                «"requires2FA"»: false
+            })
+        "#,
+    );
+
+    assert_capture_ranges(
+        &syntax_map,
+        &buffer,
+        &["boolean"],
+        r#"
+            serde_json::json!({
+                "email": "",
+                "password": "password123",
+                "requires2FA": «false»
+            })
+        "#,
+    );
+}
+
+#[gpui::test]
 fn test_typing_multiple_new_injections(cx: &mut App) {
     let (buffer, syntax_map) = test_edit_sequence(
         "Rust",
@@ -275,7 +425,7 @@ fn test_typing_multiple_new_injections(cx: &mut App) {
     assert_capture_ranges(
         &syntax_map,
         &buffer,
-        &["field"],
+        &["property"],
         "fn a() { test_macro!(b.«c»(vec![d.«e»])) }",
     );
 }
@@ -313,16 +463,16 @@ fn test_pasting_new_injection_line_between_others(cx: &mut App) {
     assert_capture_ranges(
         &syntax_map,
         &buffer,
-        &["struct"],
+        &["type"],
         "
         fn a() {
-            b!(«B {}»);
-            c!(«C {}»);
-            d!(«D {}»);
-            h!(«H {}»);
-            e!(«E {}»);
-            f!(«F {}»);
-            g!(«G {}»);
+            b!(«B» {});
+            c!(«C» {});
+            d!(«D» {});
+            h!(«H» {});
+            e!(«E» {});
+            f!(«F» {});
+            g!(«G» {});
         }
         ",
     );
@@ -360,7 +510,7 @@ fn test_joining_injections_with_child_injections(cx: &mut App) {
     assert_capture_ranges(
         &syntax_map,
         &buffer,
-        &["field"],
+        &["property"],
         "
         fn a() {
             b!(
@@ -781,6 +931,219 @@ fn test_empty_combined_injections_inside_injections(cx: &mut App) {
 }
 
 #[gpui::test]
+fn test_combined_injection_with_leading_content_layer_ordering(cx: &mut App) {
+    // Regression test for "layers out of order".
+    //
+    // A combined injection stores its layer `range` as the parent's full
+    // `outer_range`, but the parse queue orders steps by `ParseStep::range()`,
+    // which for a combined injection is the parsed node span. When the parent
+    // layer has content before its first injected range (here: leading HEEx
+    // markup before the first `<% %>` directive), those two ranges start at
+    // different offsets. A nested combined injection then inherits the wide
+    // `outer_range` (starting at 0) but is ordered by the narrow node span,
+    // landing after a sibling injection and breaking the sorted-by-start
+    // invariant.
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+    let heex = Arc::new(heex_lang());
+    let elixir = Arc::new(
+        Language::new(
+            LanguageConfig {
+                name: LanguageName::new_static("Elixir"),
+                matcher: Arc::new(LanguageMatcher {
+                    path_suffixes: vec![String::from("ex")],
+                    ..Default::default()
+                }),
+                ..LanguageConfig::default()
+            },
+            Some(tree_sitter::Language::new(tree_sitter_elixir::LANGUAGE)),
+        )
+        .with_injection_query(
+            r#"
+            ((string (quoted_content) @injection.content)
+             (#set! injection.language "html")
+             (#set! injection.combined))
+            ((string (quoted_content) @injection.content)
+             (#set! injection.language "Markdown")
+             (#set! injection.combined))
+            "#,
+        )
+        .unwrap(),
+    );
+    registry.add(heex.clone());
+    registry.add(elixir);
+    registry.add(Arc::new(html_lang()));
+    registry.add(markdown_lang());
+
+    let buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        r#"
+<div>leading markup before any directive</div>
+<a href={"early-attr"}>x</a>
+<%= "mid" %>
+<% y = "code" %>
+<b class={"late-attr"}>z</b>
+<%= "tail" %>
+"#
+        .unindent(),
+    );
+
+    let mut syntax_map = SyntaxMap::new(&buffer);
+    syntax_map.set_language_registry(registry);
+    // In debug builds, `reparse` runs `check_invariants`, which panics with
+    // "layers out of order" if the produced layers are not correctly sorted.
+    syntax_map.reparse(heex, &buffer);
+}
+
+#[gpui::test]
+fn test_comment_triggered_injection_toggle(cx: &mut App) {
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+
+    let python = Arc::new(python_lang());
+    let comment = Arc::new(comment_lang());
+    registry.add(python.clone());
+    registry.add(comment);
+    // Note: SQL is an extension language (not built-in as of v0.222.0), so we can use
+    // contains_unknown_injections() to detect when the injection is triggered.
+    // We register a mock "comment" language because Python injects all comments as
+    // language "comment", and we only want SQL to trigger unknown injections.
+
+    // Start with Python code with incomplete #sq comment (not enough to trigger injection)
+    let mut buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        "#sq\ncmd = \"SELECT col1, col2 FROM tbl\"".to_string(),
+    );
+
+    let mut syntax_map = SyntaxMap::new(&buffer);
+    syntax_map.set_language_registry(registry);
+    syntax_map.reparse(python.clone(), &buffer);
+
+    // Should have no unknown injections (#sq doesn't match the injection pattern)
+    assert!(
+        !syntax_map.contains_unknown_injections(),
+        "Expected no unknown injections with incomplete #sq comment"
+    );
+
+    // Complete the comment by adding 'l' to make #sql
+    let sq_end = buffer.as_rope().to_string().find('\n').unwrap();
+    buffer.edit([(sq_end..sq_end, "l")]);
+    syntax_map.interpolate(&buffer);
+    syntax_map.reparse(python.clone(), &buffer);
+
+    // Should now have unknown injections (SQL injection triggered but SQL not registered)
+    assert!(
+        syntax_map.contains_unknown_injections(),
+        "Expected unknown injections after completing #sql comment"
+    );
+
+    // Remove the 'l' to go back to #sq
+    let l_position = buffer.as_rope().to_string().find("l\n").unwrap();
+    buffer.edit([(l_position..l_position + 1, "")]);
+    syntax_map.interpolate(&buffer);
+    syntax_map.reparse(python, &buffer);
+
+    // Should have no unknown injections again - SQL injection should be invalidated
+    assert!(
+        !syntax_map.contains_unknown_injections(),
+        "Expected no unknown injections after removing 'l' from #sql comment"
+    );
+}
+
+#[gpui::test]
+fn test_injection_grouped_by_host(cx: &mut App) {
+    // Each SQL layer is described by the buffer text of the fragments it is parsed from,
+    // so that interpolated strings are asserted to produce a single layer covering every
+    // fragment of the string.
+    let cases: &[(&str, &[&[&str]])] = &[
+        (
+            indoc! {r#"
+                # sql
+                cmd = "SELECT col1, col2 FROM tbl"
+            "#},
+            &[&["SELECT col1, col2 FROM tbl"]],
+        ),
+        (
+            indoc! {r#"
+                # sql
+                cmd = f"SELECT col1 FROM tbl WHERE col2 = '{my_var}'"
+            "#},
+            &[&["SELECT col1 FROM tbl WHERE col2 = '", "'"]],
+        ),
+        (
+            indoc! {r#"
+                # sql
+                cmd = f"SELECT {col1}, {col2} FROM {tbl}"
+            "#},
+            &[&["SELECT ", ", ", " FROM "]],
+        ),
+        (
+            indoc! {r#"
+                cursor.execute(
+                    # sql
+                    f"SELECT col1 FROM tbl WHERE col2 = '{my_var}'"
+                )
+            "#},
+            &[&["SELECT col1 FROM tbl WHERE col2 = '", "'"]],
+        ),
+        (
+            indoc! {r#"
+                cursor.execute(
+                    # sql
+                    f"SELECT col1 FROM tbl WHERE col2 = '{my_var}'"
+                )
+
+                cursor.execute(
+                    # sql
+                    f"INSERT INTO tbl VALUES ('{val1}')"
+                )
+            "#},
+            &[
+                &["SELECT col1 FROM tbl WHERE col2 = '", "'"],
+                &["INSERT INTO tbl VALUES ('", "')"],
+            ],
+        ),
+    ];
+
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+    let python = Arc::new(python_lang());
+    registry.add(python.clone());
+    registry.add(Arc::new(comment_lang()));
+    registry.add(Arc::new(sql_lang()));
+
+    for (buffer_index, (text, expected_layers)) in cases.iter().enumerate() {
+        let buffer = Buffer::new(
+            ReplicaId::LOCAL,
+            BufferId::new(buffer_index as u64 + 1).unwrap(),
+            text.to_string(),
+        );
+        let mut syntax_map = SyntaxMap::new(&buffer);
+        syntax_map.set_language_registry(registry.clone());
+        syntax_map.reparse(python.clone(), &buffer);
+
+        let sql_layers = syntax_map
+            .layers_for_range(0..buffer.len(), &buffer, true)
+            .filter(|layer| layer.language.name() == "SQL")
+            .map(|layer| match layer.included_sub_ranges {
+                Some(sub_ranges) => sub_ranges
+                    .iter()
+                    .map(|range| buffer.text_for_range(range.clone()).collect::<String>())
+                    .collect::<Vec<_>>(),
+                None => {
+                    vec![
+                        buffer
+                            .text_for_range(layer.node().byte_range())
+                            .collect::<String>(),
+                    ]
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(sql_layers, *expected_layers, "buffer text:\n{text}");
+    }
+}
+
+#[gpui::test]
 fn test_syntax_map_languages_loading_with_erb(cx: &mut App) {
     let text = r#"
         <body>
@@ -884,7 +1247,7 @@ fn test_random_syntax_map_edits_rust_macros(rng: StdRng, cx: &mut App) {
     .repeat(2);
 
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
-    let language = Arc::new(rust_lang());
+    let language = rust_lang();
     registry.add(language.clone());
 
     test_random_edits(text, registry, language, rng);
@@ -915,6 +1278,32 @@ fn test_random_syntax_map_edits_with_erb(rng: StdRng, cx: &mut App) {
     registry.add(language.clone());
     registry.add(Arc::new(ruby_lang()));
     registry.add(Arc::new(html_lang()));
+
+    test_random_edits(text, registry, language, rng);
+}
+
+#[gpui::test(iterations = 50)]
+fn test_random_syntax_map_edits_with_python_sql(rng: StdRng, cx: &mut App) {
+    let text = r#"
+        # sql
+        query = f"SELECT {col} FROM tbl WHERE name = '{name}' AND id = {id}"
+
+        cursor.execute(
+            # sql
+            f"""
+                INSERT INTO tbl (col1, col2)
+                VALUES ('{one}', '{two}')
+            """
+        )
+    "#
+    .unindent()
+    .repeat(5);
+
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+    let language = Arc::new(python_lang());
+    registry.add(language.clone());
+    registry.add(Arc::new(comment_lang()));
+    registry.add(Arc::new(sql_lang()));
 
     test_random_edits(text, registry, language, rng);
 }
@@ -952,7 +1341,54 @@ fn test_random_syntax_map_edits_with_heex(rng: StdRng, cx: &mut App) {
     test_random_edits(text, registry, language, rng);
 }
 
-fn test_random_edits(text: String, registry: Arc<LanguageRegistry>, language: Arc<Language>, mut rng: StdRng) {
+#[test]
+fn test_flatten_capture_regions_with_nested_captures() {
+    let outer = capture_ref(1);
+    let inner = capture_ref(2);
+    assert_eq!(
+        flattened(0..12, &[(0..10, outer), (2..5, inner)]),
+        vec![
+            (0..2, vec![outer]),
+            (2..5, vec![outer, inner]),
+            (5..10, vec![outer]),
+        ],
+    );
+}
+
+#[test]
+fn test_flatten_capture_regions_with_overlapping_captures() {
+    let first = capture_ref(1);
+    let second = capture_ref(2);
+    assert_eq!(
+        flattened(0..25, &[(0..10, first), (2..20, second)]),
+        vec![
+            (0..2, vec![first]),
+            (2..10, vec![first, second]),
+            (10..20, vec![second]),
+        ],
+        "a capture must not extend past its own end when overlapping another capture"
+    );
+}
+
+#[test]
+fn test_flatten_capture_regions_clips_to_the_requested_range() {
+    let capture = capture_ref(1);
+    assert_eq!(
+        flattened(5..8, &[(0..10, capture)]),
+        vec![(5..8, vec![capture])],
+    );
+    assert_eq!(
+        flattened(0..6, &[(4..10, capture)]),
+        vec![(4..6, vec![capture])],
+    );
+}
+
+fn test_random_edits(
+    text: String,
+    registry: Arc<LanguageRegistry>,
+    language: Arc<Language>,
+    mut rng: StdRng,
+) {
     let operations = env::var("OPERATIONS")
         .map(|i| i.parse().expect("invalid `OPERATIONS` variable"))
         .unwrap_or(10);
@@ -969,7 +1405,7 @@ fn test_random_edits(text: String, registry: Arc<LanguageRegistry>, language: Ar
     log::info!("initial text:\n{}", buffer.text());
 
     for _ in 0..operations {
-        let prev_buffer = buffer.snapshot();
+        let prev_buffer = buffer.snapshot().clone();
         let prev_syntax_map = syntax_map.snapshot();
 
         buffer.randomly_edit(&mut rng, 3);
@@ -1005,7 +1441,10 @@ fn test_random_edits(text: String, registry: Arc<LanguageRegistry>, language: Ar
     let layers = syntax_map.layers(&buffer);
     let reference_layers = reference_syntax_map.layers(&buffer);
     for (edited_layer, reference_layer) in layers.into_iter().zip(reference_layers) {
-        assert_eq!(edited_layer.node().to_sexp(), reference_layer.node().to_sexp());
+        assert_eq!(
+            edited_layer.node().to_sexp(),
+            reference_layer.node().to_sexp()
+        );
         assert_eq!(edited_layer.node().range(), reference_layer.node().range());
     }
 }
@@ -1020,7 +1459,11 @@ fn check_interpolation(
         .edits_since::<usize>(old_buffer.version())
         .collect::<Vec<_>>();
 
-    for (old_layer, new_layer) in old_syntax_map.layers.iter().zip(new_syntax_map.layers.iter()) {
+    for (old_layer, new_layer) in old_syntax_map
+        .layers
+        .iter()
+        .zip(new_syntax_map.layers.iter())
+    {
         assert_eq!(old_layer.range, new_layer.range);
         let Some(old_tree) = old_layer.content.tree() else {
             continue;
@@ -1081,8 +1524,12 @@ fn check_interpolation(
 
         if !new_node.has_changes() {
             assert_eq!(
-                old_buffer.text_for_range(old_range.clone()).collect::<String>(),
-                new_buffer.text_for_range(new_range.clone()).collect::<String>(),
+                old_buffer
+                    .text_for_range(old_range.clone())
+                    .collect::<String>(),
+                new_buffer
+                    .text_for_range(new_range.clone())
+                    .collect::<String>(),
                 concat!(
                     "mismatched text for node\n",
                     "layer depth: {}, old layer range: {:?}, new layer range: {:?},\n",
@@ -1101,8 +1548,8 @@ fn check_interpolation(
             check_node_edits(
                 depth,
                 range,
-                old_node.child(i as u32).unwrap(),
-                new_node.child(i as u32).unwrap(),
+                old_node.child(i).unwrap(),
+                new_node.child(i).unwrap(),
                 old_buffer,
                 new_buffer,
                 edits,
@@ -1115,11 +1562,11 @@ fn test_edit_sequence(language_name: &str, steps: &[&str], cx: &mut App) -> (Buf
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
     registry.add(Arc::new(elixir_lang()));
     registry.add(Arc::new(heex_lang()));
-    registry.add(Arc::new(rust_lang()));
+    registry.add(rust_lang());
     registry.add(Arc::new(ruby_lang()));
     registry.add(Arc::new(html_lang()));
     registry.add(Arc::new(erb_lang()));
-    registry.add(Arc::new(markdown_lang()));
+    registry.add(markdown_lang());
     registry.add(Arc::new(markdown_inline_lang()));
 
     let language = registry
@@ -1177,10 +1624,11 @@ fn html_lang() -> Language {
     Language::new(
         LanguageConfig {
             name: "HTML".into(),
-            matcher: LanguageMatcher {
+            matcher: (LanguageMatcher {
                 path_suffixes: vec!["html".to_string()],
                 ..Default::default()
-            },
+            })
+            .into(),
             ..Default::default()
         },
         Some(tree_sitter_html::LANGUAGE.into()),
@@ -1199,10 +1647,11 @@ fn ruby_lang() -> Language {
     Language::new(
         LanguageConfig {
             name: "Ruby".into(),
-            matcher: LanguageMatcher {
+            matcher: (LanguageMatcher {
                 path_suffixes: vec!["rb".to_string()],
                 ..Default::default()
-            },
+            })
+            .into(),
             ..Default::default()
         },
         Some(tree_sitter_ruby::LANGUAGE.into()),
@@ -1221,10 +1670,11 @@ fn erb_lang() -> Language {
     Language::new(
         LanguageConfig {
             name: "ERB".into(),
-            matcher: LanguageMatcher {
+            matcher: (LanguageMatcher {
                 path_suffixes: vec!["erb".to_string()],
                 ..Default::default()
-            },
+            })
+            .into(),
             ..Default::default()
         },
         Some(tree_sitter_embedded_template::LANGUAGE.into()),
@@ -1253,43 +1703,15 @@ fn erb_lang() -> Language {
     .unwrap()
 }
 
-fn rust_lang() -> Language {
-    Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::LANGUAGE.into()),
-    )
-    .with_highlights_query(
-        r#"
-            (field_identifier) @field
-            (struct_expression) @struct
-        "#,
-    )
-    .unwrap()
-    .with_injection_query(
-        r#"
-            (macro_invocation
-                (token_tree) @injection.content
-                (#set! injection.language "rust"))
-        "#,
-    )
-    .unwrap()
-}
-
 fn elixir_lang() -> Language {
     Language::new(
         LanguageConfig {
             name: "Elixir".into(),
-            matcher: LanguageMatcher {
+            matcher: (LanguageMatcher {
                 path_suffixes: vec!["ex".into()],
                 ..Default::default()
-            },
+            })
+            .into(),
             ..Default::default()
         },
         Some(tree_sitter_elixir::LANGUAGE.into()),
@@ -1306,10 +1728,11 @@ fn heex_lang() -> Language {
     Language::new(
         LanguageConfig {
             name: "HEEx".into(),
-            matcher: LanguageMatcher {
+            matcher: (LanguageMatcher {
                 path_suffixes: vec!["heex".into()],
                 ..Default::default()
-            },
+            })
+            .into(),
             ..Default::default()
         },
         Some(tree_sitter_heex::LANGUAGE.into()),
@@ -1334,6 +1757,70 @@ fn heex_lang() -> Language {
     .unwrap()
 }
 
+fn python_lang() -> Language {
+    Language::new(
+        LanguageConfig {
+            name: "Python".into(),
+            matcher: (LanguageMatcher {
+                path_suffixes: vec!["py".to_string()],
+                ..Default::default()
+            })
+            .into(),
+            line_comments: vec!["# ".into()],
+            ..Default::default()
+        },
+        Some(tree_sitter_python::LANGUAGE.into()),
+    )
+    .with_queries(LanguageQueries {
+        injections: Some(Cow::from(include_str!(
+            "../../../grammars/src/python/injections.scm"
+        ))),
+        ..Default::default()
+    })
+    .expect("Could not parse Python queries")
+}
+
+fn comment_lang() -> Language {
+    // Mock "comment" language to satisfy Python's comment injection.
+    // Uses JSON grammar as a stand-in since we just need it to be registered.
+    Language::new(
+        LanguageConfig {
+            name: "comment".into(),
+            ..Default::default()
+        },
+        Some(tree_sitter_json::LANGUAGE.into()),
+    )
+}
+
+/// Stands in for the real SQL language, which this crate doesn't depend on. The grammar
+/// is irrelevant here; only the layers Python's injection query produces are asserted on.
+fn sql_lang() -> Language {
+    Language::new(
+        LanguageConfig {
+            name: "SQL".into(),
+            ..Default::default()
+        },
+        Some(tree_sitter_json::LANGUAGE.into()),
+    )
+}
+
+fn capture_ref(capture_id: u32) -> HighlightCaptureRef {
+    HighlightCaptureRef {
+        grammar_index: 0,
+        capture_id: CaptureId(capture_id),
+    }
+}
+
+fn flattened(
+    range: Range<usize>,
+    captures: &[(Range<usize>, HighlightCaptureRef)],
+) -> Vec<(Range<usize>, Vec<HighlightCaptureRef>)> {
+    flatten_capture_regions(range, captures.iter().cloned())
+        .into_iter()
+        .map(|region| (region.range, region.stack.to_vec()))
+        .collect()
+}
+
 fn range_for_text(buffer: &Buffer, text: &str) -> Range<usize> {
     let start = buffer.as_rope().to_string().find(text).unwrap();
     start..start + text.len()
@@ -1346,12 +1833,21 @@ fn assert_layers_for_range(
     range: Range<Point>,
     expected_layers: &[&str],
 ) {
-    let layers = syntax_map.layers_for_range(range, buffer, true).collect::<Vec<_>>();
-    assert_eq!(layers.len(), expected_layers.len(), "wrong number of layers");
+    let layers = syntax_map
+        .layers_for_range(range, buffer, true)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        layers.len(),
+        expected_layers.len(),
+        "wrong number of layers"
+    );
     for (i, (layer, expected_s_exp)) in layers.iter().zip(expected_layers.iter()).enumerate() {
         let actual_s_exp = layer.node().to_sexp();
         assert!(
-            string_contains_sequence(&actual_s_exp, &expected_s_exp.split("...").collect::<Vec<_>>()),
+            string_contains_sequence(
+                &actual_s_exp,
+                &expected_s_exp.split("...").collect::<Vec<_>>()
+            ),
             "layer {i}:\n\nexpected: {expected_s_exp}\nactual:   {actual_s_exp}",
         );
     }
@@ -1366,7 +1862,10 @@ fn assert_capture_ranges(
 ) {
     let mut actual_ranges = Vec::<Range<usize>>::new();
     let captures = syntax_map.captures(0..buffer.len(), buffer, |grammar| {
-        grammar.highlights_config.as_ref().map(|config| &config.query)
+        grammar
+            .highlights_config
+            .as_ref()
+            .map(|config| &config.query)
     });
     let queries = captures
         .grammars()
@@ -1379,6 +1878,7 @@ fn assert_capture_ranges(
             actual_ranges.push(capture.node.byte_range());
         }
     }
+    actual_ranges.dedup();
 
     let (text, expected_ranges) = marked_text_ranges(&marked_string.unindent(), false);
     assert_eq!(text, buffer.text());

@@ -3,20 +3,21 @@ use std::sync::Arc;
 use gpui::{FontStyle, FontWeight, HighlightStyle, Hsla, WindowBackgroundAppearance, hsla};
 
 use crate::{
-    AccentColors, Appearance, DEFAULT_DARK_THEME, PlayerColors, StatusColors, StatusColorsRefinement, SyntaxTheme,
-    SystemColors, Theme, ThemeColors, ThemeColorsRefinement, ThemeFamily, ThemeStyles, default_color_scales,
+    AccentColors, Appearance, DEFAULT_DARK_THEME, PlayerColors, StatusColors,
+    StatusColorsRefinement, SyntaxTheme, SystemColors, Theme, ThemeColors, ThemeColorsRefinement,
+    ThemeFamily, ThemeStyles, default_color_scales,
 };
 
-/// The default theme family for Gram.
+/// The default theme family for Zed.
 ///
 /// This is used to construct the default theme fallback values, as well as to
 /// have a theme available at compile time for tests.
-pub fn gram_default_themes() -> ThemeFamily {
+pub fn zed_default_themes() -> ThemeFamily {
     ThemeFamily {
-        id: "gram-default".to_string(),
-        name: "Gram Default".into(),
+        id: "zed-default".to_string(),
+        name: "Zed Default".into(),
         author: "".into(),
-        themes: vec![gram_default_dark()],
+        themes: vec![zed_default_dark()],
         scales: default_color_scales(),
     }
 }
@@ -24,7 +25,8 @@ pub fn gram_default_themes() -> ThemeFamily {
 // If a theme customizes a foreground version of a status color, but does not
 // customize the background color, then use a partly-transparent version of the
 // foreground color for the background color.
-pub(crate) fn apply_status_color_defaults(status: &mut StatusColorsRefinement) {
+/// Applies default status color backgrounds from their foreground counterparts.
+pub fn apply_status_color_defaults(status: &mut StatusColorsRefinement) {
     for (fg_color, bg_color) in [
         (&status.deleted, &mut status.deleted_background),
         (&status.created, &mut status.created_background),
@@ -41,7 +43,11 @@ pub(crate) fn apply_status_color_defaults(status: &mut StatusColorsRefinement) {
     }
 }
 
-pub(crate) fn apply_theme_color_defaults(theme_colors: &mut ThemeColorsRefinement, player_colors: &PlayerColors) {
+/// Applies default theme color values derived from player colors.
+pub fn apply_theme_color_defaults(
+    theme_colors: &mut ThemeColorsRefinement,
+    player_colors: &PlayerColors,
+) {
     if theme_colors.element_selection_background.is_none() {
         let mut selection = player_colors.local().selection;
         if selection.a == 1.0 {
@@ -51,7 +57,7 @@ pub(crate) fn apply_theme_color_defaults(theme_colors: &mut ThemeColorsRefinemen
     }
 }
 
-pub(crate) fn gram_default_dark() -> Theme {
+pub(crate) fn zed_default_dark() -> Theme {
     let bg = hsla(215. / 360., 12. / 100., 15. / 100., 1.);
     let editor = hsla(220. / 360., 12. / 100., 18. / 100., 1.);
     let elevated_surface = hsla(225. / 360., 12. / 100., 17. / 100., 1.);
@@ -105,7 +111,9 @@ pub(crate) fn gram_default_dark() -> Theme {
         styles: ThemeStyles {
             window_background_appearance: WindowBackgroundAppearance::Opaque,
             system: SystemColors::default(),
-            accents: AccentColors(vec![blue, orange, purple, teal, red, green, yellow]),
+            accents: AccentColors(Arc::from(vec![
+                blue, orange, purple, teal, red, green, yellow,
+            ])),
             colors: ThemeColors {
                 border: hsla(225. / 360., 13. / 100., 12. / 100., 1.),
                 border_variant: hsla(228. / 360., 8. / 100., 25. / 100., 1.),
@@ -155,7 +163,12 @@ pub(crate) fn gram_default_dark() -> Theme {
                 editor_subheader_background: bg,
                 editor_active_line_background: hsla(222.9 / 360., 13.5 / 100., 20.4 / 100., 1.0),
                 editor_highlighted_line_background: hsla(207.8 / 360., 81. / 100., 66. / 100., 0.1),
-                editor_debugger_active_line_background: hsla(207.8 / 360., 81. / 100., 66. / 100., 0.2),
+                editor_debugger_active_line_background: hsla(
+                    207.8 / 360.,
+                    81. / 100.,
+                    66. / 100.,
+                    0.2,
+                ),
                 editor_line_number: hsla(222.0 / 360., 11.5 / 100., 34.1 / 100., 1.0),
                 editor_active_line_number: hsla(216.0 / 360., 5.9 / 100., 49.6 / 100., 1.0),
                 editor_hover_line_number: hsla(216.0 / 360., 5.9 / 100., 56.7 / 100., 1.0),
@@ -164,9 +177,20 @@ pub(crate) fn gram_default_dark() -> Theme {
                 editor_active_wrap_guide: hsla(228. / 360., 8. / 100., 25. / 100., 1.),
                 editor_indent_guide: hsla(228. / 360., 8. / 100., 25. / 100., 1.),
                 editor_indent_guide_active: hsla(225. / 360., 13. / 100., 12. / 100., 1.),
-                editor_document_highlight_read_background: hsla(207.8 / 360., 81. / 100., 66. / 100., 0.2),
+                editor_document_highlight_read_background: hsla(
+                    207.8 / 360.,
+                    81. / 100.,
+                    66. / 100.,
+                    0.2,
+                ),
                 editor_document_highlight_write_background: gpui::red(),
                 editor_document_highlight_bracket_background: gpui::green(),
+                editor_diff_hunk_added_background: ADDED_COLOR.opacity(0.12),
+                editor_diff_hunk_added_hollow_background: ADDED_COLOR.opacity(0.06),
+                editor_diff_hunk_added_hollow_border: ADDED_COLOR.opacity(0.36),
+                editor_diff_hunk_deleted_background: REMOVED_COLOR.opacity(0.12),
+                editor_diff_hunk_deleted_hollow_background: REMOVED_COLOR.opacity(0.06),
+                editor_diff_hunk_deleted_hollow_border: REMOVED_COLOR.opacity(0.36),
 
                 terminal_background: bg,
                 // todo("Use one colors for terminal")
@@ -209,7 +233,12 @@ pub(crate) fn gram_default_dark() -> Theme {
                 pane_group_border: hsla(225. / 360., 13. / 100., 12. / 100., 1.),
                 scrollbar_thumb_background: gpui::transparent_black(),
                 scrollbar_thumb_hover_background: hover,
-                scrollbar_thumb_active_background: hsla(225.0 / 360., 11.8 / 100., 26.7 / 100., 1.0),
+                scrollbar_thumb_active_background: hsla(
+                    225.0 / 360.,
+                    11.8 / 100.,
+                    26.7 / 100.,
+                    1.0,
+                ),
                 scrollbar_thumb_border: hsla(228. / 360., 8. / 100., 25. / 100., 1.),
                 scrollbar_track_background: gpui::transparent_black(),
                 scrollbar_track_border: hsla(228. / 360., 8. / 100., 25. / 100., 1.),
@@ -218,6 +247,7 @@ pub(crate) fn gram_default_dark() -> Theme {
                 minimap_thumb_active_background: hsla(225.0 / 360., 11.8 / 100., 26.7 / 100., 0.7),
                 minimap_thumb_border: hsla(228. / 360., 8. / 100., 25. / 100., 1.),
                 editor_foreground: hsla(218. / 360., 14. / 100., 71. / 100., 1.),
+                editor_code_lens_foreground: None,
                 link_text_hover: blue,
                 version_control_added: ADDED_COLOR,
                 version_control_deleted: REMOVED_COLOR,
@@ -231,14 +261,23 @@ pub(crate) fn gram_default_dark() -> Theme {
                 version_control_conflict_marker_theirs: crate::blue().light().step_12().alpha(0.5),
 
                 vim_normal_background: SystemColors::default().transparent,
-                vim_insert_background: crate::green().dark().step_12(),
-                vim_replace_background: crate::red().dark().step_12(),
-                vim_visual_background: crate::blue().dark().step_12(),
-                vim_visual_line_background: crate::blue().dark().step_12(),
-                vim_visual_block_background: crate::blue().dark().step_12(),
+                vim_insert_background: SystemColors::default().transparent,
+                vim_replace_background: SystemColors::default().transparent,
+                vim_visual_background: SystemColors::default().transparent,
+                vim_visual_line_background: SystemColors::default().transparent,
+                vim_visual_block_background: SystemColors::default().transparent,
+                vim_yank_background: hsla(207.8 / 360., 81. / 100., 66. / 100., 0.2),
+                vim_helix_jump_label_foreground: red,
                 vim_helix_normal_background: SystemColors::default().transparent,
-                vim_helix_select_background: crate::green().dark().step_12(),
-                vim_mode_text: SystemColors::default().transparent,
+                vim_helix_select_background: SystemColors::default().transparent,
+                vim_normal_foreground: SystemColors::default().transparent,
+                vim_insert_foreground: SystemColors::default().transparent,
+                vim_replace_foreground: SystemColors::default().transparent,
+                vim_visual_foreground: SystemColors::default().transparent,
+                vim_visual_line_foreground: SystemColors::default().transparent,
+                vim_visual_block_foreground: SystemColors::default().transparent,
+                vim_helix_normal_foreground: SystemColors::default().transparent,
+                vim_helix_select_foreground: SystemColors::default().transparent,
             },
             status: StatusColors {
                 conflict: yellow,
@@ -285,70 +324,70 @@ pub(crate) fn gram_default_dark() -> Theme {
                 warning_border: yellow,
             },
             player,
-            syntax: Arc::new(SyntaxTheme {
-                highlights: vec![
-                    ("attribute".into(), purple.into()),
-                    ("boolean".into(), orange.into()),
-                    ("comment".into(), gray.into()),
-                    ("comment.doc".into(), gray.into()),
-                    ("constant".into(), yellow.into()),
-                    ("constructor".into(), blue.into()),
-                    ("embedded".into(), HighlightStyle::default()),
-                    (
-                        "emphasis".into(),
-                        HighlightStyle {
-                            font_style: Some(FontStyle::Italic),
-                            ..HighlightStyle::default()
-                        },
-                    ),
-                    (
-                        "emphasis.strong".into(),
-                        HighlightStyle {
-                            font_weight: Some(FontWeight::BOLD),
-                            ..HighlightStyle::default()
-                        },
-                    ),
-                    ("enum".into(), HighlightStyle::default()),
-                    ("function".into(), blue.into()),
-                    ("function.method".into(), blue.into()),
-                    ("function.definition".into(), blue.into()),
-                    ("hint".into(), blue.into()),
-                    ("keyword".into(), purple.into()),
-                    ("label".into(), HighlightStyle::default()),
-                    ("link_text".into(), blue.into()),
-                    (
-                        "link_uri".into(),
-                        HighlightStyle {
-                            color: Some(teal),
-                            font_style: Some(FontStyle::Italic),
-                            ..HighlightStyle::default()
-                        },
-                    ),
-                    ("number".into(), orange.into()),
-                    ("operator".into(), HighlightStyle::default()),
-                    ("predictive".into(), HighlightStyle::default()),
-                    ("preproc".into(), HighlightStyle::default()),
-                    ("primary".into(), HighlightStyle::default()),
-                    ("property".into(), red.into()),
-                    ("punctuation".into(), HighlightStyle::default()),
-                    ("punctuation.bracket".into(), HighlightStyle::default()),
-                    ("punctuation.delimiter".into(), HighlightStyle::default()),
-                    ("punctuation.list_marker".into(), HighlightStyle::default()),
-                    ("punctuation.special".into(), HighlightStyle::default()),
-                    ("string".into(), green.into()),
-                    ("string.escape".into(), HighlightStyle::default()),
-                    ("string.regex".into(), red.into()),
-                    ("string.special".into(), HighlightStyle::default()),
-                    ("string.special.symbol".into(), HighlightStyle::default()),
-                    ("tag".into(), HighlightStyle::default()),
-                    ("text.literal".into(), HighlightStyle::default()),
-                    ("title".into(), HighlightStyle::default()),
-                    ("type".into(), teal.into()),
-                    ("variable".into(), HighlightStyle::default()),
-                    ("variable.special".into(), red.into()),
-                    ("variant".into(), HighlightStyle::default()),
-                ],
-            }),
+            syntax: Arc::new(SyntaxTheme::new(vec![
+                ("attribute".into(), purple.into()),
+                ("boolean".into(), orange.into()),
+                ("comment".into(), gray.into()),
+                ("comment.doc".into(), gray.into()),
+                ("constant".into(), yellow.into()),
+                ("constructor".into(), blue.into()),
+                ("embedded".into(), HighlightStyle::default()),
+                (
+                    "emphasis".into(),
+                    HighlightStyle {
+                        font_style: Some(FontStyle::Italic),
+                        ..HighlightStyle::default()
+                    },
+                ),
+                (
+                    "emphasis.strong".into(),
+                    HighlightStyle {
+                        font_weight: Some(FontWeight::BOLD),
+                        ..HighlightStyle::default()
+                    },
+                ),
+                ("enum".into(), teal.into()),
+                ("function".into(), blue.into()),
+                ("function.method".into(), blue.into()),
+                ("function.definition".into(), blue.into()),
+                ("hint".into(), blue.into()),
+                ("keyword".into(), purple.into()),
+                ("label".into(), HighlightStyle::default()),
+                ("link_text".into(), blue.into()),
+                (
+                    "link_uri".into(),
+                    HighlightStyle {
+                        color: Some(teal),
+                        font_style: Some(FontStyle::Italic),
+                        ..HighlightStyle::default()
+                    },
+                ),
+                ("number".into(), orange.into()),
+                ("operator".into(), HighlightStyle::default()),
+                ("predictive".into(), HighlightStyle::default()),
+                ("preproc".into(), purple.into()),
+                ("primary".into(), HighlightStyle::default()),
+                ("property".into(), red.into()),
+                ("punctuation".into(), HighlightStyle::default()),
+                ("punctuation.bracket".into(), HighlightStyle::default()),
+                ("punctuation.delimiter".into(), HighlightStyle::default()),
+                ("punctuation.list_marker".into(), HighlightStyle::default()),
+                ("punctuation.special".into(), HighlightStyle::default()),
+                ("string".into(), green.into()),
+                ("string.escape".into(), HighlightStyle::default()),
+                ("string.regex".into(), red.into()),
+                ("string.special".into(), HighlightStyle::default()),
+                ("string.special.symbol".into(), HighlightStyle::default()),
+                ("tag".into(), HighlightStyle::default()),
+                ("text.literal".into(), HighlightStyle::default()),
+                ("title".into(), HighlightStyle::default()),
+                ("type".into(), teal.into()),
+                ("variable".into(), HighlightStyle::default()),
+                ("variable.special".into(), red.into()),
+                ("variant".into(), HighlightStyle::default()),
+                ("diff.plus".into(), green.into()),
+                ("diff.minus".into(), red.into()),
+            ])),
         },
     }
 }

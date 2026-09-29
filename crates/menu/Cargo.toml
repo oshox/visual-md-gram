@@ -1,18 +1,17 @@
 [package]
 name = "menu"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
 
 [lib]
-doctest = false
 path = "src/menu.rs"
+doctest = false
 test = false
 
 [dependencies]
 gpui.workspace = true
-
-[lints]
-workspace = true

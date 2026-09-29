@@ -4,7 +4,7 @@
 
 use std::{any::TypeId, rc::Rc};
 
-use collections::HashSet;
+use collections::{HashSet, TypeIdHashSet};
 use derive_more::{Deref, DerefMut};
 use gpui::{Action, App, BorrowAppContext, Global, Task, WeakEntity};
 use workspace::Workspace;
@@ -18,10 +18,10 @@ pub fn init(cx: &mut App) {
 #[derive(Default)]
 pub struct CommandPaletteFilter {
     hidden_namespaces: HashSet<&'static str>,
-    hidden_action_types: HashSet<TypeId>,
+    hidden_action_types: TypeIdHashSet,
     /// Actions that have explicitly been shown. These should be shown even if
     /// they are in a hidden namespace.
-    shown_action_types: HashSet<TypeId>,
+    shown_action_types: TypeIdHashSet,
 }
 
 #[derive(Deref, DerefMut, Default)]
@@ -32,7 +32,8 @@ impl Global for GlobalCommandPaletteFilter {}
 impl CommandPaletteFilter {
     /// Returns the global [`CommandPaletteFilter`], if one is set.
     pub fn try_global(cx: &App) -> Option<&CommandPaletteFilter> {
-        cx.try_global::<GlobalCommandPaletteFilter>().map(|filter| &filter.0)
+        cx.try_global::<GlobalCommandPaletteFilter>()
+            .map(|filter| &filter.0)
     }
 
     /// Returns a mutable reference to the global [`CommandPaletteFilter`].
@@ -60,7 +61,8 @@ impl CommandPaletteFilter {
             return false;
         }
 
-        self.hidden_namespaces.contains(namespace) || self.hidden_action_types.contains(&action.type_id())
+        self.hidden_namespaces.contains(namespace)
+            || self.hidden_action_types.contains(&action.type_id())
     }
 
     /// Hides all actions in the given namespace.
@@ -125,7 +127,8 @@ impl GlobalCommandPaletteInterceptor {
     /// This will override the previous interceptor, if it exists.
     pub fn set(
         cx: &mut App,
-        interceptor: impl Fn(&str, WeakEntity<Workspace>, &mut App) -> Task<CommandInterceptResult> + 'static,
+        interceptor: impl Fn(&str, WeakEntity<Workspace>, &mut App) -> Task<CommandInterceptResult>
+        + 'static,
     ) {
         cx.set_global(Self(Rc::new(interceptor)));
     }

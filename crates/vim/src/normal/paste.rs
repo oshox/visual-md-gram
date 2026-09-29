@@ -1,10 +1,14 @@
-use editor::{DisplayPoint, MultiBufferOffset, RowExt, SelectionEffects, display_map::ToDisplayPoint, movement};
+use editor::{
+    DisplayPoint, MultiBufferOffset, RowExt, SelectionEffects, ToOffset,
+    display_map::ToDisplayPoint, movement,
+};
 use gpui::{Action, Context, Window};
 use language::{Bias, SelectionGoal};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::Settings;
 use std::cmp;
+use text::LineEnding;
 use vim_mode_setting::HelixModeSetting;
 
 use crate::{
@@ -22,7 +26,7 @@ pub struct Paste {
     #[serde(default)]
     before: bool,
     #[serde(default)]
-    preserve_clipboard: bool,
+    pub(crate) preserve_clipboard: bool,
 }
 
 impl Vim {
@@ -33,7 +37,11 @@ impl Vim {
         Vim::take_forced_motion(cx);
 
         self.update_editor(cx, |vim, editor, cx| {
-            let text_layout_details = editor.text_layout_details(window);
+            if editor.read_only(cx) {
+                return;
+            }
+
+            let text_layout_details = editor.text_layout_details(window, cx);
             editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
 
@@ -47,10 +55,14 @@ impl Vim {
                 })
                 .filter(|reg| !reg.text.is_empty())
                 else {
+                    vim.set_status_label(
+                        format!("Nothing in register {}", selected_register.unwrap_or('"')),
+                        cx,
+                    );
                     return;
                 };
-                let clipboard_selections =
-                    clipboard_selections.filter(|sel| sel.len() > 1 && vim.mode != Mode::VisualLine);
+                let clipboard_selections = clipboard_selections
+                    .filter(|sel| sel.len() > 1 && vim.mode != Mode::VisualLine);
 
                 if !action.preserve_clipboard && vim.mode.is_visual() {
                     vim.copy_selections_content(editor, MotionKind::for_mode(vim.mode), window, cx);
@@ -59,13 +71,14 @@ impl Vim {
                 let display_map = editor.display_snapshot(cx);
                 let current_selections = editor.selections.all_adjusted_display(&display_map);
 
-                // unlike gram, if you have a multi-cursor selection from vim block mode,
+                // unlike zed, if you have a multi-cursor selection from vim block mode,
                 // pasting it will paste it on subsequent lines, even if you don't yet
                 // have a cursor there.
                 let mut selections_to_process = Vec::new();
                 let mut i = 0;
                 while i < current_selections.len() {
-                    selections_to_process.push((current_selections[i].start..current_selections[i].end, true));
+                    selections_to_process
+                        .push((current_selections[i].start..current_selections[i].end, true));
                     i += 1;
                 }
                 if let Some(clipboard_selections) = clipboard_selections.as_ref() {
@@ -76,22 +89,27 @@ impl Vim {
                         .unwrap();
                     let mut row = current_selections.last().unwrap().end.row().next_row();
                     while i < clipboard_selections.len() {
-                        let cursor = display_map.clip_point(DisplayPoint::new(row, left), Bias::Left);
+                        let cursor =
+                            display_map.clip_point(DisplayPoint::new(row, left), Bias::Left);
                         selections_to_process.push((cursor..cursor, false));
                         i += 1;
                         row.0 += 1;
                     }
                 }
 
-                let first_selection_indent_column = clipboard_selections
-                    .as_ref()
-                    .and_then(|selections| selections.first().map(|selection| selection.first_line_indent));
+                let first_selection_indent_column =
+                    clipboard_selections.as_ref().and_then(|zed_selections| {
+                        zed_selections
+                            .first()
+                            .map(|selection| selection.first_line_indent)
+                    });
                 let before = action.before || vim.mode == Mode::VisualLine;
 
                 let mut edits = Vec::new();
                 let mut new_selections = Vec::new();
                 let mut original_indent_columns = Vec::new();
                 let mut start_offset = 0;
+                let mut mark_start_adjustments = Vec::new();
 
                 for (ix, (selection, preserve)) in selections_to_process.iter().enumerate() {
                     let (mut to_insert, original_indent_column) =
@@ -99,7 +117,11 @@ impl Vim {
                             if let Some(clipboard_selection) = clipboard_selections.get(ix) {
                                 let end_offset = start_offset + clipboard_selection.len;
                                 let text = text[start_offset..end_offset].to_string();
-                                start_offset = end_offset + 1;
+                                start_offset = if clipboard_selection.is_entire_line {
+                                    end_offset
+                                } else {
+                                    end_offset + 1
+                                };
                                 (text, Some(clipboard_selection.first_line_indent))
                             } else {
                                 ("".to_string(), first_selection_indent_column)
@@ -107,17 +129,24 @@ impl Vim {
                         } else {
                             (text.to_string(), first_selection_indent_column)
                         };
+                    LineEnding::normalize(&mut to_insert);
                     let line_mode = to_insert.ends_with('\n');
                     let is_multiline = to_insert.contains('\n');
 
                     if line_mode && !before {
                         if selection.is_empty() {
-                            to_insert = "\n".to_owned() + &to_insert[..to_insert.len() - "\n".len()];
+                            to_insert =
+                                "\n".to_owned() + &to_insert[..to_insert.len() - "\n".len()];
+                            mark_start_adjustments.push(1usize);
                         } else {
                             to_insert = "\n".to_owned() + &to_insert;
+                            mark_start_adjustments.push(1usize);
                         }
                     } else if line_mode && vim.mode == Mode::VisualLine {
                         to_insert.pop();
+                        mark_start_adjustments.push(0usize);
+                    } else {
+                        mark_start_adjustments.push(0usize);
                     }
 
                     let display_range = if !selection.is_empty() {
@@ -127,16 +156,17 @@ impl Vim {
                         // the line. In this situation we'll want to move one
                         // position to the left, ensuring we don't join the last
                         // line of the selection with the line directly below.
-                        let end_point = if vim.mode == Mode::VisualLine && selection.end.column() == 0 {
-                            movement::left(&display_map, selection.end)
-                        } else {
-                            selection.end
-                        };
+                        let end_point =
+                            if vim.mode == Mode::VisualLine && selection.end.column() == 0 {
+                                movement::left(&display_map, selection.end)
+                            } else {
+                                selection.end
+                            };
 
                         selection.start..end_point
                     } else if line_mode {
                         let point = if before {
-                            movement::line_beginning(&display_map, selection.start, false)
+                            movement::line_beginning(&display_map, selection.start)
                         } else {
                             movement::line_end(&display_map, selection.start, false)
                         };
@@ -150,10 +180,12 @@ impl Vim {
                         point..point
                     };
 
-                    let point_range =
-                        display_range.start.to_point(&display_map)..display_range.end.to_point(&display_map);
+                    let point_range = display_range.start.to_point(&display_map)
+                        ..display_range.end.to_point(&display_map);
                     let anchor = if is_multiline || vim.mode == Mode::VisualLine {
-                        display_map.buffer_snapshot().anchor_before(point_range.start)
+                        display_map
+                            .buffer_snapshot()
+                            .anchor_before(point_range.start)
                     } else {
                         display_map.buffer_snapshot().anchor_after(point_range.end)
                     };
@@ -165,7 +197,28 @@ impl Vim {
                     original_indent_columns.push(original_indent_column);
                 }
 
-                let cursor_offset = editor.selections.last::<MultiBufferOffset>(&display_map).head();
+                // Record anchors before applying edits to track pasted text start.
+                // anchor_before(start) stays before inserted text (for `[` mark).
+                let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+                let mark_start_anchors: Vec<_> = edits
+                    .iter()
+                    .map(|(range, _)| buffer_snapshot.anchor_before(range.start))
+                    .collect();
+                let paste_text_last_character_offsets: Vec<_> = edits
+                    .iter()
+                    .map(|(_, text)| {
+                        text.strip_suffix('\n')
+                            .unwrap_or(text.as_str())
+                            .char_indices()
+                            .next_back()
+                            .map_or(0, |(offset, _)| offset)
+                    })
+                    .collect();
+
+                let cursor_offset = editor
+                    .selections
+                    .last::<MultiBufferOffset>(&display_map)
+                    .head();
                 if editor
                     .buffer()
                     .read(cx)
@@ -178,6 +231,28 @@ impl Vim {
                     editor.edit(edits, cx);
                 }
 
+                // Set `[` and `]` marks to the pasted text range.
+                let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+                let start_anchors: Vec<_> = mark_start_anchors
+                    .iter()
+                    .zip(mark_start_adjustments.iter())
+                    .map(|(anchor, &adj)| {
+                        let offset = anchor.to_offset(&buffer_snapshot) + adj;
+                        buffer_snapshot.anchor_before(offset)
+                    })
+                    .collect();
+                let end_anchors: Vec<_> = mark_start_anchors
+                    .iter()
+                    .zip(paste_text_last_character_offsets.iter())
+                    .map(|(anchor, &last_character_offset)| {
+                        let start = anchor.to_offset(&buffer_snapshot);
+                        let end = start + last_character_offset;
+                        buffer_snapshot.anchor_after(end)
+                    })
+                    .collect();
+                vim.set_mark("[".to_string(), start_anchors, editor.buffer(), window, cx);
+                vim.set_mark("]".to_string(), end_anchors, editor.buffer(), window, cx);
+
                 // in line_mode vim will insert the new text on the next (or previous if before) line
                 // and put the cursor on the first non-blank character of the first inserted line (or at the end if the first line is blank).
                 // otherwise vim will insert the next text at (or before) the current cursor position,
@@ -189,8 +264,14 @@ impl Vim {
                             let mut cursor = anchor.to_display_point(map);
                             if *line_mode {
                                 if !before {
-                                    cursor =
-                                        movement::down(map, cursor, SelectionGoal::None, false, &text_layout_details).0;
+                                    cursor = movement::down(
+                                        map,
+                                        cursor,
+                                        SelectionGoal::None,
+                                        false,
+                                        &text_layout_details,
+                                    )
+                                    .0;
                                 }
                                 cursor = movement::indented_line_beginning(map, cursor, true, true);
                             } else if !is_multiline && !vim.temp_mode {
@@ -224,11 +305,11 @@ impl Vim {
     ) {
         self.stop_recording(cx);
         let selected_register = self.selected_register.take();
-        self.update_editor(cx, |_, editor, cx| {
+        self.update_editor(cx, |vim, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         object.expand_selection(map, selection, around, None);
                     });
                 });
@@ -237,12 +318,16 @@ impl Vim {
                     globals.read_register(selected_register, Some(editor), cx)
                 })
                 .filter(|reg| !reg.text.is_empty()) else {
+                    vim.set_status_label(
+                        format!("Nothing in register {}", selected_register.unwrap_or('"')),
+                        cx,
+                    );
                     return;
                 };
                 editor.insert(&text, window, cx);
                 editor.set_clip_at_line_ends(true, cx);
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         selection.start = map.clip_point(selection.start, Bias::Left);
                         selection.end = selection.start
                     })
@@ -261,13 +346,19 @@ impl Vim {
     ) {
         self.stop_recording(cx);
         let selected_register = self.selected_register.take();
-        self.update_editor(cx, |_, editor, cx| {
-            let text_layout_details = editor.text_layout_details(window);
+        self.update_editor(cx, |vim, editor, cx| {
+            let text_layout_details = editor.text_layout_details(window, cx);
             editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
-                        motion.expand_selection(map, selection, times, &text_layout_details, forced_motion);
+                    s.move_with(&mut |map, selection| {
+                        motion.expand_selection(
+                            map,
+                            selection,
+                            times,
+                            &text_layout_details,
+                            forced_motion,
+                        );
                     });
                 });
 
@@ -275,12 +366,16 @@ impl Vim {
                     globals.read_register(selected_register, Some(editor), cx)
                 })
                 .filter(|reg| !reg.text.is_empty()) else {
+                    vim.set_status_label(
+                        format!("Nothing in register {}", selected_register.unwrap_or('"')),
+                        cx,
+                    );
                     return;
                 };
                 editor.insert(&text, window, cx);
                 editor.set_clip_at_line_ends(true, cx);
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         selection.start = map.clip_point(selection.start, Bias::Left);
                         selection.end = selection.start
                     })
@@ -294,12 +389,92 @@ impl Vim {
 mod test {
     use crate::{
         state::{Mode, Register},
-        test::VimTestContext,
+        test::{NeovimBackedTestContext, VimTestContext},
     };
     use gpui::ClipboardItem;
     use indoc::indoc;
     use language::{LanguageName, language_settings::LanguageSettingsContent};
     use settings::{SettingsStore, UseSystemClipboard};
+
+    #[gpui::test]
+    async fn test_paste(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // single line
+        cx.set_shared_state(indoc! {"
+            The quick brown
+            fox ˇjumps over
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("v w y").await;
+        cx.shared_clipboard().await.assert_eq("jumps o");
+        cx.set_shared_state(indoc! {"
+            The quick brown
+            fox jumps oveˇr
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            fox jumps overjumps ˇo
+            the lazy dog"});
+
+        cx.set_shared_state(indoc! {"
+            The quick brown
+            fox jumps oveˇr
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("shift-p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            fox jumps ovejumps ˇor
+            the lazy dog"});
+
+        // line mode
+        cx.set_shared_state(indoc! {"
+            The quick brown
+            fox juˇmps over
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("d d").await;
+        cx.shared_clipboard().await.assert_eq("fox jumps over\n");
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            the laˇzy dog"});
+        cx.simulate_shared_keystrokes("p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            the lazy dog
+            ˇfox jumps over"});
+        cx.simulate_shared_keystrokes("k shift-p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            ˇfox jumps over
+            the lazy dog
+            fox jumps over"});
+
+        // multiline, cursor to first character of pasted text.
+        cx.set_shared_state(indoc! {"
+            The quick brown
+            fox jumps ˇover
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("v j y").await;
+        cx.shared_clipboard().await.assert_eq("over\nthe lazy do");
+
+        cx.simulate_shared_keystrokes("p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            fox jumps oˇover
+            the lazy dover
+            the lazy dog"});
+        cx.simulate_shared_keystrokes("u shift-p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            fox jumps ˇover
+            the lazy doover
+            the lazy dog"});
+    }
 
     #[gpui::test]
     async fn test_yank_system_clipboard_never(cx: &mut gpui::TestAppContext) {
@@ -343,7 +518,8 @@ mod test {
 
         cx.update_global(|store: &mut SettingsStore, cx| {
             store.update_user_settings(cx, |s| {
-                s.vim.get_or_insert_default().use_system_clipboard = Some(UseSystemClipboard::OnYank)
+                s.vim.get_or_insert_default().use_system_clipboard =
+                    Some(UseSystemClipboard::OnYank)
             });
         });
 
@@ -396,6 +572,133 @@ mod test {
                 test-copˇyfox jjumpsumps over"},
             Mode::Normal,
         );
+    }
+
+    #[gpui::test]
+    async fn test_paste_visual(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // copy in visual mode
+        cx.set_shared_state(indoc! {"
+                The quick brown
+                fox jˇumps over
+                the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("v i w y").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                The quick brown
+                fox ˇjumps over
+                the lazy dog"});
+        // paste in visual mode
+        cx.simulate_shared_keystrokes("w v i w p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                The quick brown
+                fox jumps jumpˇs
+                the lazy dog"});
+        cx.shared_clipboard().await.assert_eq("over");
+        // paste in visual line mode
+        cx.simulate_shared_keystrokes("up shift-v shift-p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            ˇover
+            fox jumps jumps
+            the lazy dog"});
+        cx.shared_clipboard().await.assert_eq("over");
+        // paste in visual block mode
+        cx.simulate_shared_keystrokes("ctrl-v down down p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            oveˇrver
+            overox jumps jumps
+            overhe lazy dog"});
+
+        // copy in visual line mode
+        cx.set_shared_state(indoc! {"
+                The quick brown
+                fox juˇmps over
+                the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("shift-v d").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                The quick brown
+                the laˇzy dog"});
+        // paste in visual mode
+        cx.simulate_shared_keystrokes("v i w p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                The quick brown
+                the•
+                ˇfox jumps over
+                 dog"});
+        cx.shared_clipboard().await.assert_eq("lazy");
+        cx.set_shared_state(indoc! {"
+            The quick brown
+            fox juˇmps over
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("shift-v d").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The quick brown
+            the laˇzy dog"});
+        cx.shared_clipboard().await.assert_eq("fox jumps over\n");
+        // paste in visual line mode
+        cx.simulate_shared_keystrokes("k shift-v p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            ˇfox jumps over
+            the lazy dog"});
+        cx.shared_clipboard().await.assert_eq("The quick brown\n");
+
+        // Copy line and paste in visual mode, with cursor on newline character.
+        cx.set_shared_state(indoc! {"
+            ˇThe quick brown
+            fox jumps over
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("y y shift-v j $ p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            ˇThe quick brown
+            the lazy dog"});
+    }
+
+    #[gpui::test]
+    async fn test_paste_visual_block(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        // copy in visual block mode
+        cx.set_shared_state(indoc! {"
+            The ˇquick brown
+            fox jumps over
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("ctrl-v 2 j y").await;
+        cx.shared_clipboard().await.assert_eq("q\nj\nl");
+        cx.simulate_shared_keystrokes("p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The qˇquick brown
+            fox jjumps over
+            the llazy dog"});
+        cx.simulate_shared_keystrokes("v i w shift-p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The ˇq brown
+            fox jjjumps over
+            the lllazy dog"});
+        cx.simulate_shared_keystrokes("v i w shift-p").await;
+
+        cx.set_shared_state(indoc! {"
+            The ˇquick brown
+            fox jumps over
+            the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("ctrl-v j y").await;
+        cx.shared_clipboard().await.assert_eq("q\nj");
+        cx.simulate_shared_keystrokes("l ctrl-v 2 j shift-p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            The qˇqick brown
+            fox jjmps over
+            the lzy dog"});
+
+        cx.simulate_shared_keystrokes("shift-v p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            ˇq
+            j
+            fox jjmps over
+            the lzy dog"});
     }
 
     #[gpui::test]
@@ -482,7 +785,7 @@ mod test {
         cx.update_global(|store: &mut SettingsStore, cx| {
             store.update_user_settings(cx, |settings| {
                 settings.project.all_languages.languages.0.insert(
-                    LanguageName::new_static("Rust").0,
+                    LanguageName::new_static("Rust").0.to_string(),
                     LanguageSettingsContent {
                         auto_indent_on_paste: Some(false),
                         ..Default::default()
@@ -502,6 +805,40 @@ mod test {
                 "},
             Mode::Normal,
         );
+    }
+
+    #[gpui::test]
+    async fn test_paste_count(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {"
+            onˇe
+            two
+            three
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("y y 3 p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            one
+            ˇone
+            one
+            one
+            two
+            three
+        "});
+
+        cx.set_shared_state(indoc! {"
+            one
+            ˇtwo
+            three
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("y $ $ 3 p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            one
+            twotwotwotwˇo
+            three
+        "});
     }
 
     #[gpui::test]
@@ -546,6 +883,175 @@ mod test {
             indoc! {"
                 ˇsomething else
                 the lazy dog"},
+            Mode::Normal,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_editor_paste_visual_preserves_system_clipboard(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        cx.set_state(
+            indoc! {"
+                The quick brown
+                fox ˇjumps over
+                the lazy dog"},
+            Mode::Normal,
+        );
+
+        // Put known content on the system clipboard
+        cx.write_to_clipboard(ClipboardItem::new_string("from clipboard".to_string()));
+
+        // Select "jumps" in visual mode, then editor::Paste (Cmd-V / Ctrl-V)
+        cx.simulate_keystrokes("v i w");
+        cx.dispatch_action(editor::actions::Paste);
+
+        // The selected text should be replaced with clipboard content
+        cx.assert_state(
+            indoc! {"
+                The quick brown
+                fox from clipboarˇd over
+                the lazy dog"},
+            Mode::Normal,
+        );
+
+        // System clipboard must still hold the original value, not "jumps"
+        assert_eq!(
+            cx.read_from_clipboard().map(|item| item.text().unwrap()),
+            Some("from clipboard".into()),
+        );
+    }
+
+    #[gpui::test]
+    async fn test_numbered_registers(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |s| {
+                s.vim.get_or_insert_default().use_system_clipboard = Some(UseSystemClipboard::Never)
+            });
+        });
+
+        cx.set_shared_state(indoc! {"
+                The quick brown
+                fox jˇumps over
+                the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("y y \" 0 p").await;
+        cx.shared_register('0').await.assert_eq("fox jumps over\n");
+        cx.shared_register('"').await.assert_eq("fox jumps over\n");
+
+        cx.shared_state().await.assert_eq(indoc! {"
+                The quick brown
+                fox jumps over
+                ˇfox jumps over
+                the lazy dog"});
+        cx.simulate_shared_keystrokes("k k d d").await;
+        cx.shared_register('0').await.assert_eq("fox jumps over\n");
+        cx.shared_register('1').await.assert_eq("The quick brown\n");
+        cx.shared_register('"').await.assert_eq("The quick brown\n");
+
+        cx.simulate_shared_keystrokes("d d shift-g d d").await;
+        cx.shared_register('0').await.assert_eq("fox jumps over\n");
+        cx.shared_register('3').await.assert_eq("The quick brown\n");
+        cx.shared_register('2').await.assert_eq("fox jumps over\n");
+        cx.shared_register('1').await.assert_eq("the lazy dog\n");
+
+        cx.shared_state().await.assert_eq(indoc! {"
+        ˇfox jumps over"});
+
+        cx.simulate_shared_keystrokes("d d \" 3 p p \" 1 p").await;
+        cx.set_shared_state(indoc! {"
+                The quick brown
+                fox jumps over
+                ˇthe lazy dog"})
+            .await;
+    }
+
+    #[gpui::test]
+    async fn test_named_registers(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |s| {
+                s.vim.get_or_insert_default().use_system_clipboard = Some(UseSystemClipboard::Never)
+            });
+        });
+
+        cx.set_shared_state(indoc! {"
+                The quick brown
+                fox jˇumps over
+                the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("\" a d a w").await;
+        cx.shared_register('a').await.assert_eq("jumps ");
+        cx.simulate_shared_keystrokes("\" shift-a d i w").await;
+        cx.shared_register('a').await.assert_eq("jumps over");
+        cx.shared_register('"').await.assert_eq("jumps over");
+        cx.simulate_shared_keystrokes("\" a p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                The quick brown
+                fox jumps oveˇr
+                the lazy dog"});
+        cx.simulate_shared_keystrokes("\" a d a w").await;
+        cx.shared_register('a').await.assert_eq(" over");
+    }
+
+    #[gpui::test]
+    async fn test_special_registers(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |s| {
+                s.vim.get_or_insert_default().use_system_clipboard = Some(UseSystemClipboard::Never)
+            });
+        });
+
+        cx.set_shared_state(indoc! {"
+                The quick brown
+                fox jˇumps over
+                the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("d i w").await;
+        cx.shared_register('-').await.assert_eq("jumps");
+        cx.simulate_shared_keystrokes("\" _ d d").await;
+        cx.shared_register('_').await.assert_eq("");
+
+        cx.simulate_shared_keystrokes("shift-v \" _ y w").await;
+        cx.shared_register('"').await.assert_eq("jumps");
+
+        cx.shared_state().await.assert_eq(indoc! {"
+                The quick brown
+                the ˇlazy dog"});
+        cx.simulate_shared_keystrokes("\" \" d ^").await;
+        cx.shared_register('0').await.assert_eq("the ");
+        cx.shared_register('"').await.assert_eq("the ");
+
+        cx.simulate_shared_keystrokes("^ \" + d $").await;
+        cx.shared_clipboard().await.assert_eq("lazy dog");
+        cx.shared_register('"').await.assert_eq("lazy dog");
+
+        cx.simulate_shared_keystrokes("/ d o g enter").await;
+        cx.shared_register('/').await.assert_eq("dog");
+        cx.simulate_shared_keystrokes("\" / shift-p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+                The quick brown
+                doˇg"});
+
+        // not testing nvim as it doesn't have a filename
+        cx.simulate_keystrokes("\" % p");
+        #[cfg(not(target_os = "windows"))]
+        cx.assert_state(
+            indoc! {"
+                    The quick brown
+                    dogdir/file.rˇs"},
+            Mode::Normal,
+        );
+        #[cfg(target_os = "windows")]
+        cx.assert_state(
+            indoc! {"
+                    The quick brown
+                    dogdir\\file.rˇs"},
             Mode::Normal,
         );
     }
@@ -678,6 +1184,188 @@ mod test {
                 two fisˇh
                 "},
             Mode::Normal,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_paste_entire_line_from_editor_copy(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        cx.set_state(
+            indoc! {"
+                ˇline one
+                line two
+                line three"},
+            Mode::Normal,
+        );
+
+        // Simulate what the editor's do_copy produces for two entire-line selections:
+        // entire-line selections are NOT separated by an extra newline in the clipboard text.
+        let clipboard_text = "line one\nline two\n".to_string();
+        let clipboard_selections = vec![
+            editor::ClipboardSelection {
+                len: "line one\n".len(),
+                is_entire_line: true,
+                first_line_indent: 0,
+                file_path: None,
+                line_range: None,
+            },
+            editor::ClipboardSelection {
+                len: "line two\n".len(),
+                is_entire_line: true,
+                first_line_indent: 0,
+                file_path: None,
+                line_range: None,
+            },
+        ];
+        cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+            clipboard_text,
+            clipboard_selections,
+        ));
+
+        cx.simulate_keystrokes("p");
+        cx.assert_state(
+            indoc! {"
+                line one
+                ˇline one
+                line two
+                line two
+                line three"},
+            Mode::Normal,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_paste_marks(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        // Yank a word, paste it elsewhere, then verify `[ and `] point to pasted text.
+        cx.set_state(
+            indoc! {"
+                ˇhello world
+                foo bar"},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("y i w");
+        cx.simulate_keystrokes("j w");
+        cx.simulate_keystrokes("p");
+        cx.assert_state(
+            indoc! {"
+                hello world
+                foo bhellˇoar"},
+            Mode::Normal,
+        );
+        // `[ should go to start of pasted text
+        cx.simulate_keystrokes("` [");
+        cx.assert_state(
+            indoc! {"
+                hello world
+                foo bˇhelloar"},
+            Mode::Normal,
+        );
+        // `] should go to end of pasted text
+        cx.simulate_keystrokes("` ]");
+        cx.assert_state(
+            indoc! {"
+                hello world
+                foo bhellˇoar"},
+            Mode::Normal,
+        );
+
+        // Line-mode paste: yank a line, paste below, verify marks.
+        cx.set_state(
+            indoc! {"
+                ˇfirst line
+                second line
+                third line"},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("y y j p");
+        cx.assert_state(
+            indoc! {"
+                first line
+                second line
+                ˇfirst line
+                third line"},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("` [");
+        cx.assert_state(
+            indoc! {"
+                first line
+                second line
+                ˇfirst line
+                third line"},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("` ]");
+        cx.assert_state(
+            indoc! {"
+                first line
+                second line
+                first linˇe
+                third line"},
+            Mode::Normal,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_paste_marks_unicode(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.set_state("ˇxy", Mode::Normal);
+        cx.write_to_clipboard(ClipboardItem::new_string("é".to_string()));
+
+        cx.simulate_keystrokes("p");
+        cx.simulate_keystrokes("` ]");
+
+        cx.assert_state("xˇéy", Mode::Normal);
+    }
+
+    #[gpui::test]
+    async fn test_paste_marks_normalize_line_endings(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.set_state("ˇxy", Mode::Normal);
+        cx.write_to_clipboard(ClipboardItem::new_string("a\r\nb".to_string()));
+
+        cx.simulate_keystrokes("p");
+        cx.simulate_keystrokes("` ]");
+
+        cx.assert_state("xa\nˇby", Mode::Normal);
+    }
+
+    #[gpui::test]
+    async fn test_paste_marks_read_only(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.set_state("ˇx", Mode::Normal);
+        cx.write_to_clipboard(ClipboardItem::new_string("long text".to_string()));
+        cx.update_editor(|editor, _window, _cx| editor.set_read_only(true));
+
+        cx.simulate_keystrokes("p");
+
+        cx.assert_state("ˇx", Mode::Normal);
+    }
+
+    #[gpui::test]
+    async fn test_paste_marks_linewise_before(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.set_state(
+            indoc! {"
+                ˇfirst line
+                second line
+                third line"},
+            Mode::Normal,
+        );
+
+        cx.simulate_keystrokes("y y j shift-p");
+        cx.simulate_keystrokes("` [ v ` ]");
+
+        cx.assert_state(
+            indoc! {"
+                first line
+                «first lineˇ»
+                second line
+                third line"},
+            Mode::Visual,
         );
     }
 }

@@ -1,10 +1,12 @@
+#![expect(clippy::result_large_err)]
 use std::{path::Path, sync::Arc};
 
 use dap::{Scope, StackFrame, Variable, requests::Variables};
 use editor::{Editor, EditorMode, MultiBuffer};
 use gpui::{BackgroundExecutor, TestAppContext, VisualTestContext};
 use language::{
-    Language, LanguageConfig, LanguageMatcher, tree_sitter_python, tree_sitter_rust, tree_sitter_typescript,
+    Language, LanguageConfig, LanguageMatcher, rust_lang, tree_sitter_python,
+    tree_sitter_typescript,
 };
 use project::{FakeFs, Project};
 use serde_json::json;
@@ -17,7 +19,6 @@ use crate::{
 };
 
 #[gpui::test]
-#[allow(clippy::result_large_err)]
 async fn test_rust_inline_values(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -212,7 +213,9 @@ fn main() {
         .expect("This worktree should exist in project")
         .0;
 
-    let worktree_id = workspace.update(cx, |_, _, cx| worktree.read(cx).id()).unwrap();
+    let worktree_id = workspace
+        .update(cx, |_, _, cx| worktree.read(cx).id())
+        .unwrap();
 
     let buffer = project
         .update(cx, |project, cx| {
@@ -222,7 +225,7 @@ fn main() {
         .unwrap();
 
     buffer.update(cx, |buffer, cx| {
-        buffer.set_language(Some(Arc::new(rust_lang())), cx);
+        buffer.set_language(Some(rust_lang()), cx);
     });
 
     let (editor, cx) = cx.add_window_view(|window, cx| {
@@ -1519,25 +1522,7 @@ fn main() {
     });
 }
 
-fn rust_lang() -> Language {
-    let debug_variables_query = include_str!("../../../languages/src/rust/debugger.scm");
-    Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::LANGUAGE.into()),
-    )
-    .with_debug_variables_query(debug_variables_query)
-    .unwrap()
-}
-
 #[gpui::test]
-#[allow(clippy::result_large_err)]
 async fn test_python_inline_values(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -1580,7 +1565,9 @@ def process_data(untyped_param, typed_param: int, another_typed: str):
         .expect("This worktree should exist in project")
         .0;
 
-    let worktree_id = workspace.update(cx, |_, _, cx| worktree.read(cx).id()).unwrap();
+    let worktree_id = workspace
+        .update(cx, |_, _, cx| worktree.read(cx).id())
+        .unwrap();
 
     let buffer = project
         .update(cx, |project, cx| {
@@ -1840,14 +1827,15 @@ def process_data(untyped_param, typed_param: int, another_typed: str):
 }
 
 fn python_lang() -> Language {
-    let debug_variables_query = include_str!("../../../languages/src/python/debugger.scm");
+    let debug_variables_query = include_str!("../../../grammars/src/python/debugger.scm");
     Language::new(
         LanguageConfig {
             name: "Python".into(),
-            matcher: LanguageMatcher {
+            matcher: (LanguageMatcher {
                 path_suffixes: vec!["py".to_string()],
                 ..Default::default()
-            },
+            })
+            .into(),
             ..Default::default()
         },
         Some(tree_sitter_python::LANGUAGE.into()),
@@ -1856,21 +1844,24 @@ fn python_lang() -> Language {
     .unwrap()
 }
 
-fn go_lang() -> Language {
-    let debug_variables_query = include_str!("../../../languages/src/go/debugger.scm");
-    Language::new(
-        LanguageConfig {
-            name: "Go".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["go".to_string()],
+fn go_lang() -> Arc<Language> {
+    let debug_variables_query = include_str!("../../../grammars/src/go/debugger.scm");
+    Arc::new(
+        Language::new(
+            LanguageConfig {
+                name: "Go".into(),
+                matcher: (LanguageMatcher {
+                    path_suffixes: vec!["go".to_string()],
+                    ..Default::default()
+                })
+                .into(),
                 ..Default::default()
             },
-            ..Default::default()
-        },
-        Some(tree_sitter_go::LANGUAGE.into()),
+            Some(tree_sitter_go::LANGUAGE.into()),
+        )
+        .with_debug_variables_query(debug_variables_query)
+        .unwrap(),
     )
-    .with_debug_variables_query(debug_variables_query)
-    .unwrap()
 }
 
 /// Test utility function for inline values testing
@@ -1882,21 +1873,21 @@ fn go_lang() -> Language {
 /// * `language` - Language configuration to use for parsing
 /// * `executor` - Background executor for async operations
 /// * `cx` - Test app context
-#[allow(clippy::result_large_err)]
 async fn test_inline_values_util(
     local_variables: &[(&str, &str)],
     global_variables: &[(&str, &str)],
     before: &str,
     after: &str,
     active_debug_line: Option<usize>,
-    language: Language,
+    language: Arc<Language>,
     executor: BackgroundExecutor,
     cx: &mut TestAppContext,
 ) {
     init_test(cx);
 
     let lines_count = before.lines().count();
-    let stop_line = active_debug_line.unwrap_or_else(|| if lines_count > 6 { 6 } else { lines_count - 1 });
+    let stop_line =
+        active_debug_line.unwrap_or_else(|| if lines_count > 6 { 6 } else { lines_count - 1 });
 
     let fs = FakeFs::new(executor.clone());
     fs.insert_tree(path!("/project"), json!({ "main.rs": before.to_string() }))
@@ -2076,7 +2067,9 @@ async fn test_inline_values_util(
         .expect("This worktree should exist in project")
         .0;
 
-    let worktree_id = workspace.update(cx, |_, _, cx| worktree.read(cx).id()).unwrap();
+    let worktree_id = workspace
+        .update(cx, |_, _, cx| worktree.read(cx).id())
+        .unwrap();
 
     let buffer = project
         .update(cx, |project, cx| {
@@ -2086,7 +2079,7 @@ async fn test_inline_values_util(
         .unwrap();
 
     buffer.update(cx, |buffer, cx| {
-        buffer.set_language(Some(Arc::new(language)), cx);
+        buffer.set_language(Some(language), cx);
     });
 
     let (editor, cx) = cx.add_window_view(|window, cx| {
@@ -2137,7 +2130,17 @@ fn main() {
 "#
     .unindent();
 
-    test_inline_values_util(&variables, &[], &before, &after, None, rust_lang(), executor, cx).await;
+    test_inline_values_util(
+        &variables,
+        &[],
+        &before,
+        &after,
+        None,
+        rust_lang(),
+        executor,
+        cx,
+    )
+    .await;
 }
 
 #[gpui::test]
@@ -2248,63 +2251,87 @@ fn main() {
 "#
     .unindent();
 
-    test_inline_values_util(&variables, &[], &before, &after, None, rust_lang(), executor, cx).await;
+    test_inline_values_util(
+        &variables,
+        &[],
+        &before,
+        &after,
+        None,
+        rust_lang(),
+        executor,
+        cx,
+    )
+    .await;
 }
 
-fn javascript_lang() -> Language {
-    let debug_variables_query = include_str!("../../../languages/src/javascript/debugger.scm");
-    Language::new(
-        LanguageConfig {
-            name: "JavaScript".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["js".to_string()],
+fn javascript_lang() -> Arc<Language> {
+    let debug_variables_query = include_str!("../../../grammars/src/javascript/debugger.scm");
+    Arc::new(
+        Language::new(
+            LanguageConfig {
+                name: "JavaScript".into(),
+                matcher: (LanguageMatcher {
+                    path_suffixes: vec!["js".to_string()],
+                    ..Default::default()
+                })
+                .into(),
                 ..Default::default()
             },
-            ..Default::default()
-        },
-        Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        )
+        .with_debug_variables_query(debug_variables_query)
+        .unwrap(),
     )
-    .with_debug_variables_query(debug_variables_query)
-    .unwrap()
 }
 
-fn typescript_lang() -> Language {
-    let debug_variables_query = include_str!("../../../languages/src/typescript/debugger.scm");
-    Language::new(
-        LanguageConfig {
-            name: "TypeScript".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["ts".to_string()],
+fn typescript_lang() -> Arc<Language> {
+    let debug_variables_query = include_str!("../../../grammars/src/typescript/debugger.scm");
+    Arc::new(
+        Language::new(
+            LanguageConfig {
+                name: "TypeScript".into(),
+                matcher: (LanguageMatcher {
+                    path_suffixes: vec!["ts".to_string()],
+                    ..Default::default()
+                })
+                .into(),
                 ..Default::default()
             },
-            ..Default::default()
-        },
-        Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        )
+        .with_debug_variables_query(debug_variables_query)
+        .unwrap(),
     )
-    .with_debug_variables_query(debug_variables_query)
-    .unwrap()
 }
 
-fn tsx_lang() -> Language {
-    let debug_variables_query = include_str!("../../../languages/src/tsx/debugger.scm");
-    Language::new(
-        LanguageConfig {
-            name: "TSX".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["tsx".to_string()],
+fn tsx_lang() -> Arc<Language> {
+    let debug_variables_query = include_str!("../../../grammars/src/tsx/debugger.scm");
+    Arc::new(
+        Language::new(
+            LanguageConfig {
+                name: "TSX".into(),
+                matcher: (LanguageMatcher {
+                    path_suffixes: vec!["tsx".to_string()],
+                    ..Default::default()
+                })
+                .into(),
                 ..Default::default()
             },
-            ..Default::default()
-        },
-        Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+            Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        )
+        .with_debug_variables_query(debug_variables_query)
+        .unwrap(),
     )
-    .with_debug_variables_query(debug_variables_query)
-    .unwrap()
 }
 
 #[gpui::test]
 async fn test_javascript_inline_values(executor: BackgroundExecutor, cx: &mut TestAppContext) {
-    let variables = [("x", "10"), ("y", "20"), ("sum", "30"), ("message", "Hello")];
+    let variables = [
+        ("x", "10"),
+        ("y", "20"),
+        ("sum", "30"),
+        ("message", "Hello"),
+    ];
 
     let before = r#"
 function calculate() {
@@ -2328,12 +2355,27 @@ function calculate() {
 "#
     .unindent();
 
-    test_inline_values_util(&variables, &[], &before, &after, None, javascript_lang(), executor, cx).await;
+    test_inline_values_util(
+        &variables,
+        &[],
+        &before,
+        &after,
+        None,
+        javascript_lang(),
+        executor,
+        cx,
+    )
+    .await;
 }
 
 #[gpui::test]
 async fn test_typescript_inline_values(executor: BackgroundExecutor, cx: &mut TestAppContext) {
-    let variables = [("count", "42"), ("name", "Alice"), ("result", "84"), ("i", "3")];
+    let variables = [
+        ("count", "42"),
+        ("name", "Alice"),
+        ("result", "84"),
+        ("i", "3"),
+    ];
 
     let before = r#"
 function processData(count: number, name: string): number {
@@ -2357,7 +2399,17 @@ function processData(count: number, name: string): number {
 "#
     .unindent();
 
-    test_inline_values_util(&variables, &[], &before, &after, None, typescript_lang(), executor, cx).await;
+    test_inline_values_util(
+        &variables,
+        &[],
+        &before,
+        &after,
+        None,
+        typescript_lang(),
+        executor,
+        cx,
+    )
+    .await;
 }
 
 #[gpui::test]
@@ -2392,7 +2444,17 @@ const Counter = () => {
 "#
     .unindent();
 
-    test_inline_values_util(&variables, &[], &before, &after, None, tsx_lang(), executor, cx).await;
+    test_inline_values_util(
+        &variables,
+        &[],
+        &before,
+        &after,
+        None,
+        tsx_lang(),
+        executor,
+        cx,
+    )
+    .await;
 }
 
 #[gpui::test]
@@ -2415,7 +2477,17 @@ const double = (x) => {
 "#
     .unindent();
 
-    test_inline_values_util(&variables, &[], &before, &after, None, javascript_lang(), executor, cx).await;
+    test_inline_values_util(
+        &variables,
+        &[],
+        &before,
+        &after,
+        None,
+        javascript_lang(),
+        executor,
+        cx,
+    )
+    .await;
 }
 
 #[gpui::test]
@@ -2442,5 +2514,15 @@ function iterate() {
 "#
     .unindent();
 
-    test_inline_values_util(&variables, &[], &before, &after, None, typescript_lang(), executor, cx).await;
+    test_inline_values_util(
+        &variables,
+        &[],
+        &before,
+        &after,
+        None,
+        typescript_lang(),
+        executor,
+        cx,
+    )
+    .await;
 }

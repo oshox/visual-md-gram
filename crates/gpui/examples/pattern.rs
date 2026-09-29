@@ -1,7 +1,13 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
+#[path = "example_support/fonts.rs"]
+mod example_support;
+
 use gpui::{
-    App, AppContext, Application, Bounds, Context, Window, WindowBounds, WindowOptions, div, linear_color_stop,
+    App, AppContext, Bounds, Context, Window, WindowBounds, WindowOptions, div, linear_color_stop,
     linear_gradient, pattern_slash, prelude::*, px, rgb, size,
 };
+use gpui_platform::application;
 
 struct PatternExample;
 
@@ -25,30 +31,26 @@ impl Render for PatternExample {
                     .flex_col()
                     .border_1()
                     .border_color(gpui::blue())
-                    .child(
-                        div()
-                            .w(px(54.0))
-                            .h(px(18.0))
-                            .bg(pattern_slash(gpui::red(), 18.0 / 4.0, 18.0 / 4.0)),
-                    )
-                    .child(
-                        div()
-                            .w(px(54.0))
-                            .h(px(18.0))
-                            .bg(pattern_slash(gpui::red(), 18.0 / 4.0, 18.0 / 4.0)),
-                    )
-                    .child(
-                        div()
-                            .w(px(54.0))
-                            .h(px(18.0))
-                            .bg(pattern_slash(gpui::red(), 18.0 / 4.0, 18.0 / 4.0)),
-                    )
-                    .child(
-                        div()
-                            .w(px(54.0))
-                            .h(px(18.0))
-                            .bg(pattern_slash(gpui::red(), 18.0 / 4.0, 18.0 / 2.0)),
-                    ),
+                    .child(div().w(px(54.0)).h(px(18.0)).bg(pattern_slash(
+                        gpui::red(),
+                        18.0 / 4.0,
+                        18.0 / 4.0,
+                    )))
+                    .child(div().w(px(54.0)).h(px(18.0)).bg(pattern_slash(
+                        gpui::red(),
+                        18.0 / 4.0,
+                        18.0 / 4.0,
+                    )))
+                    .child(div().w(px(54.0)).h(px(18.0)).bg(pattern_slash(
+                        gpui::red(),
+                        18.0 / 4.0,
+                        18.0 / 4.0,
+                    )))
+                    .child(div().w(px(54.0)).h(px(18.0)).bg(pattern_slash(
+                        gpui::red(),
+                        18.0 / 4.0,
+                        18.0 / 2.0,
+                    ))),
             )
             .child(
                 div()
@@ -58,30 +60,26 @@ impl Render for PatternExample {
                     .border_color(gpui::blue())
                     .bg(gpui::green().opacity(0.16))
                     .child("Elements the same height should align")
-                    .child(
-                        div()
-                            .w(px(256.0))
-                            .h(px(56.0))
-                            .bg(pattern_slash(gpui::red(), 56.0 / 6.0, 56.0 / 6.0)),
-                    )
-                    .child(
-                        div()
-                            .w(px(256.0))
-                            .h(px(56.0))
-                            .bg(pattern_slash(gpui::green(), 56.0 / 6.0, 56.0 / 6.0)),
-                    )
-                    .child(
-                        div()
-                            .w(px(256.0))
-                            .h(px(56.0))
-                            .bg(pattern_slash(gpui::blue(), 56.0 / 6.0, 56.0 / 6.0)),
-                    )
-                    .child(
-                        div()
-                            .w(px(256.0))
-                            .h(px(26.0))
-                            .bg(pattern_slash(gpui::yellow(), 56.0 / 6.0, 56.0 / 6.0)),
-                    ),
+                    .child(div().w(px(256.0)).h(px(56.0)).bg(pattern_slash(
+                        gpui::red(),
+                        56.0 / 6.0,
+                        56.0 / 6.0,
+                    )))
+                    .child(div().w(px(256.0)).h(px(56.0)).bg(pattern_slash(
+                        gpui::green(),
+                        56.0 / 6.0,
+                        56.0 / 6.0,
+                    )))
+                    .child(div().w(px(256.0)).h(px(56.0)).bg(pattern_slash(
+                        gpui::blue(),
+                        56.0 / 6.0,
+                        56.0 / 6.0,
+                    )))
+                    .child(div().w(px(256.0)).h(px(26.0)).bg(pattern_slash(
+                        gpui::yellow(),
+                        56.0 / 6.0,
+                        56.0 / 6.0,
+                    ))),
             )
             .child(
                 div()
@@ -106,8 +104,11 @@ impl Render for PatternExample {
     }
 }
 
-fn main() {
-    Application::new().run(|cx: &mut App| {
+fn run_example() {
+    application().run(|cx: &mut App| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         let bounds = Bounds::centered(None, size(px(600.0), px(600.0)), cx);
         cx.open_window(
             WindowOptions {
@@ -118,6 +119,18 @@ fn main() {
         )
         .unwrap();
 
-        cx.activate();
+        cx.activate(true);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

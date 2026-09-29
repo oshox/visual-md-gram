@@ -1,3 +1,4 @@
+#![expect(clippy::result_large_err)]
 use crate::{
     tests::{active_debug_session_panel, start_debug_session},
     *,
@@ -11,7 +12,6 @@ use tests::{init_test, init_test_workspace};
 use util::path;
 
 #[gpui::test]
-#[allow(clippy::result_large_err)]
 async fn test_handle_output_event(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -86,10 +86,11 @@ async fn test_handle_output_event(executor: BackgroundExecutor, cx: &mut TestApp
 
     cx.run_until_parked();
 
-    let running_state = active_debug_session_panel(workspace, cx).update_in(cx, |item, window, cx| {
-        cx.focus_self(window);
-        item.running_state().clone()
-    });
+    let running_state =
+        active_debug_session_panel(workspace, cx).update_in(cx, |item, window, cx| {
+            cx.focus_self(window);
+            item.running_state().clone()
+        });
 
     cx.run_until_parked();
 
@@ -97,20 +98,13 @@ async fn test_handle_output_event(executor: BackgroundExecutor, cx: &mut TestApp
     workspace
         .update(cx, |workspace, _window, cx| {
             let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
-            let active_debug_session_panel = debug_panel.update(cx, |this, _| this.active_session()).unwrap();
+            let active_debug_session_panel = debug_panel
+                .update(cx, |this, _| this.active_session())
+                .unwrap();
 
             assert_eq!(
                 "First console output line before thread stopped!\nFirst output line before thread stopped!\n",
-                active_debug_session_panel
-                    .read(cx)
-                    .running_state()
-                    .read(cx)
-                    .console()
-                    .read(cx)
-                    .editor()
-                    .read(cx)
-                    .text(cx)
-                    .as_str()
+                active_debug_session_panel.read(cx).running_state().read(cx).console().read(cx).editor().read(cx).text(cx).as_str()
             );
         })
         .unwrap();
@@ -166,7 +160,6 @@ async fn test_handle_output_event(executor: BackgroundExecutor, cx: &mut TestApp
 }
 
 #[gpui::test]
-#[allow(clippy::result_large_err)]
 async fn test_escape_code_processing(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -215,7 +208,8 @@ async fn test_escape_code_processing(executor: BackgroundExecutor, cx: &mut Test
     client
         .fake_event(dap::messages::Events::Output(dap::OutputEvent {
             category: None,
-            output: "   \u{1b}[1m\u{1b}[38;2;173;127;168m▲ Next.js 15.1.5\u{1b}[39m\u{1b}[22m".to_string(),
+            output: "   \u{1b}[1m\u{1b}[38;2;173;127;168m▲ Next.js 15.1.5\u{1b}[39m\u{1b}[22m"
+                .to_string(),
             data: None,
             variables_reference: None,
             source: None,
@@ -295,14 +289,16 @@ async fn test_escape_code_processing(executor: BackgroundExecutor, cx: &mut Test
 
     cx.run_until_parked();
 
-    let _running_state = active_debug_session_panel(workspace, cx).update_in(cx, |item, window, cx| {
-        cx.focus_self(window);
-        item.running_state().update(cx, |this, cx| {
-            this.console().update(cx, |this, cx| this.update_output(window, cx));
-        });
+    let _running_state =
+        active_debug_session_panel(workspace, cx).update_in(cx, |item, window, cx| {
+            cx.focus_self(window);
+            item.running_state().update(cx, |this, cx| {
+                this.console()
+                    .update(cx, |this, cx| this.update_output(window, cx));
+            });
 
-        item.running_state().clone()
-    });
+            item.running_state().clone()
+        });
 
     cx.run_until_parked();
 
@@ -332,7 +328,7 @@ async fn test_escape_code_processing(executor: BackgroundExecutor, cx: &mut Test
 
             let text_highlights = editor.update(cx, |editor, cx| {
                 let mut text_highlights = editor.all_text_highlights(window, cx).into_iter().flat_map(|(_, ranges)| ranges).collect::<Vec<_>>();
-                text_highlights.sort_by_key(|a| a.start);
+                text_highlights.sort_by_key(|hl| hl.start);
                 text_highlights
             });
             pretty_assertions::assert_eq!(

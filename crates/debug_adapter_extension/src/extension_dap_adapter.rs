@@ -9,12 +9,13 @@ use async_trait::async_trait;
 use collections::HashMap;
 use dap::{
     StartDebuggingRequestArgumentsRequest,
-    adapters::{DapDelegate, DebugAdapter, DebugAdapterBinary, DebugAdapterName, DebugTaskDefinition},
-    settings::DapSettings,
+    adapters::{
+        DapDelegate, DebugAdapter, DebugAdapterBinary, DebugAdapterName, DebugTaskDefinition,
+    },
 };
 use extension::{Extension, WorktreeDelegate};
 use gpui::AsyncApp;
-use task::{DebugScenario, GramDebugConfig};
+use task::{DebugScenario, ZedDebugConfig};
 use util::rel_path::RelPath;
 
 pub(crate) struct ExtensionDapAdapter {
@@ -30,10 +31,13 @@ impl ExtensionDapAdapter {
         schema_path: &Path,
     ) -> Result<Self> {
         let schema = std::fs::read_to_string(&schema_path).with_context(|| {
-            format!("Failed to read debug adapter schema for {debug_adapter_name} (from path: `{schema_path:?}`)")
+            format!(
+                "Failed to read debug adapter schema for {debug_adapter_name} (from path: `{schema_path:?}`)"
+            )
         })?;
-        let schema = serde_json::Value::from_str(&schema)
-            .with_context(|| format!("Debug adapter schema for {debug_adapter_name} is not a valid JSON"))?;
+        let schema = serde_json::Value::from_str(&schema).with_context(|| {
+            format!("Debug adapter schema for {debug_adapter_name} is not a valid JSON")
+        })?;
         Ok(Self {
             extension,
             debug_adapter_name,
@@ -90,25 +94,11 @@ impl DebugAdapter for ExtensionDapAdapter {
         _user_args: Option<Vec<String>>,
         // TODO support user env in the extension API
         _user_env: Option<HashMap<String, String>>,
-        settings: &DapSettings,
         _cx: &mut AsyncApp,
     ) -> Result<DebugAdapterBinary> {
-        if user_installed_path.is_none() && settings.ignore_system_version {
-            anyhow::bail!("ignore_system_version set for extension-provided DAP");
-        }
-
-        if !settings.allow_binary_download {
-            anyhow::bail!("allow_binary_download not set for extension-provided DAP");
-        }
-
-        if !settings.enable_auto_updates {
-            anyhow::bail!("enable_auto_updates not set for extension-provided DAP");
-        }
-
         self.extension
             .get_dap_binary(
                 self.debug_adapter_name.clone(),
-                settings,
                 config.clone(),
                 user_installed_path,
                 Arc::new(WorktreeDelegateAdapter(delegate.clone())),
@@ -116,11 +106,14 @@ impl DebugAdapter for ExtensionDapAdapter {
             .await
     }
 
-    async fn config_from_gram_format(&self, scenario: GramDebugConfig) -> Result<DebugScenario> {
-        self.extension.dap_config_to_scenario(scenario).await
+    async fn config_from_zed_format(&self, zed_scenario: ZedDebugConfig) -> Result<DebugScenario> {
+        self.extension.dap_config_to_scenario(zed_scenario).await
     }
 
-    async fn request_kind(&self, config: &serde_json::Value) -> Result<StartDebuggingRequestArgumentsRequest> {
+    async fn request_kind(
+        &self,
+        config: &serde_json::Value,
+    ) -> Result<StartDebuggingRequestArgumentsRequest> {
         self.extension
             .dap_request_kind(self.debug_adapter_name.clone(), config.clone())
             .await

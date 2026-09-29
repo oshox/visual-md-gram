@@ -1,10 +1,13 @@
 use crate::{BufferDiagnosticsEditor, ProjectDiagnosticsEditor, ToggleDiagnosticsRefresh};
+use agent_settings::AgentSettings;
 use gpui::{Context, EventEmitter, ParentElement, Render, Window};
 use language::DiagnosticEntry;
+use settings::Settings;
 use text::{Anchor, BufferId};
-use ui::prelude::*;
-use ui::{IconButton, IconButtonShape, IconName, Tooltip};
+use ui::{Tooltip, prelude::*};
 use workspace::{ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, item::ItemHandle};
+use zed_actions::assistant::InlineAssist;
+use zed_actions::buffer_search;
 
 pub struct ToolbarControls {
     editor: Option<Box<dyn DiagnosticsToolbarEditor>>,
@@ -25,7 +28,11 @@ pub(crate) trait DiagnosticsToolbarEditor: Send + Sync {
     /// with the latest information.
     fn refresh_diagnostics(&self, window: &mut Window, cx: &mut App);
     /// Returns a list of diagnostics for the provided buffer id.
-    fn get_diagnostics_for_buffer(&self, buffer_id: BufferId, cx: &App) -> Vec<DiagnosticEntry<Anchor>>;
+    fn get_diagnostics_for_buffer(
+        &self,
+        buffer_id: BufferId,
+        cx: &App,
+    ) -> Vec<DiagnosticEntry<Anchor>>;
 }
 
 impl Render for ToolbarControls {
@@ -41,24 +48,48 @@ impl Render for ToolbarControls {
             None => {}
         }
 
-        let warning_tooltip = if include_warnings {
-            "Exclude Warnings"
-        } else {
-            "Include Warnings"
-        };
+        let is_agent_enabled = AgentSettings::get_global(cx).enabled(cx);
 
-        let warning_color = if include_warnings { Color::Warning } else { Color::Muted };
+        let (warning_tooltip, warning_color) = if include_warnings {
+            ("Exclude Warnings", Color::Warning)
+        } else {
+            ("Include Warnings", Color::Disabled)
+        };
 
         h_flex()
             .gap_1()
+            .child({
+                IconButton::new("toggle_search", IconName::MagnifyingGlass)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::for_action_title(
+                        "Buffer Search",
+                        &buffer_search::Deploy::find(),
+                    ))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(buffer_search::Deploy::find()), cx);
+                    })
+            })
+            .when(is_agent_enabled, |this| {
+                this.child(
+                    IconButton::new("inline_assist", IconName::ZedAssistant)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::for_action_title(
+                            "Inline Assist",
+                            &InlineAssist::default(),
+                        ))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(InlineAssist::default()), cx);
+                        }),
+                )
+            })
             .map(|div| {
                 if is_updating {
                     div.child(
                         IconButton::new("stop-updating", IconName::Stop)
-                            .icon_color(Color::Info)
-                            .shape(IconButtonShape::Square)
+                            .icon_color(Color::Error)
+                            .icon_size(IconSize::Small)
                             .tooltip(Tooltip::for_action_title(
-                                "Stop diagnostics update",
+                                "Stop Diagnostics Update",
                                 &ToggleDiagnosticsRefresh,
                             ))
                             .on_click(cx.listener(move |toolbar_controls, _, _, cx| {
@@ -71,10 +102,9 @@ impl Render for ToolbarControls {
                 } else {
                     div.child(
                         IconButton::new("refresh-diagnostics", IconName::ArrowCircle)
-                            .icon_color(Color::Info)
-                            .shape(IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
                             .tooltip(Tooltip::for_action_title(
-                                "Refresh diagnostics",
+                                "Refresh Diagnostics",
                                 &ToggleDiagnosticsRefresh,
                             ))
                             .on_click(cx.listener({
@@ -90,7 +120,7 @@ impl Render for ToolbarControls {
             .child(
                 IconButton::new("toggle-warnings", IconName::Warning)
                     .icon_color(warning_color)
-                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text(warning_tooltip))
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(editor) = &this.editor {

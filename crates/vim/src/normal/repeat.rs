@@ -42,7 +42,9 @@ fn repeatable_insert(action: &ReplayableAction) -> Option<Box<dyn Action>> {
                 || super::InsertEndOfLine.partial_eq(&**action)
             {
                 Some(super::InsertBefore.boxed_clone())
-            } else if super::InsertLineAbove.partial_eq(&**action) || super::InsertLineBelow.partial_eq(&**action) {
+            } else if super::InsertLineAbove.partial_eq(&**action)
+                || super::InsertLineBelow.partial_eq(&**action)
+            {
                 Some(super::InsertLineBelow.boxed_clone())
             } else if crate::replace::ToggleReplace.partial_eq(&**action) {
                 Some(crate::replace::ToggleReplace.boxed_clone())
@@ -60,7 +62,9 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         vim.switch_mode(Mode::Normal, false, window, cx)
     });
 
-    Vim::action(editor, cx, |vim, _: &Repeat, window, cx| vim.repeat(false, window, cx));
+    Vim::action(editor, cx, |vim, _: &Repeat, window, cx| {
+        vim.repeat(false, window, cx)
+    });
 
     Vim::action(editor, cx, |vim, _: &ToggleRecord, window, cx| {
         let globals = Vim::globals(cx);
@@ -108,7 +112,7 @@ impl Replayer {
         let this = self.clone();
         window.defer(cx, move |window, cx| {
             this.next(window, cx);
-            let Some(workspace) = window.root::<Workspace>() else {
+            let Some(workspace) = Workspace::for_window(window, cx) else {
                 return;
             };
             let Some(editor) = workspace
@@ -161,7 +165,7 @@ impl Replayer {
                 text,
                 utf16_range_to_replace,
             } => {
-                let Some(workspace) = window.root::<Workspace>() else {
+                let Some(workspace) = Workspace::for_window(window, cx) else {
                     return;
                 };
                 let Some(editor) = workspace
@@ -181,7 +185,12 @@ impl Replayer {
 }
 
 impl Vim {
-    pub(crate) fn record_register(&mut self, register: char, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn record_register(
+        &mut self,
+        register: char,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let globals = Vim::globals(cx);
         globals.recording_register = Some(register);
         globals.recordings.remove(&register);
@@ -189,7 +198,12 @@ impl Vim {
         self.clear_operator(window, cx)
     }
 
-    pub(crate) fn replay_register(&mut self, mut register: char, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn replay_register(
+        &mut self,
+        mut register: char,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut count = Vim::take_count(cx).unwrap_or(1);
         Vim::take_forced_motion(cx);
         self.clear_operator(window, cx);
@@ -216,7 +230,12 @@ impl Vim {
         replayer.replay(repeated_actions, window, cx);
     }
 
-    pub(crate) fn repeat(&mut self, from_insert_mode: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn repeat(
+        &mut self,
+        from_insert_mode: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_operator().is_some() {
             Vim::update_globals(cx, |globals, _| {
                 globals.recording_actions.clear();
@@ -272,6 +291,24 @@ impl Vim {
         }) else {
             return;
         };
+
+        // Dot repeat always uses the recorded register, ignoring any "X
+        // override, as the register is an inherent part of the recorded action.
+        // For numbered registers, Neovim increments on each dot repeat so after
+        // using `"1p`, using `.` will equate to `"2p", the next `.` to `"3p`,
+        // etc..
+        let recorded_register = cx.global::<VimGlobals>().recorded_register_for_dot;
+        let next_register = recorded_register
+            .filter(|c| matches!(c, '1'..='9'))
+            .map(|c| ((c as u8 + 1).min(b'9')) as char);
+
+        self.selected_register = next_register.or(recorded_register);
+        if let Some(next_register) = next_register {
+            Vim::update_globals(cx, |globals, _| {
+                globals.recorded_register_for_dot = Some(next_register)
+            })
+        };
+
         if mode != Some(self.mode) {
             if let Some(mode) = mode {
                 self.switch_mode(mode, false, window, cx)
@@ -284,20 +321,48 @@ impl Vim {
                     }
                 }
                 RecordedSelection::Visual { rows, cols } => {
-                    self.visual_motion(Motion::Down { display_lines: false }, Some(rows as usize), window, cx);
-                    self.visual_motion(Motion::StartOfLine { display_lines: false }, None, window, cx);
+                    self.visual_motion(
+                        Motion::Down {
+                            display_lines: false,
+                        },
+                        Some(rows as usize),
+                        window,
+                        cx,
+                    );
+                    self.visual_motion(
+                        Motion::StartOfLine {
+                            display_lines: false,
+                        },
+                        None,
+                        window,
+                        cx,
+                    );
                     if cols > 1 {
                         self.visual_motion(Motion::Right, Some(cols as usize - 1), window, cx)
                     }
                 }
                 RecordedSelection::VisualBlock { rows, cols } => {
-                    self.visual_motion(Motion::Down { display_lines: false }, Some(rows as usize), window, cx);
+                    self.visual_motion(
+                        Motion::Down {
+                            display_lines: false,
+                        },
+                        Some(rows as usize),
+                        window,
+                        cx,
+                    );
                     if cols > 1 {
                         self.visual_motion(Motion::Right, Some(cols as usize - 1), window, cx);
                     }
                 }
                 RecordedSelection::VisualLine { rows } => {
-                    self.visual_motion(Motion::Down { display_lines: false }, Some(rows as usize), window, cx);
+                    self.visual_motion(
+                        Motion::Down {
+                            display_lines: false,
+                        },
+                        Some(rows as usize),
+                        window,
+                        cx,
+                    );
                 }
                 RecordedSelection::None => {}
             }
@@ -354,7 +419,274 @@ mod test {
 
     use gpui::EntityInputHandler;
 
-    use crate::{VimGlobals, state::Mode, test::VimTestContext};
+    use crate::{
+        VimGlobals,
+        state::Mode,
+        test::{NeovimBackedTestContext, VimTestContext},
+    };
+
+    #[gpui::test]
+    async fn test_dot_repeat(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // "o"
+        cx.set_shared_state("ˇhello").await;
+        cx.simulate_shared_keystrokes("o w o r l d escape").await;
+        cx.shared_state().await.assert_eq("hello\nworlˇd");
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq("hello\nworld\nworlˇd");
+
+        // "d"
+        cx.simulate_shared_keystrokes("^ d f o").await;
+        cx.simulate_shared_keystrokes("g g .").await;
+        cx.shared_state().await.assert_eq("ˇ\nworld\nrld");
+
+        // "p" (note that it pastes the current clipboard)
+        cx.simulate_shared_keystrokes("j y y p").await;
+        cx.simulate_shared_keystrokes("shift-g y y .").await;
+        cx.shared_state()
+            .await
+            .assert_eq("\nworld\nworld\nrld\nˇrld");
+
+        // "~" (note that counts apply to the action taken, not . itself)
+        cx.set_shared_state("ˇthe quick brown fox").await;
+        cx.simulate_shared_keystrokes("2 ~ .").await;
+        cx.set_shared_state("THE ˇquick brown fox").await;
+        cx.simulate_shared_keystrokes("3 .").await;
+        cx.set_shared_state("THE QUIˇck brown fox").await;
+        cx.run_until_parked();
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq("THE QUICK ˇbrown fox");
+
+        // "q l" (note after macro should be used last change made by macro)
+        cx.set_shared_state("ˇ").await;
+        cx.simulate_shared_keystrokes("q l shift-o h e l l o space w o r l d escape q")
+            .await;
+        cx.simulate_shared_keystrokes("@ l").await;
+        cx.shared_state()
+            .await
+            .assert_eq("hello worlˇd\nhello world\n");
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state()
+            .await
+            .assert_eq("hello worlˇd\nhello world\nhello world\n");
+    }
+
+    #[gpui::test]
+    async fn test_dot_repeat_after_macro_change_motion(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        cx.set_state("ˇfoo foo", Mode::Normal);
+        cx.simulate_keystrokes("q l c f o x escape q");
+        cx.assert_state("ˇxo foo", Mode::Normal);
+
+        cx.simulate_keystrokes("w @ l");
+        cx.assert_state("xo ˇxo", Mode::Normal);
+
+        cx.simulate_keystrokes(".");
+        cx.assert_state("xo ˇx", Mode::Normal);
+    }
+
+    #[gpui::test]
+    async fn test_dot_repeat_registers_paste(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // basic paste repeat uses the unnamed register
+        cx.set_shared_state("ˇhello\n").await;
+        cx.simulate_shared_keystrokes("y y p").await;
+        cx.shared_state().await.assert_eq("hello\nˇhello\n");
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq("hello\nhello\nˇhello\n");
+
+        // "_ (blackhole) is recorded and replayed, so the pasted text is still
+        // the original yanked line.
+        cx.set_shared_state(indoc! {"
+            ˇone
+            two
+            three
+            four
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("y y j \" _ d d . p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            one
+            four
+            ˇone
+        "});
+
+        // the recorded register is replayed, not whatever is in the unnamed register
+        cx.set_shared_state(indoc! {"
+            ˇone
+            two
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("y y j \" a y y \" a p .")
+            .await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            one
+            two
+            two
+            ˇtwo
+        "});
+
+        // `"X.` ignores the override and always uses the recorded register.
+        // Both `dd` calls go into register `a`, so register `b` is empty and
+        // `"bp` pastes nothing.
+        cx.set_shared_state(indoc! {"
+            ˇone
+            two
+            three
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("\" a d d \" b .").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            ˇthree
+        "});
+        cx.simulate_shared_keystrokes("\" a p \" b p").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            three
+            ˇtwo
+        "});
+
+        // numbered registers cycle on each dot repeat: "1p . . uses registers 2, 3, …
+        // Since the cycling behavior caps at register 9, the first line to be
+        // deleted `1`, is no longer in any of the registers.
+        cx.set_shared_state(indoc! {"
+            ˇone
+            two
+            three
+            four
+            five
+            six
+            seven
+            eight
+            nine
+            ten
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("d d . . . . . . . . .").await;
+        cx.shared_state().await.assert_eq(indoc! {"ˇ"});
+        cx.simulate_shared_keystrokes("\" 1 p . . . . . . . . .")
+            .await;
+        cx.shared_state().await.assert_eq(indoc! {"
+
+            ten
+            nine
+            eight
+            seven
+            six
+            five
+            four
+            three
+            two
+            ˇtwo"});
+
+        // unnamed register repeat: dd records None, so . pastes the same
+        // deleted text
+        cx.set_shared_state(indoc! {"
+            ˇone
+            two
+            three
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("d d p .").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            two
+            one
+            ˇone
+            three
+        "});
+
+        // After `"1p` cycles to `2`, using `"ap` resets recorded_register to `a`,
+        // so the next `.` uses `a` and not 3.
+        cx.set_shared_state(indoc! {"
+            one
+            two
+            ˇthree
+        "})
+            .await;
+        cx.simulate_shared_keystrokes("\" 2 y y k k \" a y y j \" 1 y y k \" 1 p . \" a p .")
+            .await;
+        cx.shared_state().await.assert_eq(indoc! {"
+            one
+            two
+            three
+            one
+            ˇone
+            two
+            three
+        "});
+    }
+
+    // This needs to be a separate test from `test_dot_repeat_registers_paste`
+    // as Neovim doesn't have support for using registers in replace operations
+    // by default.
+    #[gpui::test]
+    async fn test_dot_repeat_registers_replace(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        cx.set_state(
+            indoc! {"
+            line ˇone
+            line two
+            line three
+        "},
+            Mode::Normal,
+        );
+
+        // 1. Yank `one` into register `a`
+        // 2. Move down and yank `two` into the default register
+        // 3. Replace `two` with the contents of register `a`
+        cx.simulate_keystrokes("\" a y w j y w \" a g R w");
+        cx.assert_state(
+            indoc! {"
+            line one
+            line onˇe
+            line three
+        "},
+            Mode::Normal,
+        );
+
+        // 1. Move down to `three`
+        // 2. Repeat the replace operation
+        cx.simulate_keystrokes("j .");
+        cx.assert_state(
+            indoc! {"
+            line one
+            line one
+            line onˇe
+        "},
+            Mode::Normal,
+        );
+
+        // Similar test, but this time using numbered registers, as those should
+        // automatically increase on successive uses of `.` .
+        cx.set_state(
+            indoc! {"
+            line ˇone
+            line two
+            line three
+            line four
+        "},
+            Mode::Normal,
+        );
+
+        // 1. Yank `one` into register `1`
+        // 2. Yank `two` into register `2`
+        // 3. Move down and yank `three` into the default register
+        // 4. Replace `three` with the contents of register `1`
+        // 5. Move down and repeat
+        cx.simulate_keystrokes("\" 1 y w j \" 2 y w j y w \" 1 g R w j .");
+        cx.assert_state(
+            indoc! {"
+            line one
+            line two
+            line one
+            line twˇo
+        "},
+            Mode::Normal,
+        );
+    }
 
     #[gpui::test]
     async fn test_repeat_ime(cx: &mut gpui::TestAppContext) {
@@ -374,7 +706,6 @@ mod test {
         cx.assert_state("hˇäällo", Mode::Normal);
     }
 
-    #[ignore]
     #[gpui::test]
     async fn test_repeat_completion(cx: &mut gpui::TestAppContext) {
         VimTestContext::init(cx);
@@ -401,30 +732,33 @@ mod test {
             Mode::Normal,
         );
 
-        let mut request = cx.set_request_handler::<lsp::request::Completion, _, _>(move |_, params, _| async move {
-            let position = params.text_document_position.position;
-            Ok(Some(lsp::CompletionResponse::Array(vec![
-                lsp::CompletionItem {
-                    label: "first".to_string(),
-                    text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
-                        range: lsp::Range::new(position, position),
-                        new_text: "first".to_string(),
-                    })),
-                    ..Default::default()
-                },
-                lsp::CompletionItem {
-                    label: "second".to_string(),
-                    text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
-                        range: lsp::Range::new(position, position),
-                        new_text: "second".to_string(),
-                    })),
-                    ..Default::default()
-                },
-            ])))
-        });
+        let mut request = cx.set_request_handler::<lsp::request::Completion, _, _>(
+            move |_, params, _| async move {
+                let position = params.text_document_position.position;
+                Ok(Some(lsp::CompletionResponse::Array(vec![
+                    lsp::CompletionItem {
+                        label: "first".to_string(),
+                        text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+                            range: lsp::Range::new(position, position),
+                            new_text: "first".to_string(),
+                        })),
+                        ..Default::default()
+                    },
+                    lsp::CompletionItem {
+                        label: "second".to_string(),
+                        text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+                            range: lsp::Range::new(position, position),
+                            new_text: "second".to_string(),
+                        })),
+                        ..Default::default()
+                    },
+                ])))
+            },
+        );
         cx.simulate_keystrokes("a .");
         request.next().await;
-        cx.condition(|editor, _| editor.context_menu_visible()).await;
+        cx.condition(|editor, _| editor.context_menu_visible())
+            .await;
         cx.simulate_keystrokes("down enter ! escape");
 
         cx.assert_state(
@@ -446,7 +780,6 @@ mod test {
         );
     }
 
-    #[ignore]
     #[gpui::test]
     async fn test_repeat_completion_unicode_bug(cx: &mut gpui::TestAppContext) {
         VimTestContext::init(cx);
@@ -472,22 +805,27 @@ mod test {
             Mode::Normal,
         );
 
-        let mut request = cx.set_request_handler::<lsp::request::Completion, _, _>(move |_, params, _| async move {
-            let position = params.text_document_position.position;
-            let mut to_the_left = position;
-            to_the_left.character -= 2;
-            Ok(Some(lsp::CompletionResponse::Array(vec![lsp::CompletionItem {
-                label: "oops".to_string(),
-                text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
-                    range: lsp::Range::new(to_the_left, position),
-                    new_text: "к!".to_string(),
-                })),
-                ..Default::default()
-            }])))
-        });
+        let mut request = cx.set_request_handler::<lsp::request::Completion, _, _>(
+            move |_, params, _| async move {
+                let position = params.text_document_position.position;
+                let mut to_the_left = position;
+                to_the_left.character -= 2;
+                Ok(Some(lsp::CompletionResponse::Array(vec![
+                    lsp::CompletionItem {
+                        label: "oops".to_string(),
+                        text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+                            range: lsp::Range::new(to_the_left, position),
+                            new_text: "к!".to_string(),
+                        })),
+                        ..Default::default()
+                    },
+                ])))
+            },
+        );
         cx.simulate_keystrokes("i .");
         request.next().await;
-        cx.condition(|editor, _| editor.context_menu_visible()).await;
+        cx.condition(|editor, _| editor.context_menu_visible())
+            .await;
         cx.simulate_keystrokes("enter escape");
         cx.assert_state(
             indoc! {"
@@ -499,6 +837,141 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_repeat_visual(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // single-line (3 columns)
+        cx.set_shared_state(indoc! {
+            "ˇthe quick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("v i w s o escape").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇo quick brown
+            fox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("j w .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "o quick brown
+            fox ˇops over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("f r .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "o quick brown
+            fox ops oveˇothe lazy dog"
+        });
+
+        // visual
+        cx.set_shared_state(indoc! {
+            "the ˇquick brown
+            fox jumps over
+            fox jumps over
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("v j x").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "the ˇumps over
+            fox jumps over
+            fox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "the ˇumps over
+            fox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("w .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "the umps ˇumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("j .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "the umps umps over
+            the ˇog"
+        });
+
+        // block mode (3 rows)
+        cx.set_shared_state(indoc! {
+            "ˇthe quick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("ctrl-v j j shift-i o escape")
+            .await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇothe quick brown
+            ofox jumps over
+            othe lazy dog"
+        });
+        cx.simulate_shared_keystrokes("j 4 l .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "othe quick brown
+            ofoxˇo jumps over
+            otheo lazy dog"
+        });
+
+        // line mode
+        cx.set_shared_state(indoc! {
+            "ˇthe quick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("shift-v shift-r o escape")
+            .await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇo
+            fox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("j .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "o
+            ˇo
+            the lazy dog"
+        });
+    }
+
+    #[gpui::test]
+    async fn test_repeat_motion_counts(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "ˇthe quick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("3 d 3 l").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇ brown
+            fox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("j .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            " brown
+            ˇ over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("j 2 .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            " brown
+             over
+            ˇe lazy dog"
+        });
+    }
+
+    #[gpui::test]
     async fn test_record_interrupted(cx: &mut gpui::TestAppContext) {
         let mut cx = VimTestContext::new(cx, true).await;
 
@@ -506,6 +979,18 @@ mod test {
         cx.simulate_keystrokes("4 i j cmd-shift-p escape");
         cx.simulate_keystrokes("escape");
         cx.assert_state("ˇjhello\n", Mode::Normal);
+    }
+
+    #[gpui::test]
+    async fn test_repeat_over_blur(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("ˇhello hello hello\n").await;
+        cx.simulate_shared_keystrokes("c f o x escape").await;
+        cx.shared_state().await.assert_eq("ˇx hello hello\n");
+        cx.simulate_shared_keystrokes(": escape").await;
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq("ˇx hello\n");
     }
 
     #[gpui::test]
@@ -551,6 +1036,89 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_undo_repeated_insert(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("hellˇo").await;
+        cx.simulate_shared_keystrokes("3 a . escape").await;
+        cx.shared_state().await.assert_eq("hello..ˇ.");
+        cx.simulate_shared_keystrokes("u").await;
+        cx.shared_state().await.assert_eq("hellˇo");
+    }
+
+    #[gpui::test]
+    async fn test_record_replay(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("ˇhello world").await;
+        cx.simulate_shared_keystrokes("q w c w j escape q").await;
+        cx.shared_state().await.assert_eq("ˇj world");
+        cx.simulate_shared_keystrokes("2 l @ w").await;
+        cx.shared_state().await.assert_eq("j ˇj");
+    }
+
+    #[gpui::test]
+    async fn test_record_replay_count(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("ˇhello world!!").await;
+        cx.simulate_shared_keystrokes("q a v 3 l s 0 escape l q")
+            .await;
+        cx.shared_state().await.assert_eq("0ˇo world!!");
+        cx.simulate_shared_keystrokes("2 @ a").await;
+        cx.shared_state().await.assert_eq("000ˇ!");
+    }
+
+    #[gpui::test]
+    async fn test_record_replay_dot(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("ˇhello world").await;
+        cx.simulate_shared_keystrokes("q a r a l r b l q").await;
+        cx.shared_state().await.assert_eq("abˇllo world");
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq("abˇblo world");
+        cx.simulate_shared_keystrokes("shift-q").await;
+        cx.shared_state().await.assert_eq("ababˇo world");
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq("ababˇb world");
+    }
+
+    #[gpui::test]
+    async fn test_record_replay_of_dot(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("ˇhello world").await;
+        cx.simulate_shared_keystrokes("r o q w . q").await;
+        cx.shared_state().await.assert_eq("ˇoello world");
+        cx.simulate_shared_keystrokes("d l").await;
+        cx.shared_state().await.assert_eq("ˇello world");
+        cx.simulate_shared_keystrokes("@ w").await;
+        cx.shared_state().await.assert_eq("ˇllo world");
+    }
+
+    #[gpui::test]
+    async fn test_record_replay_interleaved(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("ˇhello world").await;
+        cx.simulate_shared_keystrokes("q z r a l q").await;
+        cx.shared_state().await.assert_eq("aˇello world");
+        cx.simulate_shared_keystrokes("q b @ z @ z q").await;
+        cx.shared_state().await.assert_eq("aaaˇlo world");
+        cx.simulate_shared_keystrokes("@ @").await;
+        cx.shared_state().await.assert_eq("aaaaˇo world");
+        cx.simulate_shared_keystrokes("@ b").await;
+        cx.shared_state().await.assert_eq("aaaaaaˇworld");
+        cx.simulate_shared_keystrokes("@ @").await;
+        cx.shared_state().await.assert_eq("aaaaaaaˇorld");
+        cx.simulate_shared_keystrokes("q z r b l q").await;
+        cx.shared_state().await.assert_eq("aaaaaaabˇrld");
+        cx.simulate_shared_keystrokes("@ b").await;
+        cx.shared_state().await.assert_eq("aaaaaaabbbˇd");
+    }
+
+    #[gpui::test]
     async fn test_repeat_clear(cx: &mut gpui::TestAppContext) {
         let mut cx = VimTestContext::new(cx, true).await;
 
@@ -559,5 +1127,81 @@ mod test {
         cx.set_state("ˇhello world", Mode::Normal);
         cx.simulate_keystrokes("d .");
         assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
+    async fn test_repeat_clear_repeat(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "ˇthe quick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("d d").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇfox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("d . .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇthe lazy dog"
+        });
+    }
+
+    #[gpui::test]
+    async fn test_repeat_clear_count(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "ˇthe quick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("d d").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇfox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("2 d .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇfox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇthe lazy dog"
+        });
+
+        cx.set_shared_state(indoc! {
+            "ˇthe quick brown
+            fox jumps over
+            the lazy dog
+            the quick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("2 d d").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇthe lazy dog
+            the quick brown
+            fox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("5 d .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇthe lazy dog
+            the quick brown
+            fox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇfox jumps over
+            the lazy dog"
+        });
     }
 }

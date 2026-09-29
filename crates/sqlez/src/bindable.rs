@@ -123,7 +123,8 @@ impl Column for f32 {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let result = statement
             .column_double(start_index)
-            .with_context(|| format!("Failed to parse f32 at index {start_index}"))? as f32;
+            .with_context(|| format!("Failed to parse f32 at index {start_index}"))?
+            as f32;
 
         Ok((result, start_index + 1))
     }
@@ -315,7 +316,9 @@ impl<T: Bind, const COUNT: usize> Bind for [T; COUNT] {
 impl StaticColumnCount for &Path {}
 impl Bind for &Path {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        self.as_os_str().as_encoded_bytes().bind(statement, start_index)
+        self.as_os_str()
+            .as_encoded_bytes()
+            .bind(statement, start_index)
     }
 }
 

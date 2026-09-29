@@ -1,19 +1,17 @@
 [package]
 name = "icons"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
 
 [lib]
 path = "src/icons.rs"
-test = false
 doctest = false
 
 [dependencies]
 serde.workspace = true
 strum.workspace = true
-
-[lints]
-workspace = true

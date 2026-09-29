@@ -1,7 +1,7 @@
 use assets::Assets;
-use gpui::{Application, Entity, KeyBinding, Length, StyleRefinement, WindowOptions, rgb};
+use gpui::{Entity, KeyBinding, Length, StyleRefinement, WindowOptions, rgb};
 use language::LanguageRegistry;
-use markdown::{Markdown, MarkdownElement, style::MarkdownStyle};
+use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use node_runtime::NodeRuntime;
 use settings::SettingsStore;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ wow so cool
 pub fn main() {
     env_logger::init();
 
-    Application::new().with_assets(Assets).run(|cx| {
+    gpui_platform::application().with_assets(Assets).run(|cx| {
         let store = SettingsStore::test(cx);
         cx.set_global(store);
         cx.bind_keys([KeyBinding::new("cmd-c", markdown::Copy, None)]);
@@ -28,10 +28,10 @@ pub fn main() {
         let language_registry = Arc::new(LanguageRegistry::new(cx.background_executor().clone()));
         let fs = fs::FakeFs::new(cx.background_executor().clone());
         languages::init(language_registry, fs, node_runtime, cx);
-        theme::init(LoadThemes::JustBase, cx);
+        theme_settings::init(LoadThemes::JustBase, cx);
         Assets.load_fonts(cx).unwrap();
 
-        cx.activate();
+        cx.activate(true);
         let _ = cx.open_window(WindowOptions::default(), |_, cx| {
             cx.new(|cx| {
                 let markdown = cx.new(|cx| Markdown::new(MARKDOWN_EXAMPLE.into(), None, None, cx));
@@ -49,13 +49,13 @@ impl Render for HelloWorld {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let markdown_style = MarkdownStyle {
             base_text_style: gpui::TextStyle {
-                font_family: "Gram Mono".into(),
+                font_family: "Zed Mono".into(),
                 color: cx.theme().colors().text,
                 ..Default::default()
             },
             code_block: StyleRefinement {
                 text: gpui::TextStyleRefinement {
-                    font_family: Some("Gram Mono".into()),
+                    font_family: Some("Zed Mono".into()),
                     background_color: Some(cx.theme().colors().editor_background),
                     ..Default::default()
                 },
@@ -68,7 +68,7 @@ impl Render for HelloWorld {
                 ..Default::default()
             },
             inline_code: gpui::TextStyleRefinement {
-                font_family: Some("Gram Mono".into()),
+                font_family: Some("Zed Mono".into()),
                 background_color: Some(cx.theme().colors().editor_background),
                 ..Default::default()
             },

@@ -1,22 +1,27 @@
-// This crate was essentially pulled out verbatim from main `gram` crate to avoid having to run RustEmbed macro whenever gram has to be rebuilt. It saves a second or two on an incremental build.
+// This crate was essentially pulled out verbatim from main `zed` crate to avoid having to run RustEmbed macro whenever zed has to be rebuilt. It saves a second or two on an incremental build.
 
 use anyhow::Context as _;
 use gpui::{App, AssetSource, Result, SharedString};
-use rust_embed::RustEmbed;
 
-#[derive(RustEmbed)]
-#[folder = "../../assets"]
-#[include = "fonts/**/*"]
-#[include = "icons/**/*"]
-#[include = "images/**/*"]
-#[include = "themes/**/*"]
-#[exclude = "themes/src/*"]
-#[include = "sounds/**/*"]
-#[include = "prompts/**/*"]
-#[include = "*.toml"]
-#[include = "*.md"]
-#[exclude = "*.DS_Store"]
-pub struct Assets;
+// Release builds embed the assets; dev builds read them from the checkout at
+// runtime so edits show up on the next launch without a rebuild and no
+// build-time path is baked in (which corgi's sandbox rejects). See
+// `util::fs_embed!`.
+util::fs_embed! {
+    pub struct Assets,
+    crate_relative = "../../assets",
+    root_relative = "assets",
+    include = [
+        "fonts/**/*",
+        "icons/**/*",
+        "images/**/*",
+        "themes/**/*",
+        "sounds/**/*",
+        "prompts/**/*",
+        "*.md",
+    ],
+    exclude = ["themes/src/*", "*.DS_Store"],
+}
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
@@ -27,7 +32,13 @@ impl AssetSource for Assets {
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         Ok(Self::iter()
-            .filter_map(|p| if p.starts_with(path) { Some(p.into()) } else { None })
+            .filter_map(|p| {
+                if p.starts_with(path) {
+                    Some(p.into())
+                } else {
+                    None
+                }
+            })
             .collect())
     }
 }
@@ -52,37 +63,9 @@ impl Assets {
 
     pub fn load_test_fonts(&self, cx: &App) {
         cx.text_system()
-            .add_fonts(vec![self.load("fonts/myna/Myna-Regular.ttf").unwrap().unwrap()])
+            .add_fonts(vec![
+                self.load("fonts/lilex/Lilex-Regular.ttf").unwrap().unwrap(),
+            ])
             .unwrap()
-    }
-}
-
-#[derive(RustEmbed)]
-#[folder = "../../docs"]
-#[include = "*.md"]
-#[exclude = "*.DS_Store"]
-pub struct Docs;
-
-impl AssetSource for Docs {
-    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        Self::get(path)
-            .map(|f| Some(f.data))
-            .with_context(|| format!("loading docs at path {path:?}"))
-    }
-
-    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        Ok(Self::iter()
-            .filter_map(|p| if p.starts_with(path) { Some(p.into()) } else { None })
-            .collect())
-    }
-}
-
-pub fn lookup_docs(path: &str) -> Option<rust_embed::EmbeddedFile> {
-    if let Some(docs) = Docs::get(&path) {
-        Some(docs)
-    } else if let Some(docs) = Docs::get(&format!("{path}.md")) {
-        Some(docs)
-    } else {
-        None
     }
 }

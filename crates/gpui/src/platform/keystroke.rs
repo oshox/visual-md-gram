@@ -30,9 +30,6 @@ pub struct Keystroke {
     /// this binding was pressed.
     /// e.g. for s this is "s", for option-s "ß", and cmd-s None
     pub key_char: Option<String>,
-
-    /// If set, altgr was held when the key was pushed
-    pub altgr: bool,
 }
 
 /// Represents a keystroke that can be used in keybindings and displayed to the user.
@@ -48,7 +45,7 @@ pub struct KeybindingKeystroke {
     display_key: String,
 }
 
-/// Error type for `Keystroke::parse`. This is used instead of `anyhow::Error` so that Gram can use
+/// Error type for `Keystroke::parse`. This is used instead of `anyhow::Error` so that Zed can use
 /// markdown to display it.
 #[derive(Debug)]
 pub struct InvalidKeystrokeError {
@@ -84,7 +81,11 @@ impl Keystroke {
     /// both possibilities for self against the target.
     pub fn should_match(&self, target: &KeybindingKeystroke) -> bool {
         #[cfg(not(target_os = "windows"))]
-        if let Some(key_char) = self.key_char.as_ref().filter(|key_char| key_char != &&self.key) {
+        if let Some(key_char) = self
+            .key_char
+            .as_ref()
+            .filter(|key_char| key_char != &&self.key)
+        {
             let ime_modifiers = Modifiers {
                 control: self.modifiers.control,
                 platform: self.modifiers.platform,
@@ -97,7 +98,11 @@ impl Keystroke {
         }
 
         #[cfg(target_os = "windows")]
-        if let Some(key_char) = self.key_char.as_ref().filter(|key_char| key_char != &&self.key) {
+        if let Some(key_char) = self
+            .key_char
+            .as_ref()
+            .filter(|key_char| key_char != &&self.key)
+        {
             // On Windows, if key_char is set, then the typed keystroke produced the key_char
             if &target.inner.key == key_char && target.inner.modifiers == Modifiers::none() {
                 return true;
@@ -211,7 +216,6 @@ impl Keystroke {
             modifiers,
             key,
             key_char,
-            altgr: false,
         })
     }
 
@@ -225,7 +229,10 @@ impl Keystroke {
     pub fn is_ime_in_progress(&self) -> bool {
         self.key_char.is_none()
             && (is_printable_key(&self.key) || self.key.is_empty())
-            && !(self.modifiers.platform || self.modifiers.control || self.modifiers.function || self.modifiers.alt)
+            && !(self.modifiers.platform
+                || self.modifiers.control
+                || self.modifiers.function
+                || self.modifiers.alt)
     }
 
     /// Returns a new keystroke with the key_char filled.
@@ -254,31 +261,12 @@ impl Keystroke {
         }
         self
     }
-
-    /// True if all chars in keystroke are ASCII
-    /// graphic
-    pub fn is_ascii_graphic(&self) -> bool {
-        self.key_char
-            .as_ref()
-            .map_or(false, |s| s.chars().all(|c| c.is_ascii_graphic()))
-    }
-
-    /// True if all chars in keystroke are alphanumeric
-    pub fn is_alphanumeric(&self) -> bool {
-        self.key_char
-            .as_ref()
-            .map_or(false, |s| s.chars().all(|c| c.is_alphanumeric()))
-    }
-
-    /// Used to detect when altgr/right option is used for text input
-    pub fn prefer_character_input(&self) -> bool {
-        self.key_char.as_ref().map_or(false, |typed| *typed != self.key)
-    }
 }
 
 impl KeybindingKeystroke {
     #[cfg(target_os = "windows")]
-    pub(crate) fn new(inner: Keystroke, display_modifiers: Modifiers, display_key: String) -> Self {
+    #[expect(missing_docs)]
+    pub fn new(inner: Keystroke, display_modifiers: Modifiers, display_key: String) -> Self {
         KeybindingKeystroke {
             inner,
             display_modifiers,
@@ -506,7 +494,11 @@ impl Modifiers {
 
     /// Returns how many modifier keys are pressed.
     pub fn number_of_modifiers(&self) -> u8 {
-        self.control as u8 + self.alt as u8 + self.shift as u8 + self.platform as u8 + self.function as u8
+        self.control as u8
+            + self.alt as u8
+            + self.shift as u8
+            + self.platform as u8
+            + self.function as u8
     }
 
     /// Returns [`Modifiers`] with no modifiers.

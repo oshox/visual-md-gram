@@ -1,11 +1,9 @@
 use crate::prelude::*;
-use gpui::{FontWeight, StyleRefinement, UnderlineStyle};
-use settings::Settings;
+use gpui::{FontWeight, Rems, StyleRefinement, UnderlineStyle};
 use smallvec::SmallVec;
-use theme::ThemeSettings;
 
 /// Sets the size of a label
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, Default)]
+#[derive(Debug, PartialEq, Clone, Copy, Default)]
 pub enum LabelSize {
     /// The default size of a label.
     #[default]
@@ -16,6 +14,8 @@ pub enum LabelSize {
     Small,
     /// The extra small size of a label.
     XSmall,
+    /// An arbitrary custom size specified in rems.
+    Custom(Rems),
 }
 
 /// Sets the line height of a label
@@ -89,6 +89,7 @@ pub struct LabelLike {
     single_line: bool,
     truncate: bool,
     truncate_start: bool,
+    truncate_middle: bool,
 }
 
 impl Default for LabelLike {
@@ -115,6 +116,7 @@ impl LabelLike {
             single_line: false,
             truncate: false,
             truncate_start: false,
+            truncate_middle: false,
         }
     }
 }
@@ -132,6 +134,22 @@ impl LabelLike {
     /// Truncates overflowing text with an ellipsis (`…`) at the start if needed.
     pub fn truncate_start(mut self) -> Self {
         self.truncate_start = true;
+        self
+    }
+
+    /// Truncates overflowing text with an ellipsis (`…`) in the middle if needed.
+    /// Preserves the start and end of the text. Useful for filenames.
+    pub fn truncate_middle(mut self) -> Self {
+        self.truncate_middle = true;
+        self
+    }
+
+    /// Wraps the text and truncates it with an ellipsis (`…`) at the end of
+    /// the last visible line if it exceeds the given number of lines.
+    pub fn line_clamp(mut self, lines: usize) -> Self {
+        // `line_clamp` alone hard-cuts the text; the ellipsis on the last
+        // visible line is only rendered when a text overflow style is set.
+        self.base = self.base.line_clamp(lines).text_ellipsis();
         self
     }
 }
@@ -189,14 +207,16 @@ impl LabelCommon for LabelLike {
     }
 
     fn buffer_font(mut self, cx: &App) -> Self {
-        self.base = self.base.font(theme::ThemeSettings::get_global(cx).buffer_font.clone());
+        let font = theme::theme_settings(cx).buffer_font(cx).clone();
+        self.weight = Some(font.weight);
+        self.base = self.base.font(font);
         self
     }
 
     fn inline_code(mut self, cx: &App) -> Self {
         self.base = self
             .base
-            .font(theme::ThemeSettings::get_global(cx).buffer_font.clone())
+            .font(theme::theme_settings(cx).buffer_font(cx).clone())
             .bg(cx.theme().colors().element_background)
             .rounded_sm()
             .px_0p5();
@@ -223,9 +243,10 @@ impl RenderOnce for LabelLike {
                 LabelSize::Default => this.text_ui(cx),
                 LabelSize::Small => this.text_ui_sm(cx),
                 LabelSize::XSmall => this.text_ui_xs(cx),
+                LabelSize::Custom(size) => this.text_size(size),
             })
             .when(self.line_height_style == LineHeightStyle::UiLabel, |this| {
-                this.line_height(relative(1.125))
+                this.line_height(relative(1.))
             })
             .when(self.italic, |this| this.italic())
             .when(self.underline, |mut this| {
@@ -239,7 +260,10 @@ impl RenderOnce for LabelLike {
             .when(self.strikethrough, |this| this.line_through())
             .when(self.single_line, |this| this.whitespace_nowrap())
             .when(self.truncate, |this| {
-                this.min_w_0().overflow_x_hidden().whitespace_nowrap().text_ellipsis()
+                this.min_w_0()
+                    .overflow_x_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
             })
             .when(self.truncate_start, |this| {
                 this.min_w_0()
@@ -247,8 +271,17 @@ impl RenderOnce for LabelLike {
                     .whitespace_nowrap()
                     .text_ellipsis_start()
             })
+            .when(self.truncate_middle, |this| {
+                this.min_w_0()
+                    .overflow_x_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis_middle()
+            })
             .text_color(color)
-            .font_weight(self.weight.unwrap_or(ThemeSettings::get_global(cx).ui_font.weight))
+            .font_weight(
+                self.weight
+                    .unwrap_or(theme::theme_settings(cx).ui_font(cx).weight),
+            )
             .children(self.children)
     }
 }
@@ -262,139 +295,58 @@ impl Component for LabelLike {
         "LabelLike"
     }
 
-    fn description() -> Option<&'static str> {
-        Some("A flexible, customizable label-like component that serves as a base for other label types.")
+    fn description() -> &'static str {
+        "A flexible, customizable label-like component \
+        that serves as a base for other label types."
     }
 
-    fn preview(_window: &mut Window, cx: &mut App) -> Option<AnyElement> {
-        Some(
-            v_flex()
+    fn preview(_window: &mut Window, cx: &mut App) -> AnyElement {
+        v_flex()
                 .gap_6()
                 .children(vec![
                     example_group_with_title(
                         "Sizes",
                         vec![
                             single_example("Default", LabelLike::new().child("Default size").into_any_element()),
-                            single_example(
-                                "Large",
-                                LabelLike::new()
-                                    .size(LabelSize::Large)
-                                    .child("Large size")
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "Small",
-                                LabelLike::new()
-                                    .size(LabelSize::Small)
-                                    .child("Small size")
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "XSmall",
-                                LabelLike::new()
-                                    .size(LabelSize::XSmall)
-                                    .child("Extra small size")
-                                    .into_any_element(),
-                            ),
+                            single_example("Large", LabelLike::new().size(LabelSize::Large).child("Large size").into_any_element()),
+                            single_example("Small", LabelLike::new().size(LabelSize::Small).child("Small size").into_any_element()),
+                            single_example("XSmall", LabelLike::new().size(LabelSize::XSmall).child("Extra small size").into_any_element()),
                         ],
                     ),
                     example_group_with_title(
                         "Styles",
                         vec![
-                            single_example(
-                                "Bold",
-                                LabelLike::new()
-                                    .weight(FontWeight::BOLD)
-                                    .child("Bold text")
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "Italic",
-                                LabelLike::new().italic().child("Italic text").into_any_element(),
-                            ),
-                            single_example(
-                                "Underline",
-                                LabelLike::new().underline().child("Underlined text").into_any_element(),
-                            ),
-                            single_example(
-                                "Strikethrough",
-                                LabelLike::new()
-                                    .strikethrough()
-                                    .child("Strikethrough text")
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "Inline Code",
-                                LabelLike::new()
-                                    .inline_code(cx)
-                                    .child("const value = 42;")
-                                    .into_any_element(),
-                            ),
+                            single_example("Bold", LabelLike::new().weight(FontWeight::BOLD).child("Bold text").into_any_element()),
+                            single_example("Italic", LabelLike::new().italic().child("Italic text").into_any_element()),
+                            single_example("Underline", LabelLike::new().underline().child("Underlined text").into_any_element()),
+                            single_example("Strikethrough", LabelLike::new().strikethrough().child("Strikethrough text").into_any_element()),
+                            single_example("Inline Code", LabelLike::new().inline_code(cx).child("const value = 42;").into_any_element()),
                         ],
                     ),
                     example_group_with_title(
                         "Colors",
                         vec![
                             single_example("Default", LabelLike::new().child("Default color").into_any_element()),
-                            single_example(
-                                "Accent",
-                                LabelLike::new()
-                                    .color(Color::Accent)
-                                    .child("Accent color")
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "Error",
-                                LabelLike::new()
-                                    .color(Color::Error)
-                                    .child("Error color")
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "Alpha",
-                                LabelLike::new().alpha(0.5).child("50% opacity").into_any_element(),
-                            ),
+                            single_example("Accent", LabelLike::new().color(Color::Accent).child("Accent color").into_any_element()),
+                            single_example("Error", LabelLike::new().color(Color::Error).child("Error color").into_any_element()),
+                            single_example("Alpha", LabelLike::new().alpha(0.5).child("50% opacity").into_any_element()),
                         ],
                     ),
                     example_group_with_title(
                         "Line Height",
                         vec![
-                            single_example(
-                                "Default",
-                                LabelLike::new()
-                                    .child("Default line height\nMulti-line text")
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "UI Label",
-                                LabelLike::new()
-                                    .line_height_style(LineHeightStyle::UiLabel)
-                                    .child("UI label line height\nMulti-line text")
-                                    .into_any_element(),
-                            ),
+                            single_example("Default", LabelLike::new().child("Default line height\nMulti-line text").into_any_element()),
+                            single_example("UI Label", LabelLike::new().line_height_style(LineHeightStyle::UiLabel).child("UI label line height\nMulti-line text").into_any_element()),
                         ],
                     ),
                     example_group_with_title(
                         "Special Cases",
                         vec![
-                            single_example(
-                                "Single Line",
-                                LabelLike::new()
-                                    .single_line()
-                                    .child("This is a very long text that should be displayed in a single line")
-                                    .into_any_element(),
-                            ),
-                            single_example(
-                                "Truncate",
-                                LabelLike::new()
-                                    .truncate()
-                                    .child("This is a very long text that should be truncated with an ellipsis")
-                                    .into_any_element(),
-                            ),
+                            single_example("Single Line", LabelLike::new().single_line().child("This is a very long text that should be displayed in a single line").into_any_element()),
+                            single_example("Truncate", LabelLike::new().truncate().child("This is a very long text that should be truncated with an ellipsis").into_any_element()),
                         ],
                     ),
                 ])
-                .into_any_element(),
-        )
+                .into_any_element()
     }
 }

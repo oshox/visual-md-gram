@@ -17,7 +17,9 @@ impl LoadedSourceList {
         let list = ListState::new(0, gpui::ListAlignment::Top, px(1000.));
 
         let _subscription = cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::Stopped(_) | SessionEvent::LoadedSources => {
+            SessionEvent::Stopped(_)
+            | SessionEvent::HistoricSnapshotSelected
+            | SessionEvent::LoadedSources => {
                 this.invalidate = true;
                 cx.notify();
             }
@@ -72,18 +74,24 @@ impl Focusable for LoadedSourceList {
 impl Render for LoadedSourceList {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.invalidate {
-            let len = self.session.update(cx, |session, cx| session.loaded_sources(cx).len());
+            let len = self
+                .session
+                .update(cx, |session, cx| session.loaded_sources(cx).len());
             self.list.reset(len);
             self.invalidate = false;
             cx.notify();
         }
 
-        div().track_focus(&self.focus_handle).size_full().p_1().child(
-            list(
-                self.list.clone(),
-                cx.processor(|this, ix, _window, cx| this.render_entry(ix, cx)),
+        div()
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .p_1()
+            .child(
+                list(
+                    self.list.clone(),
+                    cx.processor(|this, ix, _window, cx| this.render_entry(ix, cx)),
+                )
+                .size_full(),
             )
-            .size_full(),
-        )
     }
 }

@@ -1,12 +1,16 @@
+#![expect(clippy::result_large_err)]
 use crate::{
     debugger_panel::DebugPanel,
-    session::running::stack_frame_list::{StackFrameEntry, StackFrameFilter},
+    session::running::stack_frame_list::{
+        StackFrameEntry, StackFrameFilter, stack_frame_filter_key,
+    },
     tests::{active_debug_session_panel, init_test, init_test_workspace, start_debug_session},
 };
 use dap::{
     StackFrame,
     requests::{Scopes, StackTrace, Threads},
 };
+use db::kvp::KeyValueStore;
 use editor::{Editor, ToPoint as _};
 use gpui::{BackgroundExecutor, TestAppContext, VisualTestContext};
 use project::{FakeFs, Project};
@@ -14,10 +18,13 @@ use serde_json::json;
 use std::sync::Arc;
 use unindent::Unindent as _;
 use util::{path, rel_path::rel_path};
+use workspace::Item;
 
 #[gpui::test]
-#[allow(clippy::result_large_err)]
-async fn test_fetch_initial_stack_frames_and_go_to_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+async fn test_fetch_initial_stack_frames_and_go_to_stack_frame(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
     init_test(cx);
 
     let fs = FakeFs::new(executor.clone());
@@ -137,7 +144,9 @@ async fn test_fetch_initial_stack_frames_and_go_to_stack_frame(executor: Backgro
     // trigger to load threads
     active_debug_session_panel(workspace, cx).update(cx, |session, cx| {
         session.running_state().update(cx, |running_state, cx| {
-            running_state.session().update(cx, |session, cx| session.threads(cx));
+            running_state
+                .session()
+                .update(cx, |session, cx| session.threads(cx));
         });
     });
 
@@ -147,7 +156,9 @@ async fn test_fetch_initial_stack_frames_and_go_to_stack_frame(executor: Backgro
     active_debug_session_panel(workspace, cx).update_in(cx, |session, window, cx| {
         session.running_state().update(cx, |running_state, cx| {
             running_state.select_current_thread(
-                &running_state.session().update(cx, |session, cx| session.threads(cx)),
+                &running_state
+                    .session()
+                    .update(cx, |session, cx| session.threads(cx)),
                 window,
                 cx,
             );
@@ -169,8 +180,8 @@ async fn test_fetch_initial_stack_frames_and_go_to_stack_frame(executor: Backgro
 }
 
 #[gpui::test]
-#[allow(clippy::result_large_err)]
 async fn test_select_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
     init_test(cx);
 
     let fs = FakeFs::new(executor.clone());
@@ -295,7 +306,9 @@ async fn test_select_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppC
     // trigger threads to load
     active_debug_session_panel(workspace, cx).update(cx, |session, cx| {
         session.running_state().update(cx, |running_state, cx| {
-            running_state.session().update(cx, |session, cx| session.threads(cx));
+            running_state
+                .session()
+                .update(cx, |session, cx| session.threads(cx));
         });
     });
 
@@ -305,7 +318,9 @@ async fn test_select_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppC
     active_debug_session_panel(workspace, cx).update_in(cx, |session, window, cx| {
         session.running_state().update(cx, |running_state, cx| {
             running_state.select_current_thread(
-                &running_state.session().update(cx, |session, cx| session.threads(cx)),
+                &running_state
+                    .session()
+                    .update(cx, |session, cx| session.threads(cx)),
                 window,
                 cx,
             );
@@ -319,7 +334,9 @@ async fn test_select_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppC
             let editors = workspace.items_of_type::<Editor>(cx).collect::<Vec<_>>();
             assert_eq!(1, editors.len());
 
-            let project_path = editors[0].update(cx, |editor, cx| editor.project_path(cx)).unwrap();
+            let project_path = editors[0]
+                .update(cx, |editor, cx| editor.active_project_path(cx))
+                .unwrap();
             assert_eq!(rel_path("src/test.js"), project_path.path.as_ref());
             assert_eq!(test_file_content, editors[0].read(cx).text(cx));
             assert_eq!(
@@ -328,7 +345,7 @@ async fn test_select_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppC
                     let snapshot = editor.snapshot(window, cx);
 
                     editor
-                        .highlighted_rows::<editor::ActiveDebugLine>()
+                        .highlighted_rows::<editor::ActiveDebugLine>(cx)
                         .map(|(range, _)| {
                             let start = range.start.to_point(&snapshot.buffer_snapshot());
                             let end = range.end.to_point(&snapshot.buffer_snapshot());
@@ -343,7 +360,9 @@ async fn test_select_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppC
     let stack_frame_list = workspace
         .update(cx, |workspace, _window, cx| {
             let debug_panel = workspace.panel::<DebugPanel>(cx).unwrap();
-            let active_debug_panel_item = debug_panel.update(cx, |this, _| this.active_session()).unwrap();
+            let active_debug_panel_item = debug_panel
+                .update(cx, |this, _| this.active_session())
+                .unwrap();
 
             active_debug_panel_item
                 .read(cx)
@@ -378,7 +397,9 @@ async fn test_select_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppC
         let editors = workspace.items_of_type::<Editor>(cx).collect::<Vec<_>>();
         assert_eq!(1, editors.len());
 
-        let project_path = editors[0].update(cx, |editor, cx| editor.project_path(cx)).unwrap();
+        let project_path = editors[0]
+            .update(cx, |editor, cx| editor.active_project_path(cx))
+            .unwrap();
         assert_eq!(rel_path("src/module.js"), project_path.path.as_ref());
         assert_eq!(module_file_content, editors[0].read(cx).text(cx));
         assert_eq!(
@@ -387,7 +408,7 @@ async fn test_select_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppC
                 let snapshot = editor.snapshot(window, cx);
 
                 editor
-                    .highlighted_rows::<editor::ActiveDebugLine>()
+                    .highlighted_rows::<editor::ActiveDebugLine>(cx)
                     .map(|(range, _)| {
                         let start = range.start.to_point(&snapshot.buffer_snapshot());
                         let end = range.end.to_point(&snapshot.buffer_snapshot());
@@ -400,7 +421,6 @@ async fn test_select_stack_frame(executor: BackgroundExecutor, cx: &mut TestAppC
 }
 
 #[gpui::test]
-#[allow(clippy::result_large_err)]
 async fn test_collapsed_entries(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -633,7 +653,9 @@ async fn test_collapsed_entries(executor: BackgroundExecutor, cx: &mut TestAppCo
     // trigger threads to load
     active_debug_session_panel(workspace, cx).update(cx, |session, cx| {
         session.running_state().update(cx, |running_state, cx| {
-            running_state.session().update(cx, |session, cx| session.threads(cx));
+            running_state
+                .session()
+                .update(cx, |session, cx| session.threads(cx));
         });
     });
 
@@ -643,7 +665,9 @@ async fn test_collapsed_entries(executor: BackgroundExecutor, cx: &mut TestAppCo
     active_debug_session_panel(workspace, cx).update_in(cx, |session, window, cx| {
         session.running_state().update(cx, |running_state, cx| {
             running_state.select_current_thread(
-                &running_state.session().update(cx, |session, cx| session.threads(cx)),
+                &running_state
+                    .session()
+                    .update(cx, |session, cx| session.threads(cx)),
                 window,
                 cx,
             );
@@ -676,9 +700,15 @@ async fn test_collapsed_entries(executor: BackgroundExecutor, cx: &mut TestAppCo
             assert_eq!(
                 &vec![
                     StackFrameEntry::Normal(stack_frames[0].clone()),
-                    StackFrameEntry::Collapsed(vec![stack_frames[1].clone(), stack_frames[2].clone()]),
+                    StackFrameEntry::Collapsed(vec![
+                        stack_frames[1].clone(),
+                        stack_frames[2].clone()
+                    ]),
                     StackFrameEntry::Normal(stack_frames[3].clone()),
-                    StackFrameEntry::Collapsed(vec![stack_frames[4].clone(), stack_frames[5].clone()]),
+                    StackFrameEntry::Collapsed(vec![
+                        stack_frames[4].clone(),
+                        stack_frames[5].clone()
+                    ]),
                     StackFrameEntry::Normal(stack_frames[6].clone()),
                 ],
                 stack_frame_list.entries()
@@ -692,7 +722,10 @@ async fn test_collapsed_entries(executor: BackgroundExecutor, cx: &mut TestAppCo
                     StackFrameEntry::Normal(stack_frames[1].clone()),
                     StackFrameEntry::Normal(stack_frames[2].clone()),
                     StackFrameEntry::Normal(stack_frames[3].clone()),
-                    StackFrameEntry::Collapsed(vec![stack_frames[4].clone(), stack_frames[5].clone()]),
+                    StackFrameEntry::Collapsed(vec![
+                        stack_frames[4].clone(),
+                        stack_frames[5].clone()
+                    ]),
                     StackFrameEntry::Normal(stack_frames[6].clone()),
                 ],
                 stack_frame_list.entries()
@@ -717,7 +750,6 @@ async fn test_collapsed_entries(executor: BackgroundExecutor, cx: &mut TestAppCo
 }
 
 #[gpui::test]
-#[allow(clippy::result_large_err)]
 async fn test_stack_frame_filter(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -907,7 +939,9 @@ async fn test_stack_frame_filter(executor: BackgroundExecutor, cx: &mut TestAppC
     // trigger threads to load
     active_debug_session_panel(workspace, cx).update(cx, |session, cx| {
         session.running_state().update(cx, |running_state, cx| {
-            running_state.session().update(cx, |session, cx| session.threads(cx));
+            running_state
+                .session()
+                .update(cx, |session, cx| session.threads(cx));
         });
     });
 
@@ -917,7 +951,9 @@ async fn test_stack_frame_filter(executor: BackgroundExecutor, cx: &mut TestAppC
     active_debug_session_panel(workspace, cx).update_in(cx, |session, window, cx| {
         session.running_state().update(cx, |running_state, cx| {
             running_state.select_current_thread(
-                &running_state.session().update(cx, |session, cx| session.threads(cx)),
+                &running_state
+                    .session()
+                    .update(cx, |session, cx| session.threads(cx)),
                 window,
                 cx,
             );
@@ -939,38 +975,43 @@ async fn test_stack_frame_filter(executor: BackgroundExecutor, cx: &mut TestAppC
 
     cx.run_until_parked();
 
-    let stack_frame_list = active_debug_session_panel(workspace, cx).update_in(cx, |debug_panel_item, window, cx| {
-        let stack_frame_list = debug_panel_item
-            .running_state()
-            .update(cx, |state, _| state.stack_frame_list().clone());
+    let stack_frame_list =
+        active_debug_session_panel(workspace, cx).update_in(cx, |debug_panel_item, window, cx| {
+            let stack_frame_list = debug_panel_item
+                .running_state()
+                .update(cx, |state, _| state.stack_frame_list().clone());
 
-        stack_frame_list.update(cx, |stack_frame_list, cx| {
-            stack_frame_list.build_entries(true, window, cx);
+            stack_frame_list.update(cx, |stack_frame_list, cx| {
+                stack_frame_list.build_entries(true, window, cx);
 
-            // Verify we have the expected collapsed structure
-            assert_eq!(
-                stack_frame_list.entries(),
-                &vec![
-                    StackFrameEntry::Normal(stack_frames_for_assertions[0].clone()),
-                    StackFrameEntry::Collapsed(vec![
-                        stack_frames_for_assertions[1].clone(),
-                        stack_frames_for_assertions[2].clone(),
-                        stack_frames_for_assertions[3].clone()
-                    ]),
-                    StackFrameEntry::Normal(stack_frames_for_assertions[4].clone()),
-                ]
-            );
+                // Verify we have the expected collapsed structure
+                assert_eq!(
+                    stack_frame_list.entries(),
+                    &vec![
+                        StackFrameEntry::Normal(stack_frames_for_assertions[0].clone()),
+                        StackFrameEntry::Collapsed(vec![
+                            stack_frames_for_assertions[1].clone(),
+                            stack_frames_for_assertions[2].clone(),
+                            stack_frames_for_assertions[3].clone()
+                        ]),
+                        StackFrameEntry::Normal(stack_frames_for_assertions[4].clone()),
+                    ]
+                );
+            });
+
+            stack_frame_list
         });
-
-        stack_frame_list
-    });
 
     stack_frame_list.update(cx, |stack_frame_list, cx| {
         let all_frames = stack_frame_list.flatten_entries(true, false);
         assert_eq!(all_frames.len(), 5, "Should see all 5 frames initially");
 
-        stack_frame_list.toggle_frame_filter(Some(project::debugger::session::ThreadStatus::Stopped), cx);
-        assert_eq!(stack_frame_list.list_filter(), StackFrameFilter::OnlyUserFrames);
+        stack_frame_list
+            .toggle_frame_filter(Some(project::debugger::session::ThreadStatus::Stopped), cx);
+        assert_eq!(
+            stack_frame_list.list_filter(),
+            StackFrameFilter::OnlyUserFrames
+        );
     });
 
     stack_frame_list.update(cx, |stack_frame_list, cx| {
@@ -980,13 +1021,18 @@ async fn test_stack_frame_filter(executor: BackgroundExecutor, cx: &mut TestAppC
         assert_eq!(user_frames[1].name, "doSomething");
 
         // Toggle back to all frames
-        stack_frame_list.toggle_frame_filter(Some(project::debugger::session::ThreadStatus::Stopped), cx);
+        stack_frame_list
+            .toggle_frame_filter(Some(project::debugger::session::ThreadStatus::Stopped), cx);
         assert_eq!(stack_frame_list.list_filter(), StackFrameFilter::All);
     });
 
     stack_frame_list.update(cx, |stack_frame_list, cx| {
         let all_frames_again = stack_frame_list.flatten_entries(true, false);
-        assert_eq!(all_frames_again.len(), 5, "Should see all 5 frames after toggling back");
+        assert_eq!(
+            all_frames_again.len(),
+            5,
+            "Should see all 5 frames after toggling back"
+        );
 
         // Test 3: Verify collapsed entries stay expanded
         stack_frame_list.expand_collapsed_entry(1, cx);
@@ -1001,18 +1047,27 @@ async fn test_stack_frame_filter(executor: BackgroundExecutor, cx: &mut TestAppC
             ]
         );
 
-        stack_frame_list.toggle_frame_filter(Some(project::debugger::session::ThreadStatus::Stopped), cx);
-        assert_eq!(stack_frame_list.list_filter(), StackFrameFilter::OnlyUserFrames);
+        stack_frame_list
+            .toggle_frame_filter(Some(project::debugger::session::ThreadStatus::Stopped), cx);
+        assert_eq!(
+            stack_frame_list.list_filter(),
+            StackFrameFilter::OnlyUserFrames
+        );
     });
 
     stack_frame_list.update(cx, |stack_frame_list, cx| {
-        stack_frame_list.toggle_frame_filter(Some(project::debugger::session::ThreadStatus::Stopped), cx);
+        stack_frame_list
+            .toggle_frame_filter(Some(project::debugger::session::ThreadStatus::Stopped), cx);
         assert_eq!(stack_frame_list.list_filter(), StackFrameFilter::All);
     });
 
     stack_frame_list.update(cx, |stack_frame_list, cx| {
-        stack_frame_list.toggle_frame_filter(Some(project::debugger::session::ThreadStatus::Stopped), cx);
-        assert_eq!(stack_frame_list.list_filter(), StackFrameFilter::OnlyUserFrames);
+        stack_frame_list
+            .toggle_frame_filter(Some(project::debugger::session::ThreadStatus::Stopped), cx);
+        assert_eq!(
+            stack_frame_list.list_filter(),
+            StackFrameFilter::OnlyUserFrames
+        );
 
         assert_eq!(
             stack_frame_list.dap_stack_frames(cx).as_slice(),
@@ -1033,6 +1088,186 @@ async fn test_stack_frame_filter(executor: BackgroundExecutor, cx: &mut TestAppC
                 StackFrameEntry::Normal(stack_frames_for_assertions[4].clone()),
             ],
             "Expanded entries should remain expanded after toggling filter"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_stack_frame_filter_persistence(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+           "src": {
+               "test.js": "function main() { console.log('hello'); }",
+           }
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+    let workspace = init_test_workspace(&project, cx).await;
+    let cx = &mut VisualTestContext::from_window(*workspace, cx);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.set_random_database_id(cx);
+        })
+        .unwrap();
+
+    let threads_response = dap::ThreadsResponse {
+        threads: vec![dap::Thread {
+            id: 1,
+            name: "Thread 1".into(),
+        }],
+    };
+
+    let stack_trace_response = dap::StackTraceResponse {
+        stack_frames: vec![StackFrame {
+            id: 1,
+            name: "main".into(),
+            source: Some(dap::Source {
+                name: Some("test.js".into()),
+                path: Some(path!("/project/src/test.js").into()),
+                source_reference: None,
+                presentation_hint: None,
+                origin: None,
+                sources: None,
+                adapter_data: None,
+                checksums: None,
+            }),
+            line: 1,
+            column: 1,
+            end_line: None,
+            end_column: None,
+            can_restart: None,
+            instruction_pointer_reference: None,
+            module_id: None,
+            presentation_hint: None,
+        }],
+        total_frames: None,
+    };
+
+    let stopped_event = dap::StoppedEvent {
+        reason: dap::StoppedEventReason::Pause,
+        description: None,
+        thread_id: Some(1),
+        preserve_focus_hint: None,
+        text: None,
+        all_threads_stopped: None,
+        hit_breakpoint_ids: None,
+    };
+
+    let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let client = session.update(cx, |session, _| session.adapter_client().unwrap());
+    let adapter_name = session.update(cx, |session, _| session.adapter());
+
+    client.on_request::<Threads, _>({
+        let threads_response = threads_response.clone();
+        move |_, _| Ok(threads_response.clone())
+    });
+
+    client.on_request::<Scopes, _>(move |_, _| Ok(dap::ScopesResponse { scopes: vec![] }));
+
+    client.on_request::<StackTrace, _>({
+        let stack_trace_response = stack_trace_response.clone();
+        move |_, _| Ok(stack_trace_response.clone())
+    });
+
+    client
+        .fake_event(dap::messages::Events::Stopped(stopped_event.clone()))
+        .await;
+
+    cx.run_until_parked();
+
+    let stack_frame_list =
+        active_debug_session_panel(workspace, cx).update(cx, |debug_panel_item, cx| {
+            debug_panel_item
+                .running_state()
+                .update(cx, |state, _| state.stack_frame_list().clone())
+        });
+
+    stack_frame_list.update(cx, |stack_frame_list, _cx| {
+        assert_eq!(
+            stack_frame_list.list_filter(),
+            StackFrameFilter::All,
+            "Initial filter should be All"
+        );
+    });
+
+    stack_frame_list.update(cx, |stack_frame_list, cx| {
+        stack_frame_list
+            .toggle_frame_filter(Some(project::debugger::session::ThreadStatus::Stopped), cx);
+        assert_eq!(
+            stack_frame_list.list_filter(),
+            StackFrameFilter::OnlyUserFrames,
+            "Filter should be OnlyUserFrames after toggle"
+        );
+    });
+
+    cx.run_until_parked();
+
+    let workspace_id = workspace
+        .update(cx, |workspace, _window, cx| workspace.database_id(cx))
+        .ok()
+        .flatten()
+        .expect("workspace id has to be some for this test to work properly");
+
+    let key = stack_frame_filter_key(&adapter_name, workspace_id);
+    let stored_value = cx
+        .update(|_, cx| KeyValueStore::global(cx))
+        .read_kvp(&key)
+        .unwrap();
+    assert_eq!(
+        stored_value,
+        Some(StackFrameFilter::OnlyUserFrames.into()),
+        "Filter should be persisted in KVP store with key: {}",
+        key
+    );
+
+    client
+        .fake_event(dap::messages::Events::Terminated(None))
+        .await;
+    cx.run_until_parked();
+
+    let session2 = start_debug_session(&workspace, cx, |_| {}).unwrap();
+    let client2 = session2.update(cx, |session, _| session.adapter_client().unwrap());
+
+    client2.on_request::<Threads, _>({
+        let threads_response = threads_response.clone();
+        move |_, _| Ok(threads_response.clone())
+    });
+
+    client2.on_request::<Scopes, _>(move |_, _| Ok(dap::ScopesResponse { scopes: vec![] }));
+
+    client2.on_request::<StackTrace, _>({
+        let stack_trace_response = stack_trace_response.clone();
+        move |_, _| Ok(stack_trace_response.clone())
+    });
+
+    client2
+        .fake_event(dap::messages::Events::Stopped(stopped_event.clone()))
+        .await;
+
+    cx.run_until_parked();
+
+    let stack_frame_list2 =
+        active_debug_session_panel(workspace, cx).update(cx, |debug_panel_item, cx| {
+            debug_panel_item
+                .running_state()
+                .update(cx, |state, _| state.stack_frame_list().clone())
+        });
+
+    stack_frame_list2.update(cx, |stack_frame_list, _cx| {
+        assert_eq!(
+            stack_frame_list.list_filter(),
+            StackFrameFilter::OnlyUserFrames,
+            "Filter should be restored from KVP store in new session"
         );
     });
 }

@@ -7,7 +7,7 @@ pub use dap_types::{StartDebuggingRequestArguments, StartDebuggingRequestArgumen
 use fs::Fs;
 use futures::io::BufReader;
 use gpui::{AsyncApp, SharedString};
-use http_client::HttpClient;
+pub use http_client::{HttpClient, github::latest_github_release};
 use language::{LanguageName, LanguageToolchainStore};
 use node_runtime::NodeRuntime;
 use schemars::JsonSchema;
@@ -18,15 +18,13 @@ use std::{
     borrow::Borrow,
     ffi::OsStr,
     fmt::Debug,
-    net::Ipv4Addr,
+    net::IpAddr,
     ops::Deref,
     path::{Path, PathBuf},
     sync::Arc,
 };
-use task::{DebugScenario, GramDebugConfig, TcpArgumentsTemplate};
+use task::{DebugScenario, TcpArgumentsTemplate, ZedDebugConfig};
 use util::{archive::extract_zip, rel_path::RelPath};
-
-use crate::settings::DapSettings;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DapStatus {
@@ -51,7 +49,9 @@ pub trait DapDelegate: Send + Sync + 'static {
     fn is_headless(&self) -> bool;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, JsonSchema)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct DebugAdapterName(pub SharedString);
 
@@ -106,7 +106,7 @@ impl<'a> From<&'a str> for DebugAdapterName {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TcpArguments {
-    pub host: Ipv4Addr,
+    pub host: IpAddr,
     pub port: u16,
     pub timeout: Option<u64>,
 }
@@ -137,7 +137,10 @@ impl TcpArguments {
 /// an optional build step is completed, we turn it's result into a DebugTaskDefinition by running a locator (or using a user-provided task) and resolving task variables.
 /// Finally, a [DebugTaskDefinition] has to be turned into a concrete debugger invocation ([DebugAdapterBinary]).
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(feature = "test-support", test), derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(
+    any(feature = "test-support", test),
+    derive(serde::Deserialize, serde::Serialize)
+)]
 pub struct DebugTaskDefinition {
     /// The name of this debug task
     pub label: SharedString,
@@ -177,7 +180,10 @@ impl DebugTaskDefinition {
         Ok(Self {
             label: proto.label.into(),
             config: serde_json::from_str(&proto.config)?,
-            tcp_connection: proto.tcp_connection.map(TcpArgumentsTemplate::from_proto).transpose()?,
+            tcp_connection: proto
+                .tcp_connection
+                .map(TcpArgumentsTemplate::from_proto)
+                .transpose()?,
             adapter: DebugAdapterName(proto.adapter.into()),
         })
     }
@@ -197,15 +203,22 @@ pub struct DebugAdapterBinary {
 impl DebugAdapterBinary {
     pub fn from_proto(binary: proto::DebugAdapterBinary) -> anyhow::Result<Self> {
         let request = match binary.launch_type() {
-            proto::debug_adapter_binary::LaunchType::Launch => StartDebuggingRequestArgumentsRequest::Launch,
-            proto::debug_adapter_binary::LaunchType::Attach => StartDebuggingRequestArgumentsRequest::Attach,
+            proto::debug_adapter_binary::LaunchType::Launch => {
+                StartDebuggingRequestArgumentsRequest::Launch
+            }
+            proto::debug_adapter_binary::LaunchType::Attach => {
+                StartDebuggingRequestArgumentsRequest::Attach
+            }
         };
 
         Ok(DebugAdapterBinary {
             command: binary.command,
             arguments: binary.arguments,
             envs: binary.envs.into_iter().collect(),
-            connection: binary.connection.map(TcpArguments::from_proto).transpose()?,
+            connection: binary
+                .connection
+                .map(TcpArguments::from_proto)
+                .transpose()?,
             request_args: StartDebuggingRequestArguments {
                 configuration: serde_json::from_str(&binary.configuration)?,
                 request,
@@ -218,12 +231,23 @@ impl DebugAdapterBinary {
         proto::DebugAdapterBinary {
             command: self.command.clone(),
             arguments: self.arguments.clone(),
-            envs: self.envs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            cwd: self.cwd.as_ref().map(|cwd| cwd.to_string_lossy().into_owned()),
+            envs: self
+                .envs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            cwd: self
+                .cwd
+                .as_ref()
+                .map(|cwd| cwd.to_string_lossy().into_owned()),
             connection: self.connection.as_ref().map(|c| c.to_proto()),
             launch_type: match self.request_args.request {
-                StartDebuggingRequestArgumentsRequest::Launch => proto::debug_adapter_binary::LaunchType::Launch.into(),
-                StartDebuggingRequestArgumentsRequest::Attach => proto::debug_adapter_binary::LaunchType::Attach.into(),
+                StartDebuggingRequestArgumentsRequest::Launch => {
+                    proto::debug_adapter_binary::LaunchType::Launch.into()
+                }
+                StartDebuggingRequestArgumentsRequest::Attach => {
+                    proto::debug_adapter_binary::LaunchType::Attach.into()
+                }
             },
             configuration: self.request_args.configuration.to_string(),
         }
@@ -267,7 +291,11 @@ pub async fn download_adapter_from_github(
             .context("Failed creating adapter path")?;
     }
 
-    log::debug!("Downloading adapter {} from {}", adapter_name, github_version.url,);
+    log::debug!(
+        "Downloading adapter {} from {}",
+        adapter_name,
+        github_version.url,
+    );
     delegate.output_to_console(format!("Downloading from {}...", github_version.url));
 
     let mut response = delegate
@@ -321,7 +349,7 @@ pub async fn download_adapter_from_github(
 pub trait DebugAdapter: 'static + Send + Sync {
     fn name(&self) -> DebugAdapterName;
 
-    async fn config_from_gram_format(&self, scenario: GramDebugConfig) -> Result<DebugScenario>;
+    async fn config_from_zed_format(&self, zed_scenario: ZedDebugConfig) -> Result<DebugScenario>;
 
     async fn get_binary(
         &self,
@@ -330,7 +358,6 @@ pub trait DebugAdapter: 'static + Send + Sync {
         user_installed_path: Option<PathBuf>,
         user_args: Option<Vec<String>>,
         user_env: Option<HashMap<String, String>>,
-        settings: &DapSettings,
         cx: &mut AsyncApp,
     ) -> Result<DebugAdapterBinary>;
 
@@ -342,7 +369,10 @@ pub trait DebugAdapter: 'static + Send + Sync {
     /// Extracts the kind (attach/launch) of debug configuration from the given JSON config.
     /// This method should only return error when the kind cannot be determined for a given configuration;
     /// in particular, it *should not* validate whether the request as a whole is valid, because that's best left to the debug adapter itself to decide.
-    async fn request_kind(&self, config: &serde_json::Value) -> Result<StartDebuggingRequestArgumentsRequest> {
+    async fn request_kind(
+        &self,
+        config: &serde_json::Value,
+    ) -> Result<StartDebuggingRequestArgumentsRequest> {
         match config.get("request") {
             Some(val) if val == "launch" => Ok(StartDebuggingRequestArgumentsRequest::Launch),
             Some(val) if val == "attach" => Ok(StartDebuggingRequestArgumentsRequest::Attach),
@@ -390,7 +420,10 @@ impl DebugAdapter for FakeAdapter {
         serde_json::Value::Null
     }
 
-    async fn request_kind(&self, config: &serde_json::Value) -> Result<StartDebuggingRequestArgumentsRequest> {
+    async fn request_kind(
+        &self,
+        config: &serde_json::Value,
+    ) -> Result<StartDebuggingRequestArgumentsRequest> {
         let request = config.as_object().unwrap()["request"].as_str().unwrap();
 
         let request = match request {
@@ -406,12 +439,12 @@ impl DebugAdapter for FakeAdapter {
         None
     }
 
-    async fn config_from_gram_format(&self, scenario: GramDebugConfig) -> Result<DebugScenario> {
-        let config = serde_json::to_value(scenario.request).unwrap();
+    async fn config_from_zed_format(&self, zed_scenario: ZedDebugConfig) -> Result<DebugScenario> {
+        let config = serde_json::to_value(zed_scenario.request).unwrap();
 
         Ok(DebugScenario {
-            adapter: scenario.adapter,
-            label: scenario.label,
+            adapter: zed_scenario.adapter,
+            label: zed_scenario.label,
             build: None,
             config,
             tcp_connection: None,
@@ -425,14 +458,16 @@ impl DebugAdapter for FakeAdapter {
         _: Option<PathBuf>,
         _: Option<Vec<String>>,
         _: Option<HashMap<String, String>>,
-        _: &DapSettings,
         _: &mut AsyncApp,
     ) -> Result<DebugAdapterBinary> {
-        let connection = task_definition.tcp_connection.as_ref().map(|connection| TcpArguments {
-            host: connection.host(),
-            port: connection.port.unwrap_or(17),
-            timeout: connection.timeout,
-        });
+        let connection = task_definition
+            .tcp_connection
+            .as_ref()
+            .map(|connection| TcpArguments {
+                host: connection.host(),
+                port: connection.port.unwrap_or(17),
+                timeout: connection.timeout,
+            });
         Ok(DebugAdapterBinary {
             command: Some("command".into()),
             arguments: vec![],

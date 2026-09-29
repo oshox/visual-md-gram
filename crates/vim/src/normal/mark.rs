@@ -1,11 +1,11 @@
 use std::{ops::Range, path::Path, sync::Arc};
 
 use editor::{
-    Anchor, Bias, DisplayPoint, Editor, MultiBuffer, SelectionEffects,
+    Anchor, Bias, DisplayPoint, Editor, MultiBuffer,
     display_map::{DisplaySnapshot, ToDisplayPoint},
     movement,
 };
-use gpui::{Context, Entity, EntityId, UpdateGlobal, Window};
+use gpui::{Context, Entity, EntityId, TaskExt, UpdateGlobal, Window};
 use language::SelectionGoal;
 use text::Point;
 use ui::App;
@@ -39,7 +39,12 @@ impl Vim {
         }
     }
 
-    pub(crate) fn create_visual_marks(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn create_visual_marks(
+        &mut self,
+        mode: Mode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut starts = vec![];
         let mut ends = vec![];
         let mut reversed = vec![];
@@ -76,7 +81,7 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(workspace) = self.workspace(window) else {
+        let Some(workspace) = self.workspace(window, cx) else {
             return;
         };
         workspace.update(cx, |workspace, cx| {
@@ -113,7 +118,7 @@ impl Vim {
                     }
                 }
 
-                editor.change_selections(SelectionEffects::no_nav_history(), window, cx, |s| {
+                editor.change_selections(Default::default(), window, cx, |s| {
                     s.select_anchor_ranges(ranges)
                 });
             })
@@ -128,7 +133,7 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(workspace) = self.workspace(window) else {
+        let Some(workspace) = self.workspace(window, cx) else {
             return;
         };
         let task = workspace.update(cx, |workspace, cx| {
@@ -154,14 +159,18 @@ impl Vim {
                             .map(|p| {
                                 if line {
                                     let point = p.to_display_point(&map.display_snapshot);
-                                    motion::first_non_whitespace(&map.display_snapshot, false, point)
-                                        .to_point(&map.display_snapshot)
+                                    motion::first_non_whitespace(
+                                        &map.display_snapshot,
+                                        false,
+                                        point,
+                                    )
+                                    .to_point(&map.display_snapshot)
                                 } else {
                                     p
                                 }
                             })
                             .collect();
-                        editor.change_selections(SelectionEffects::no_nav_history(), window, cx, |s| {
+                        editor.change_selections(Default::default(), window, cx, |s| {
                             s.select_ranges(points.into_iter().map(|p| p..p))
                         })
                     })
@@ -183,7 +192,9 @@ impl Vim {
             self.pop_operator(window, cx);
         }
         let mark = self
-            .update_editor(cx, |vim, editor, cx| vim.get_mark(&text, editor, window, cx))
+            .update_editor(cx, |vim, editor, cx| {
+                vim.get_mark(&text, editor, window, cx)
+            })
             .flatten();
         let anchors = match mark {
             None => None,
@@ -206,13 +217,21 @@ impl Vim {
         let is_active_operator = self.active_operator().is_some();
         if is_active_operator {
             if let Some(anchor) = anchors.last() {
-                self.motion(Motion::Jump { anchor: *anchor, line }, window, cx)
+                self.motion(
+                    Motion::Jump {
+                        anchor: *anchor,
+                        line,
+                    },
+                    window,
+                    cx,
+                )
             }
         } else {
             // Save the last anchor so as to jump to it later.
             let anchor: Option<Anchor> = anchors.last_mut().map(|anchor| *anchor);
-            let should_jump =
-                self.mode == Mode::Visual || self.mode == Mode::VisualLine || self.mode == Mode::VisualBlock;
+            let should_jump = self.mode == Mode::Visual
+                || self.mode == Mode::VisualLine
+                || self.mode == Mode::VisualBlock;
 
             self.update_editor(cx, |_, editor, cx| {
                 let map = editor.snapshot(window, cx);
@@ -233,7 +252,9 @@ impl Vim {
                 }
 
                 if !should_jump && !ranges.is_empty() {
-                    editor.change_selections(Default::default(), window, cx, |s| s.select_anchor_ranges(ranges));
+                    editor.change_selections(Default::default(), window, cx, |s| {
+                        s.select_anchor_ranges(ranges)
+                    });
                 }
             });
 
@@ -251,7 +272,7 @@ impl Vim {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some(workspace) = self.workspace(window) else {
+        let Some(workspace) = self.workspace(window, cx) else {
             return;
         };
         if name == "`" {
@@ -272,7 +293,13 @@ impl Vim {
         });
     }
 
-    pub fn get_mark(&self, mut name: &str, editor: &mut Editor, window: &mut Window, cx: &mut App) -> Option<Mark> {
+    pub fn get_mark(
+        &self,
+        mut name: &str,
+        editor: &mut Editor,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Mark> {
         if name == "`" {
             name = "'";
         }
@@ -297,7 +324,7 @@ impl Vim {
             return Some(Mark::Local(anchors));
         }
         VimGlobals::update_global(cx, |globals, cx| {
-            let workspace_id = self.workspace(window)?.entity_id();
+            let workspace_id = self.workspace(window, cx)?.entity_id();
             globals
                 .marks
                 .get_mut(&workspace_id)?
@@ -305,8 +332,14 @@ impl Vim {
         })
     }
 
-    pub fn delete_mark(&self, name: String, editor: &mut Editor, window: &mut Window, cx: &mut App) {
-        let Some(workspace) = self.workspace(window) else {
+    pub fn delete_mark(
+        &self,
+        name: String,
+        editor: &mut Editor,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(workspace) = self.workspace(window, cx) else {
             return;
         };
         if name == "`" || name == "'" {
@@ -324,7 +357,11 @@ impl Vim {
     }
 }
 
-pub fn jump_motion(map: &DisplaySnapshot, anchor: Anchor, line: bool) -> (DisplayPoint, SelectionGoal) {
+pub fn jump_motion(
+    map: &DisplaySnapshot,
+    anchor: Anchor,
+    line: bool,
+) -> (DisplayPoint, SelectionGoal) {
     let mut point = anchor.to_display_point(map);
     if line {
         point = motion::first_non_whitespace(map, false, point)
@@ -335,12 +372,31 @@ pub fn jump_motion(map: &DisplaySnapshot, anchor: Anchor, line: bool) -> (Displa
 
 #[cfg(test)]
 mod test {
-    use crate::test::VimTestContext;
+    use crate::test::{NeovimBackedTestContext, VimTestContext};
     use editor::Editor;
     use gpui::TestAppContext;
     use std::path::Path;
     use util::path;
     use workspace::{CloseActiveItem, OpenOptions};
+
+    #[gpui::test]
+    async fn test_quote_mark(cx: &mut TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state("ˇHello, world!").await;
+        cx.simulate_shared_keystrokes("w m o").await;
+        cx.shared_state().await.assert_eq("Helloˇ, world!");
+        cx.simulate_shared_keystrokes("$ ` o").await;
+        cx.shared_state().await.assert_eq("Helloˇ, world!");
+        cx.simulate_shared_keystrokes("` `").await;
+        cx.shared_state().await.assert_eq("Hello, worldˇ!");
+        cx.simulate_shared_keystrokes("` `").await;
+        cx.shared_state().await.assert_eq("Helloˇ, world!");
+        cx.simulate_shared_keystrokes("$ m '").await;
+        cx.shared_state().await.assert_eq("Hello, worldˇ!");
+        cx.simulate_shared_keystrokes("^ ` `").await;
+        cx.shared_state().await.assert_eq("Hello, worldˇ!");
+    }
 
     #[gpui::test]
     async fn test_global_mark_overwrite(cx: &mut TestAppContext) {
@@ -354,7 +410,12 @@ mod test {
 
         let _ = cx
             .workspace(|workspace, window, cx| {
-                workspace.open_abs_path(path!("/first.rs").into(), OpenOptions::default(), window, cx)
+                workspace.open_abs_path(
+                    path!("/first.rs").into(),
+                    OpenOptions::default(),
+                    window,
+                    cx,
+                )
             })
             .await;
 
@@ -362,7 +423,12 @@ mod test {
 
         let _ = cx
             .workspace(|workspace, window, cx| {
-                workspace.open_abs_path(path!("/second.rs").into(), OpenOptions::default(), window, cx)
+                workspace.open_abs_path(
+                    path!("/second.rs").into(),
+                    OpenOptions::default(),
+                    window,
+                    cx,
+                )
             })
             .await;
 
@@ -383,7 +449,12 @@ mod test {
         cx.workspace(|workspace, _, cx| {
             let active_editor = workspace.active_item_as::<Editor>(cx).unwrap();
 
-            let buffer = active_editor.read(cx).buffer().read(cx).as_singleton().unwrap();
+            let buffer = active_editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap();
 
             let file = buffer.read(cx).file().unwrap();
             let file_path = file.as_local().unwrap().abs_path(cx);

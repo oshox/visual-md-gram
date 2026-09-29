@@ -18,13 +18,13 @@ use smol::{
 };
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{IpAddr, SocketAddr},
     process::Stdio,
     sync::Arc,
     time::Duration,
 };
 use task::TcpArgumentsTemplate;
-use util::ConnectionResult;
+use util::{ConnectionResult, ResultExt, process::Child};
 
 use crate::{
     adapters::{DebugAdapterBinary, TcpArguments},
@@ -90,9 +90,13 @@ async fn start(
     }
 
     if binary.connection.is_some() {
-        Ok(Box::new(TcpTransport::start(binary, log_handlers, cx).await?))
+        Ok(Box::new(
+            TcpTransport::start(binary, log_handlers, cx).await?,
+        ))
     } else {
-        Ok(Box::new(StdioTransport::start(binary, log_handlers, cx).await?))
+        Ok(Box::new(
+            StdioTransport::start(binary, log_handlers, cx).await?,
+        ))
     }
 }
 
@@ -128,7 +132,10 @@ impl PendingRequests {
         Ok(())
     }
 
-    pub(crate) fn remove(&mut self, sequence_id: u64) -> anyhow::Result<Option<oneshot::Sender<Result<Response>>>> {
+    pub(crate) fn remove(
+        &mut self,
+        sequence_id: u64,
+    ) -> anyhow::Result<Option<oneshot::Sender<Result<Response>>>> {
         let Some(inner) = self.inner.as_mut() else {
             bail!("client is closed");
         };
@@ -162,14 +169,16 @@ impl TransportDelegate {
         })
     }
 
-    pub async fn connect(&self, message_handler: DapMessageHandler, cx: &mut AsyncApp) -> Result<()> {
+    pub async fn connect(
+        &self,
+        message_handler: DapMessageHandler,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
         let (server_tx, client_rx) = unbounded::<Message>();
         self.tasks.lock().clear();
 
         let log_dap_communications =
-            cx.update(|cx| DebuggerSettings::get_global(cx).log_dap_communications)
-                .with_context(|| "Failed to get Debugger Setting log dap communications error in transport::start_handlers. Defaulting to false")
-                .unwrap_or(false);
+            cx.update(|cx| DebuggerSettings::get_global(cx).log_dap_communications);
 
         let connect = self.transport.lock().connect();
         let (input, output) = connect.await?;
@@ -185,11 +194,18 @@ impl TransportDelegate {
         {
             let mut tasks = self.tasks.lock();
             tasks.push(cx.background_spawn(async move {
-                match Self::recv_from_server(output, message_handler, pending_requests.clone(), output_log_handler)
-                    .await
+                match Self::recv_from_server(
+                    output,
+                    message_handler,
+                    pending_requests.clone(),
+                    output_log_handler,
+                )
+                .await
                 {
                     Ok(()) => {
-                        pending_requests.lock().flush(anyhow!("debugger shutdown unexpectedly"));
+                        pending_requests
+                            .lock()
+                            .flush(anyhow!("debugger shutdown unexpectedly"));
                     }
                     Err(e) => {
                         pending_requests.lock().flush(e);
@@ -205,10 +221,7 @@ impl TransportDelegate {
             }));
         }
 
-        {
-            let mut lock = self.server_tx.lock().await;
-            *lock = Some(server_tx.clone());
-        }
+        *self.server_tx.lock().await = Some(server_tx.clone());
 
         Ok(())
     }
@@ -325,7 +338,9 @@ impl TransportDelegate {
         let mut reader = BufReader::new(server_stdout);
 
         let result = loop {
-            let result = Self::receive_server_message(&mut reader, &mut recv_buffer, log_handlers.as_ref()).await;
+            let result =
+                Self::receive_server_message(&mut reader, &mut recv_buffer, log_handlers.as_ref())
+                    .await;
             match result {
                 ConnectionResult::Timeout => anyhow::bail!("Timed out when connecting to debugger"),
                 ConnectionResult::ConnectionReset => {
@@ -366,7 +381,10 @@ impl TransportDelegate {
                 anyhow::bail!(error_message);
             };
 
-            anyhow::bail!("Received error response from adapter. Response: {:?}", response);
+            anyhow::bail!(
+                "Received error response from adapter. Response: {:?}",
+                response
+            );
         }
     }
 
@@ -418,7 +436,8 @@ impl TransportDelegate {
             Err(e) => return ConnectionResult::Result(Err(e)),
         };
 
-        let message = serde_json::from_str::<Message>(message_str).context("deserializing server message");
+        let message =
+            serde_json::from_str::<Message>(message_str).context("deserializing server message");
 
         if let Some(log_handlers) = log_handlers {
             let command = match &message {
@@ -453,7 +472,7 @@ impl TransportDelegate {
 pub struct TcpTransport {
     executor: BackgroundExecutor,
     pub port: u16,
-    pub host: Ipv4Addr,
+    pub host: IpAddr,
     pub timeout: u64,
     process: Arc<Mutex<Option<Child>>>,
     _stderr_task: Option<Task<()>>,
@@ -470,15 +489,22 @@ impl TcpTransport {
         }
     }
 
-    pub async fn unused_port(host: Ipv4Addr) -> Result<u16> {
-        Ok(TcpListener::bind(SocketAddrV4::new(host, 0))
+    pub async fn unused_port(host: IpAddr) -> Result<u16> {
+        Ok(TcpListener::bind(SocketAddr::new(host, 0))
             .await?
             .local_addr()?
             .port())
     }
 
-    async fn start(binary: &DebugAdapterBinary, log_handlers: LogHandlers, cx: &mut AsyncApp) -> Result<Self> {
-        let connection_args = binary.connection.as_ref().context("No connection arguments provided")?;
+    async fn start(
+        binary: &DebugAdapterBinary,
+        log_handlers: LogHandlers,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        let connection_args = binary
+            .connection
+            .as_ref()
+            .context("No connection arguments provided")?;
 
         let host = connection_args.host;
         let port = connection_args.port;
@@ -497,31 +523,37 @@ impl TcpTransport {
             command.args(&binary.arguments);
             command.envs(&binary.envs);
 
-            let mut p = Child::spawn(command, Stdio::null()).with_context(|| "failed to start debug adapter.")?;
+            let mut p = Child::spawn(command, Stdio::null(), Stdio::piped(), Stdio::piped())
+                .with_context(|| "failed to start debug adapter.")?;
 
             stdout_task = p.stdout.take().map(|stdout| {
-                cx.background_executor().spawn(TransportDelegate::handle_adapter_log(
-                    stdout,
-                    IoKind::StdOut,
-                    log_handlers.clone(),
-                ))
+                cx.background_executor()
+                    .spawn(TransportDelegate::handle_adapter_log(
+                        stdout,
+                        IoKind::StdOut,
+                        log_handlers.clone(),
+                    ))
             });
             stderr_task = p.stderr.take().map(|stderr| {
-                cx.background_executor().spawn(TransportDelegate::handle_adapter_log(
-                    stderr,
-                    IoKind::StdErr,
-                    log_handlers,
-                ))
+                cx.background_executor()
+                    .spawn(TransportDelegate::handle_adapter_log(
+                        stderr,
+                        IoKind::StdErr,
+                        log_handlers,
+                    ))
             });
             process = Some(p);
         };
 
-        let timeout = connection_args.timeout.unwrap_or_else(|| {
-            cx.update(|cx| DebuggerSettings::get_global(cx).timeout)
-                .unwrap_or(20000u64)
-        });
+        let timeout = connection_args
+            .timeout
+            .unwrap_or_else(|| cx.update(|cx| DebuggerSettings::get_global(cx).timeout));
 
-        log::info!("Debug adapter has connected to TCP server {}:{}", host, port);
+        log::info!(
+            "Debug adapter has connected to TCP server {}:{}",
+            host,
+            port
+        );
 
         let this = Self {
             executor: cx.background_executor().clone(),
@@ -544,7 +576,7 @@ impl Transport for TcpTransport {
 
     fn kill(&mut self) {
         if let Some(process) = &mut *self.process.lock() {
-            process.kill();
+            process.kill().log_err();
         }
     }
 
@@ -566,7 +598,7 @@ impl Transport for TcpTransport {
     > {
         let executor = self.executor.clone();
         let timeout = self.timeout;
-        let address = SocketAddrV4::new(self.host, self.port);
+        let address = SocketAddr::new(self.host, self.port);
         let process = self.process.clone();
         executor.clone().spawn(async move {
             select! {
@@ -585,8 +617,8 @@ impl Transport for TcpTransport {
                                 if has_process {
                                     let status = process.lock().as_mut().unwrap().try_status();
                                     if let Ok(Some(_)) = status {
-                                        let process = process.lock().take().unwrap().into_inner();
-                                        let output = process.output().await?;
+                                        let child = process.lock().take().unwrap();
+                                        let output = child.output().await?;
                                         let output = if output.stderr.is_empty() {
                                             String::from_utf8_lossy(&output.stdout).to_string()
                                         } else {
@@ -609,7 +641,7 @@ impl Transport for TcpTransport {
 impl Drop for TcpTransport {
     fn drop(&mut self) {
         if let Some(mut p) = self.process.lock().take() {
-            p.kill()
+            p.kill().log_err();
         }
     }
 }
@@ -620,10 +652,16 @@ pub struct StdioTransport {
 }
 
 impl StdioTransport {
-    // #[allow(dead_code, reason = "This is used in non test builds of Gram")]
-    async fn start(binary: &DebugAdapterBinary, log_handlers: LogHandlers, cx: &mut AsyncApp) -> Result<Self> {
+    // #[allow(dead_code, reason = "This is used in non test builds of Zed")]
+    async fn start(
+        binary: &DebugAdapterBinary,
+        log_handlers: LogHandlers,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
         let Some(binary_command) = &binary.command else {
-            bail!("When using the `stdio` transport, the path to a debug adapter binary must be set by Gram.");
+            bail!(
+                "When using the `stdio` transport, the path to a debug adapter binary must be set by Zed."
+            );
         };
         let mut command = util::command::new_std_command(&binary_command);
 
@@ -634,7 +672,7 @@ impl StdioTransport {
         command.args(&binary.arguments);
         command.envs(&binary.envs);
 
-        let mut process = Child::spawn(command, Stdio::piped())?;
+        let mut process = Child::spawn(command, Stdio::piped(), Stdio::piped(), Stdio::piped())?;
 
         let _stderr_task = process.stderr.take().map(|stderr| {
             cx.background_spawn(TransportDelegate::handle_adapter_log(
@@ -646,7 +684,10 @@ impl StdioTransport {
 
         let process = Mutex::new(process);
 
-        Ok(Self { process, _stderr_task })
+        Ok(Self {
+            process,
+            _stderr_task,
+        })
     }
 }
 
@@ -656,7 +697,7 @@ impl Transport for StdioTransport {
     }
 
     fn kill(&mut self) {
-        self.process.lock().kill();
+        self.process.lock().kill().log_err();
     }
 
     fn connect(
@@ -684,7 +725,7 @@ impl Transport for StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        self.process.lock().kill();
+        self.process.lock().kill().log_err();
     }
 }
 
@@ -720,7 +761,9 @@ pub enum FakeTransportKind {
 impl FakeTransport {
     pub fn on_request<R: dap_types::requests::Request, F>(&self, mut handler: F)
     where
-        F: 'static + Send + FnMut(u64, R::Arguments) -> RequestHandling<Result<R::Response, ErrorResponse>>,
+        F: 'static
+            + Send
+            + FnMut(u64, R::Arguments) -> RequestHandling<Result<R::Response, ErrorResponse>>,
     {
         self.request_handlers.lock().insert(
             R::COMMAND,
@@ -756,7 +799,9 @@ impl FakeTransport {
     where
         F: 'static + Send + Fn(Response),
     {
-        self.response_handlers.lock().insert(R::COMMAND, Box::new(handler));
+        self.response_handlers
+            .lock()
+            .insert(R::COMMAND, Box::new(handler));
     }
 
     async fn start_tcp(connection: TcpArguments, cx: &mut AsyncApp) -> Result<Self> {
@@ -798,22 +843,28 @@ impl FakeTransport {
                     match message {
                         Message::Request(request) => {
                             // redirect reverse requests to stdout writer/reader
-                            if request.command == RunInTerminal::COMMAND || request.command == StartDebugging::COMMAND {
-                                let message = serde_json::to_string(&Message::Request(request)).unwrap();
+                            if request.command == RunInTerminal::COMMAND
+                                || request.command == StartDebugging::COMMAND
+                            {
+                                let message =
+                                    serde_json::to_string(&Message::Request(request)).unwrap();
 
                                 let mut writer = stdout_writer.lock().await;
                                 writer
-                                    .write_all(TransportDelegate::build_rpc_message(message).as_bytes())
+                                    .write_all(
+                                        TransportDelegate::build_rpc_message(message).as_bytes(),
+                                    )
                                     .await
                                     .unwrap();
                                 writer.flush().await.unwrap();
                             } else {
-                                let response =
-                                    if let Some(handle) = request_handlers.lock().get_mut(request.command.as_str()) {
-                                        handle(request.seq, request.arguments.unwrap_or(json!({})))
-                                    } else {
-                                        panic!("No request handler for {}", request.command);
-                                    };
+                                let response = if let Some(handle) =
+                                    request_handlers.lock().get_mut(request.command.as_str())
+                                {
+                                    handle(request.seq, request.arguments.unwrap_or(json!({})))
+                                } else {
+                                    panic!("No request handler for {}", request.command);
+                                };
                                 let response = match response {
                                     RequestHandling::Respond(response) => response,
                                     RequestHandling::Exit => {
@@ -821,21 +872,31 @@ impl FakeTransport {
                                     }
                                 };
                                 let success = response.success;
-                                let message = serde_json::to_string(&Message::Response(response)).unwrap();
+                                let message =
+                                    serde_json::to_string(&Message::Response(response)).unwrap();
 
                                 let mut writer = stdout_writer.lock().await;
                                 writer
-                                    .write_all(TransportDelegate::build_rpc_message(message).as_bytes())
+                                    .write_all(
+                                        TransportDelegate::build_rpc_message(message).as_bytes(),
+                                    )
                                     .await
                                     .unwrap();
 
-                                if request.command == dap_types::requests::Initialize::COMMAND && success {
+                                if request.command == dap_types::requests::Initialize::COMMAND
+                                    && success
+                                {
                                     let message = serde_json::to_string(&Message::Event(Box::new(
-                                        dap_types::messages::Events::Initialized(Some(Default::default())),
+                                        dap_types::messages::Events::Initialized(Some(
+                                            Default::default(),
+                                        )),
                                     )))
                                     .unwrap();
                                     writer
-                                        .write_all(TransportDelegate::build_rpc_message(message).as_bytes())
+                                        .write_all(
+                                            TransportDelegate::build_rpc_message(message)
+                                                .as_bytes(),
+                                        )
                                         .await
                                         .unwrap();
                                 }
@@ -854,7 +915,9 @@ impl FakeTransport {
                             writer.flush().await.unwrap();
                         }
                         Message::Response(response) => {
-                            if let Some(handle) = response_handlers.lock().get(response.command.as_str()) {
+                            if let Some(handle) =
+                                response_handlers.lock().get(response.command.as_str())
+                            {
                                 handle(response);
                             } else {
                                 log::error!("No response handler for {}", response.command);
@@ -953,70 +1016,5 @@ impl Transport for FakeTransport {
     #[cfg(any(test, feature = "test-support"))]
     fn as_fake(&self) -> &FakeTransport {
         self
-    }
-}
-
-struct Child {
-    process: smol::process::Child,
-}
-
-impl std::ops::Deref for Child {
-    type Target = smol::process::Child;
-
-    fn deref(&self) -> &Self::Target {
-        &self.process
-    }
-}
-
-impl std::ops::DerefMut for Child {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.process
-    }
-}
-
-impl Child {
-    fn into_inner(self) -> smol::process::Child {
-        self.process
-    }
-
-    #[cfg(not(windows))]
-    fn spawn(mut command: std::process::Command, stdin: Stdio) -> Result<Self> {
-        util::set_pre_exec_to_start_new_session(&mut command);
-        let mut command = smol::process::Command::from(command);
-        let process = command
-            .stdin(stdin)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to spawn command `{command:?}`",))?;
-        Ok(Self { process })
-    }
-
-    #[cfg(windows)]
-    fn spawn(command: std::process::Command, stdin: Stdio) -> Result<Self> {
-        // TODO(windows): create a job object and add the child process handle to it,
-        // see https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects
-        let mut command = smol::process::Command::from(command);
-        let process = command
-            .stdin(stdin)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to spawn command `{command:?}`",))?;
-        Ok(Self { process })
-    }
-
-    #[cfg(not(windows))]
-    fn kill(&mut self) {
-        let pid = self.process.id();
-        unsafe {
-            libc::killpg(pid as i32, libc::SIGKILL);
-        }
-    }
-
-    #[cfg(windows)]
-    fn kill(&mut self) {
-        // TODO(windows): terminate the job object in kill
-        let _ = self.process.kill();
     }
 }

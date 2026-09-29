@@ -1,16 +1,22 @@
 mod base_keymap_setting;
+mod content_into_gpui;
 mod editable_setting_control;
-mod fallible_options;
+mod editorconfig_store;
+mod granted_write_path;
 mod keymap_file;
-pub mod merge_from;
-mod serde_helper;
-mod settings_content;
 mod settings_file;
 mod settings_store;
 mod vscode_import;
 
-pub use settings_content::*;
 pub use settings_macros::RegisterSetting;
+
+pub mod settings_content {
+    pub use ::settings_content::*;
+}
+
+pub mod fallible_options {
+    pub use ::settings_content::{FallibleOption, parse_json};
+}
 
 #[doc(hidden)]
 pub mod private {
@@ -19,22 +25,29 @@ pub mod private {
 }
 
 use gpui::{App, Global};
-use rust_embed::RustEmbed;
+
+use std::env;
 use std::{borrow::Cow, fmt, str};
 use util::asset_str;
 
+pub use ::settings_content::*;
 pub use base_keymap_setting::*;
+pub use content_into_gpui::IntoGpui;
 pub use editable_setting_control::*;
-pub use keymap_file::{
-    KeyBindingValidator, KeyBindingValidatorRegistration, KeybindSource, KeybindUpdateOperation, KeybindUpdateTarget,
-    KeymapFile, KeymapFileLoadResult,
+pub use editorconfig_store::{
+    Editorconfig, EditorconfigEvent, EditorconfigProperties, EditorconfigStore,
 };
-pub use serde_helper::*;
+pub use granted_write_path::GrantedWritePath;
+pub use keymap_file::{
+    KeyBindingValidator, KeyBindingValidatorRegistration, KeybindSource, KeybindUpdateOperation,
+    KeybindUpdateTarget, KeymapFile, KeymapFileLoadResult,
+};
 pub use settings_file::*;
 pub use settings_json::*;
 pub use settings_store::{
-    InvalidSettingsError, LSP_SETTINGS_SCHEMA_URL_PREFIX, LocalSettingsKind, MigrationStatus, ParseStatus, Settings,
-    SettingsFile, SettingsJsonSchemaParams, SettingsKey, SettingsLocation, SettingsParseResult, SettingsStore,
+    DefaultSemanticTokenRules, InvalidSettingsError, LSP_SETTINGS_SCHEMA_URL_PREFIX,
+    LocalSettingsKind, LocalSettingsPath, MigrationStatus, Settings, SettingsFile,
+    SettingsJsonSchemaParams, SettingsKey, SettingsLocation, SettingsParseResult, SettingsStore,
 };
 
 pub use vscode_import::{VsCodeSettings, VsCodeSettingsSource};
@@ -45,6 +58,30 @@ pub use keymap_file::ActionSequence;
 pub struct ActiveSettingsProfileName(pub String);
 
 impl Global for ActiveSettingsProfileName {}
+
+pub trait UserSettingsContentExt {
+    fn for_profile(&self, cx: &App) -> Option<&SettingsProfile>;
+    fn for_release_channel(&self) -> Option<&SettingsContent>;
+    fn for_os(&self) -> Option<&SettingsContent>;
+}
+
+impl UserSettingsContentExt for UserSettingsContent {
+    fn for_profile(&self, cx: &App) -> Option<&SettingsProfile> {
+        let Some(active_profile) = cx.try_global::<ActiveSettingsProfileName>() else {
+            return None;
+        };
+        self.profiles.get(&active_profile.0)
+    }
+
+    fn for_release_channel(&self) -> Option<&SettingsContent> {
+        self.release_channel_overrides
+            .get_by_key(release_channel::RELEASE_CHANNEL.dev_name())
+    }
+
+    fn for_os(&self) -> Option<&SettingsContent> {
+        self.platform_overrides.get_by_key(env::consts::OS)
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, PartialOrd, Ord, serde::Serialize)]
 pub struct WorktreeId(usize);
@@ -79,12 +116,15 @@ impl fmt::Display for WorktreeId {
     }
 }
 
-#[derive(RustEmbed)]
-#[folder = "../../assets"]
-#[include = "settings/*"]
-#[include = "keymaps/*"]
-#[exclude = "*.DS_Store"]
-pub struct SettingsAssets;
+// Dev builds read the checkout's files at runtime instead of embedding them;
+// see the `assets` crate for the rationale.
+util::fs_embed! {
+    pub struct SettingsAssets,
+    crate_relative = "../../assets",
+    root_relative = "assets",
+    include = ["settings/*", "keymaps/*"],
+    exclude = ["*.DS_Store"],
+}
 
 pub fn init(cx: &mut App) {
     let settings = SettingsStore::new(cx, &default_settings());
@@ -93,52 +133,71 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn default_settings() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/default.jsonc")
+    asset_str::<SettingsAssets>("settings/default.json")
+}
+
+pub fn default_semantic_token_rules() -> Cow<'static, str> {
+    asset_str::<SettingsAssets>("settings/default_semantic_token_rules.json")
 }
 
 #[cfg(target_os = "macos")]
-pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-macos.jsonc";
+pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-macos.json";
 
 #[cfg(target_os = "windows")]
-pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-windows.jsonc";
+pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-windows.json";
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-linux.jsonc";
+pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-linux.json";
 
 pub fn default_keymap() -> Cow<'static, str> {
     asset_str::<SettingsAssets>(DEFAULT_KEYMAP_PATH)
 }
 
-pub const VIM_KEYMAP_PATH: &str = "keymaps/vim.jsonc";
+pub const VIM_KEYMAP_PATH: &str = "keymaps/vim.json";
 
 pub fn vim_keymap() -> Cow<'static, str> {
     asset_str::<SettingsAssets>(VIM_KEYMAP_PATH)
 }
 
+/// Specific keybinding overrides. Loaded after the base keymap so they win over
+/// conflicting base-keymap (and default `Editor`) bindings for the same chords,
+/// while still allowing user keymaps (loaded last) to override them. Shared
+/// across features - prefer adding a context block here over creating another
+/// override keymap file.
+#[cfg(target_os = "macos")]
+pub const SPECIFIC_OVERRIDES_KEYMAP_PATH: &str = "keymaps/specific-overrides-macos.json";
+
+#[cfg(not(target_os = "macos"))]
+pub const SPECIFIC_OVERRIDES_KEYMAP_PATH: &str = "keymaps/specific-overrides.json";
+
 pub fn initial_user_settings_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_user_settings.jsonc")
+    asset_str::<SettingsAssets>("settings/initial_user_settings.json")
 }
 
 pub fn initial_server_settings_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_server_settings.jsonc")
+    asset_str::<SettingsAssets>("settings/initial_server_settings.json")
 }
 
 pub fn initial_project_settings_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_local_settings.jsonc")
+    asset_str::<SettingsAssets>("settings/initial_local_settings.json")
 }
 
 pub fn initial_keymap_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("keymaps/initial.jsonc")
+    asset_str::<SettingsAssets>("keymaps/initial.json")
 }
 
 pub fn initial_tasks_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_tasks.jsonc")
+    asset_str::<SettingsAssets>("settings/initial_tasks.json")
+}
+
+pub fn initial_worktree_setup_tasks_content() -> Cow<'static, str> {
+    asset_str::<SettingsAssets>("settings/initial_worktree_setup_tasks.json")
 }
 
 pub fn initial_debug_tasks_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_debug_tasks.jsonc")
+    asset_str::<SettingsAssets>("settings/initial_debug_tasks.json")
 }
 
 pub fn initial_local_debug_tasks_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_local_debug_tasks.jsonc")
+    asset_str::<SettingsAssets>("settings/initial_local_debug_tasks.json")
 }

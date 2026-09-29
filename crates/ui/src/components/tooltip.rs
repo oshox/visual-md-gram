@@ -1,12 +1,9 @@
 use std::borrow::Borrow;
 use std::rc::Rc;
 
-use gpui::{Action, AnyElement, AnyView, AppContext, FocusHandle, IntoElement, Render};
-use settings::Settings;
-use theme::ThemeSettings;
-
 use crate::prelude::*;
 use crate::{Color, KeyBinding, Label, LabelSize, StyledExt, h_flex, v_flex};
+use gpui::{Action, AnyElement, AnyView, AppContext, FocusHandle, IntoElement, Render};
 
 #[derive(RegisterComponent)]
 pub struct Tooltip {
@@ -86,13 +83,21 @@ impl Tooltip {
             cx.new(|cx| Self {
                 title: Title::Str(title.clone()),
                 meta: None,
-                key_binding: Some(KeyBinding::for_action_in(action.as_ref(), &focus_handle, cx)),
+                key_binding: Some(KeyBinding::for_action_in(
+                    action.as_ref(),
+                    &focus_handle,
+                    cx,
+                )),
             })
             .into()
         }
     }
 
-    pub fn for_action(title: impl Into<SharedString>, action: &dyn Action, cx: &mut App) -> AnyView {
+    pub fn for_action(
+        title: impl Into<SharedString>,
+        action: &dyn Action,
+        cx: &mut App,
+    ) -> AnyView {
         cx.new(|cx| Self {
             title: Title::Str(title.into()),
             meta: None,
@@ -213,7 +218,7 @@ where
     C: AppContext + Borrow<App>,
 {
     let app = (*cx).borrow();
-    let ui_font = ThemeSettings::get_global(app).ui_font.clone();
+    let ui_font = theme::theme_settings(app).ui_font(app).clone();
 
     // padding to avoid tooltip appearing right below the mouse cursor
     div().pl_2().pt_2p5().child(
@@ -269,21 +274,18 @@ impl Component for Tooltip {
         ComponentScope::DataDisplay
     }
 
-    fn description() -> Option<&'static str> {
-        Some(
-            "A tooltip that appears when hovering over an element, optionally showing a keybinding or additional metadata.",
-        )
+    fn description() -> &'static str {
+        "A tooltip that appears when hovering over an element, \
+        optionally showing a keybinding or additional metadata."
     }
 
-    fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
-        Some(
-            example_group(vec![single_example(
-                "Text only",
-                Button::new("delete-example", "Delete")
-                    .tooltip(Tooltip::text("This is a tooltip!"))
-                    .into_any_element(),
-            )])
-            .into_any_element(),
-        )
+    fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
+        example_group(vec![single_example(
+            "Text only",
+            Button::new("delete-example", "Delete")
+                .tooltip(Tooltip::text("This is a tooltip!"))
+                .into_any_element(),
+        )])
+        .into_any_element()
     }
 }

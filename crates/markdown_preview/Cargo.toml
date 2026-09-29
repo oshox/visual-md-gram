@@ -1,42 +1,43 @@
 [package]
 name = "markdown_preview"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
 
 [lib]
 path = "src/markdown_preview.rs"
 doctest = false
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
-app_actions.workspace = true
-async-recursion.workspace = true
-collections.workspace = true
+db.workspace = true
 editor.workspace = true
-fs.workspace = true
 gpui.workspace = true
 language.workspace = true
-linkify.workspace = true
 log.workspace = true
 markdown.workspace = true
-mermaid-rs-renderer.workspace = true
-pretty_assertions.workspace = true
-pulldown-cmark.workspace = true
+project.workspace = true
 settings.workspace = true
 theme.workspace = true
+theme_settings.workspace = true
 ui.workspace = true
 urlencoding.workspace = true
 util.workspace = true
 workspace.workspace = true
+zed_actions.workspace = true
 
 [dev-dependencies]
+buffer_diff.workspace = true
+db = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
-
-[features]
-test-support = []
-
-[lints]
-workspace = true
+fs.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

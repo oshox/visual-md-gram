@@ -26,7 +26,10 @@ impl LineCol {
         let str = str.as_ref();
         match str.split_once(':') {
             Some((line, col)) => match (line.parse::<u32>(), col.parse::<u32>()) {
-                (Ok(line), Ok(col)) => Some(Self { line, col: Some(col) }),
+                (Ok(line), Ok(col)) => Some(Self {
+                    line,
+                    col: Some(col),
+                }),
                 _ => None,
             },
             None => match str.parse::<u32>() {
@@ -38,6 +41,8 @@ impl LineCol {
 }
 
 impl PathWithRange {
+    // Note: We could try out this as an alternative, and see how it does on evals.
+    //
     // The closest to a standard way of including a filename is this:
     // ```rust filename="path/to/file.rs#42:43"
     // ```
@@ -52,8 +57,9 @@ impl PathWithRange {
     // - https://spec.commonmark.org/0.31.2/#example-143
     pub fn new(str: impl AsRef<str>) -> Self {
         let str = str.as_ref();
-        // Discard a language at the start,
-        // e.g. "```rust gram/crates/markdown/src/markdown.rs#L1"
+        // Sometimes the model will include a language at the start,
+        // e.g. "```rust zed/crates/markdown/src/markdown.rs#L1"
+        // We just discard that.
         let str = match str.trim_end().rfind(' ') {
             Some(space) => &str[space + 1..],
             None => str.trim_start(),
@@ -61,7 +67,10 @@ impl PathWithRange {
 
         match str.rsplit_once('#') {
             Some((path, after_hash)) => {
+                // Be tolerant to the model omitting the "L" prefix, lowercasing it,
+                // or including it more than once.
                 let after_hash = after_hash.replace(['L', 'l'], "");
+
                 let range = {
                     let mut iter = after_hash.split('-').flat_map(LineCol::new);
                     iter.next()
@@ -88,10 +97,22 @@ mod tests {
     #[test]
     fn test_linecol_parsing() {
         let line_col = LineCol::new("10:5");
-        assert_eq!(line_col, Some(LineCol { line: 10, col: Some(5) }));
+        assert_eq!(
+            line_col,
+            Some(LineCol {
+                line: 10,
+                col: Some(5)
+            })
+        );
 
         let line_only = LineCol::new("42");
-        assert_eq!(line_only, Some(LineCol { line: 42, col: None }));
+        assert_eq!(
+            line_only,
+            Some(LineCol {
+                line: 42,
+                col: None
+            })
+        );
 
         assert_eq!(LineCol::new(""), None);
         assert_eq!(LineCol::new("not a number"), None);

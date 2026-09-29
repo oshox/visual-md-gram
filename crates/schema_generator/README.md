@@ -1,6 +1,6 @@
-# Gram Schema Generator
+# Zed Schema Generator
 
-Prints various Gram schemas to stdout.
+Prints various Zed schemas to stdout.
 
 ## Usage
 

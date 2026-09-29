@@ -1,14 +1,14 @@
-//! # system_specs
-
 pub use gpui::GpuSpecs;
-use gpui::{App, AppContext as _, SemanticVersion, Task, Window, actions};
+use gpui::{App, AppContext as _, Task, Window, actions};
+use human_bytes::human_bytes;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+use semver::Version;
 use serde::Serialize;
 use std::{env, fmt::Display};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 actions!(
-    gram,
+    zed,
     [
         /// Copies system specifications to the clipboard for bug reports.
         CopySystemSpecsIntoClipboard,
@@ -19,6 +19,8 @@ actions!(
 pub struct SystemSpecs {
     app_version: String,
     release_channel: &'static str,
+    os_name: String,
+    os_version: String,
     memory: u64,
     architecture: &'static str,
     commit_sha: Option<String>,
@@ -27,14 +29,23 @@ pub struct SystemSpecs {
 }
 
 impl SystemSpecs {
-    pub fn new(window: &mut Window, cx: &mut App) -> Task<Self> {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut App,
+        os_name: String,
+        os_version: String,
+    ) -> Task<Self> {
         let app_version = AppVersion::global(cx).to_string();
         let release_channel = ReleaseChannel::global(cx);
-        let system = System::new_with_specifics(RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()));
+        let system = System::new_with_specifics(
+            RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+        );
         let memory = system.total_memory();
         let architecture = env::consts::ARCH;
         let commit_sha = match release_channel {
-            ReleaseChannel::Dev => AppCommitSha::try_global(cx).map(|sha| sha.full()),
+            ReleaseChannel::Dev | ReleaseChannel::Nightly => {
+                AppCommitSha::try_global(cx).map(|sha| sha.full())
+            }
             _ => None,
         };
         let bundle_type = bundle_type();
@@ -51,6 +62,8 @@ impl SystemSpecs {
                 app_version,
                 release_channel: release_channel.display_name(),
                 bundle_type,
+                os_name,
+                os_version,
                 memory,
                 architecture,
                 commit_sha,
@@ -60,15 +73,19 @@ impl SystemSpecs {
     }
 
     pub fn new_stateless(
-        app_version: SemanticVersion,
+        app_version: Version,
         app_commit_sha: Option<AppCommitSha>,
         release_channel: ReleaseChannel,
+        os_name: String,
+        os_version: String,
     ) -> Self {
-        let system = System::new_with_specifics(RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()));
+        let system = System::new_with_specifics(
+            RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+        );
         let memory = system.total_memory();
         let architecture = env::consts::ARCH;
         let commit_sha = match release_channel {
-            ReleaseChannel::Dev => app_commit_sha.map(|sha| sha.full()),
+            ReleaseChannel::Dev | ReleaseChannel::Nightly => app_commit_sha.map(|sha| sha.full()),
             _ => None,
         };
         let bundle_type = bundle_type();
@@ -76,6 +93,8 @@ impl SystemSpecs {
         Self {
             app_version: app_version.to_string(),
             release_channel: release_channel.display_name(),
+            os_name,
+            os_version,
             memory,
             architecture,
             commit_sha,
@@ -87,8 +106,9 @@ impl SystemSpecs {
 
 impl Display for SystemSpecs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let os_information = format!("OS: {} {}", self.os_name, self.os_version);
         let app_version_information = format!(
-            "Gram: v{} ({}) {}{}",
+            "Zed: v{} ({}) {}{}",
             self.app_version,
             match &self.commit_sha {
                 Some(commit_sha) => format!("{} {}", self.release_channel, commit_sha),
@@ -99,16 +119,24 @@ impl Display for SystemSpecs {
             } else {
                 "".to_string()
             },
-            if cfg!(debug_assertions) { "(Debug Build)" } else { "" },
+            if cfg!(debug_assertions) {
+                "(Taylor's Version)"
+            } else {
+                ""
+            },
         );
-        let memory_gb = self.memory as f64 / (1024.0 * 1024.0 * 1024.0);
         let system_specs = [
             app_version_information,
-            format!("Memory: {:0} GB", memory_gb),
+            os_information,
+            format!("Memory: {}", human_bytes(self.memory as f64)),
             format!("Architecture: {}", self.architecture),
         ]
         .into_iter()
-        .chain(self.gpu_specs.as_ref().map(|specs| format!("GPU: {}", specs)))
+        .chain(
+            self.gpu_specs
+                .as_ref()
+                .map(|specs| format!("GPU: {}", specs)),
+        )
         .collect::<Vec<String>>()
         .join("\n");
 
@@ -117,27 +145,32 @@ impl Display for SystemSpecs {
 }
 
 fn try_determine_available_gpus() -> Option<String> {
-    cfg_select! {
-        any(target_os = "linux", target_os = "freebsd") => {
-            #[allow(clippy::disallowed_methods, reason = "we are not running in an executor")]
-            std::process::Command::new("vulkaninfo")
-                .args(&["--summary"])
-                .output()
-                .ok()
-                .map(|output| {
-                    [
-                        "<details><summary>`vulkaninfo --summary` output</summary>",
-                        "",
-                        "```",
-                        String::from_utf8_lossy(&output.stdout).as_ref(),
-                        "```",
-                        "</details>",
-                    ]
-                    .join("\n")
-                })
-                .or(Some("Failed to run `vulkaninfo --summary`".to_string()))
-        }
-        _ => None,
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "we are not running in an executor"
+        )]
+        std::process::Command::new("vulkaninfo")
+            .args(&["--summary"])
+            .output()
+            .ok()
+            .map(|output| {
+                [
+                    "<details><summary>`vulkaninfo --summary` output</summary>",
+                    "",
+                    "```",
+                    String::from_utf8_lossy(&output.stdout).as_ref(),
+                    "```",
+                    "</details>",
+                ]
+                .join("\n")
+            })
+            .or(Some("Failed to run `vulkaninfo --summary`".to_string()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    {
+        None
     }
 }
 
@@ -191,20 +224,29 @@ pub fn read_gpu_info_from_sys_class_drm() -> anyhow::Result<Vec<GpuInfo>> {
             });
         let driver_version = driver_name
             .as_ref()
-            .and_then(|driver_name| std::fs::read_to_string(format!("/sys/module/{driver_name}/version")).ok())
+            .and_then(|driver_name| {
+                std::fs::read_to_string(format!("/sys/module/{driver_name}/version")).ok()
+            })
             .as_deref()
             .map(str::trim)
             .map(str::to_string);
 
-        let already_found = gpus.iter().zip(&pci_addresses).any(|(gpu, gpu_pci_address)| {
-            gpu_pci_address == &pci_address && gpu.driver_version == driver_version && gpu.driver_name == driver_name
-        });
+        let already_found = gpus
+            .iter()
+            .zip(&pci_addresses)
+            .any(|(gpu, gpu_pci_address)| {
+                gpu_pci_address == &pci_address
+                    && gpu.driver_version == driver_version
+                    && gpu.driver_name == driver_name
+            });
 
         if already_found {
             continue;
         }
 
-        let vendor = pci_db.as_ref().and_then(|db| db.vendors.get(&vendor_pci_id));
+        let vendor = pci_db
+            .as_ref()
+            .and_then(|db| db.vendors.get(&vendor_pci_id));
         let vendor_name = vendor.map(|vendor| vendor.name.clone());
         let device_name = vendor
             .and_then(|vendor| vendor.devices.get(&device_pci_id))
@@ -233,19 +275,23 @@ fn read_pci_id_from_path(path: impl AsRef<std::path::Path>) -> anyhow::Result<u1
         .strip_prefix("0x")
         .context("Not a device ID")
         .context(id.clone())?;
-    anyhow::ensure!(id.len() == 4, "Not a device id, expected 4 digits, found {}", id.len());
+    anyhow::ensure!(
+        id.len() == 4,
+        "Not a device id, expected 4 digits, found {}",
+        id.len()
+    );
     u16::from_str_radix(id, 16).context("Failed to parse device ID")
 }
 
-/// Returns value of `GRAM_BUNDLE_TYPE` set at compiletime or else at runtime.
+/// Returns value of `ZED_BUNDLE_TYPE` set at compiletime or else at runtime.
 ///
 /// The compiletime value is used by flatpak since it doesn't seem to have a way to provide a
 /// runtime environment variable.
 ///
-/// The runtime value is used by snap since the Gram snaps use release binaries directly, and so
+/// The runtime value is used by snap since the Zed snaps use release binaries directly, and so
 /// cannot have this baked in.
 fn bundle_type() -> Option<String> {
-    option_env!("GRAM_BUNDLE_TYPE")
+    option_env!("ZED_BUNDLE_TYPE")
         .map(|bundle_type| bundle_type.to_string())
-        .or_else(|| env::var("GRAM_BUNDLE_TYPE").ok())
+        .or_else(|| env::var("ZED_BUNDLE_TYPE").ok())
 }

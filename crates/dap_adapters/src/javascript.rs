@@ -1,6 +1,7 @@
+use adapters::latest_github_release;
 use anyhow::Context as _;
 use collections::HashMap;
-use dap::{StartDebuggingRequestArguments, adapters::DebugTaskDefinition, settings::DapSettings};
+use dap::{StartDebuggingRequestArguments, adapters::DebugTaskDefinition};
 use gpui::AsyncApp;
 use serde_json::Value;
 use std::{path::PathBuf, sync::OnceLock};
@@ -19,8 +20,11 @@ impl JsDebugAdapter {
     const ADAPTER_NPM_NAME: &'static str = "vscode-js-debug";
     const ADAPTER_PATH: &'static str = "js-debug/src/dapDebugServer.js";
 
-    async fn fetch_latest_adapter_version(&self, delegate: &Arc<dyn DapDelegate>) -> Result<AdapterVersion> {
-        let release = http_client::github::latest_github_release(
+    async fn fetch_latest_adapter_version(
+        &self,
+        delegate: &Arc<dyn DapDelegate>,
+    ) -> Result<AdapterVersion> {
+        let release = latest_github_release(
             &format!("microsoft/{}", Self::ADAPTER_NPM_NAME),
             true,
             false,
@@ -49,7 +53,6 @@ impl JsDebugAdapter {
         user_installed_path: Option<PathBuf>,
         user_args: Option<Vec<String>>,
         user_env: Option<HashMap<String, String>>,
-        settings: &DapSettings,
         _: &mut AsyncApp,
     ) -> Result<DebugAdapterBinary> {
         let tcp_connection = task_definition.tcp_connection.clone().unwrap_or_default();
@@ -60,7 +63,9 @@ impl JsDebugAdapter {
         let mut configuration = task_definition.config.clone();
         if let Some(configuration) = configuration.as_object_mut() {
             maybe!({
-                configuration.get("type").filter(|value| value == &"node-terminal")?;
+                configuration
+                    .get("type")
+                    .filter(|value| value == &"node-terminal")?;
                 let command = configuration.get("command")?.as_str()?.to_owned();
                 let mut args = ShellKind::Posix.split(&command)?.into_iter();
                 let program = args.next()?;
@@ -105,22 +110,28 @@ impl JsDebugAdapter {
                 .entry("cwd")
                 .or_insert(delegate.worktree_root_path().to_string_lossy().into());
 
-            configuration.entry("console").or_insert("externalTerminal".into());
+            configuration
+                .entry("console")
+                .or_insert("externalTerminal".into());
 
             configuration.entry("sourceMaps").or_insert(true.into());
-            configuration.entry("pauseForSourceMap").or_insert(true.into());
-            configuration.entry("sourceMapRenames").or_insert(true.into());
+            configuration
+                .entry("pauseForSourceMap")
+                .or_insert(true.into());
+            configuration
+                .entry("sourceMapRenames")
+                .or_insert(true.into());
 
             // Set up remote browser debugging
             if delegate.is_headless() {
-                configuration.entry("browserLaunchLocation").or_insert("ui".into());
+                configuration
+                    .entry("browserLaunchLocation")
+                    .or_insert("ui".into());
             }
         }
 
         let adapter_path = if let Some(user_installed_path) = user_installed_path {
             user_installed_path
-        } else if settings.ignore_system_version {
-            anyhow::bail!("User provided DAP binary not found and ignore_system_version set");
         } else {
             let adapter_path = paths::debug_adapters_dir().join(self.name().as_ref());
 
@@ -157,7 +168,11 @@ impl JsDebugAdapter {
             arguments,
             cwd: Some(delegate.worktree_root_path().to_path_buf()),
             envs,
-            connection: Some(adapters::TcpArguments { host, port, timeout }),
+            connection: Some(adapters::TcpArguments {
+                host,
+                port,
+                timeout,
+            }),
             request_args: StartDebuggingRequestArguments {
                 configuration,
                 request: self.request_kind(&task_definition.config).await?,
@@ -172,17 +187,17 @@ impl DebugAdapter for JsDebugAdapter {
         DebugAdapterName(Self::ADAPTER_NAME.into())
     }
 
-    async fn config_from_gram_format(&self, gram_scenario: GramDebugConfig) -> Result<DebugScenario> {
+    async fn config_from_zed_format(&self, zed_scenario: ZedDebugConfig) -> Result<DebugScenario> {
         let mut args = json!({
             "type": "pwa-node",
-            "request": match gram_scenario.request {
+            "request": match zed_scenario.request {
                 DebugRequest::Launch(_) => "launch",
                 DebugRequest::Attach(_) => "attach",
             },
         });
 
         let map = args.as_object_mut().unwrap();
-        match &gram_scenario.request {
+        match &zed_scenario.request {
             DebugRequest::Attach(attach) => {
                 map.insert("processId".into(), attach.process_id.into());
             }
@@ -200,7 +215,7 @@ impl DebugAdapter for JsDebugAdapter {
                     map.insert("env".into(), launch.env_json());
                 }
 
-                if let Some(stop_on_entry) = gram_scenario.stop_on_entry {
+                if let Some(stop_on_entry) = zed_scenario.stop_on_entry {
                     map.insert("stopOnEntry".into(), stop_on_entry.into());
                 }
                 if let Some(cwd) = launch.cwd.as_ref() {
@@ -210,8 +225,8 @@ impl DebugAdapter for JsDebugAdapter {
         };
 
         Ok(DebugScenario {
-            adapter: gram_scenario.adapter,
-            label: gram_scenario.label,
+            adapter: zed_scenario.adapter,
+            label: zed_scenario.label,
             build: None,
             config: args,
             tcp_connection: None,
@@ -299,7 +314,7 @@ impl DebugAdapter for JsDebugAdapter {
                                     "items": {
                                         "type": "string"
                                     },
-                                    "default": ["${GRAM_WORKTREE_ROOT}/**/*.js", "!**/node_modules/**"]
+                                    "default": ["${ZED_WORKTREE_ROOT}/**/*.js", "!**/node_modules/**"]
                                 },
                                 "sourceMaps": {
                                     "type": "boolean",
@@ -345,7 +360,7 @@ impl DebugAdapter for JsDebugAdapter {
                                 "webRoot": {
                                     "type": "string",
                                     "description": "Workspace absolute path to the webserver root",
-                                    "default": "${GRAM_WORKTREE_ROOT}"
+                                    "default": "${ZED_WORKTREE_ROOT}"
                                 },
                                 "userDataDir": {
                                     "type": ["string", "boolean"],
@@ -433,7 +448,7 @@ impl DebugAdapter for JsDebugAdapter {
                                     "items": {
                                         "type": "string"
                                     },
-                                    "default": ["${GRAM_WORKTREE_ROOT}/**/*.js", "!**/node_modules/**"]
+                                    "default": ["${ZED_WORKTREE_ROOT}/**/*.js", "!**/node_modules/**"]
                                 },
                                 "url": {
                                     "type": "string",
@@ -442,7 +457,7 @@ impl DebugAdapter for JsDebugAdapter {
                                 "webRoot": {
                                     "type": "string",
                                     "description": "Workspace absolute path to the webserver root",
-                                    "default": "${GRAM_WORKTREE_ROOT}"
+                                    "default": "${ZED_WORKTREE_ROOT}"
                                 },
                                 "skipFiles": {
                                     "type": "array",
@@ -491,12 +506,8 @@ impl DebugAdapter for JsDebugAdapter {
         user_installed_path: Option<PathBuf>,
         user_args: Option<Vec<String>>,
         user_env: Option<HashMap<String, String>>,
-        settings: &DapSettings,
         cx: &mut AsyncApp,
     ) -> Result<DebugAdapterBinary> {
-        if !settings.allow_binary_download {
-            anyhow::bail!("js_debug_dap not downloaded: allow_binary_download not set");
-        }
         if self.checked.set(()).is_ok() {
             delegate.output_to_console(format!("Checking latest version of {}...", self.name()));
             if let Some(version) = self.fetch_latest_adapter_version(delegate).await.log_err() {
@@ -512,8 +523,15 @@ impl DebugAdapter for JsDebugAdapter {
             }
         }
 
-        self.get_installed_binary(delegate, config, user_installed_path, user_args, user_env, settings, cx)
-            .await
+        self.get_installed_binary(
+            delegate,
+            config,
+            user_installed_path,
+            user_args,
+            user_env,
+            cx,
+        )
+        .await
     }
 
     fn label_for_child_session(&self, args: &StartDebuggingRequestArguments) -> Option<String> {

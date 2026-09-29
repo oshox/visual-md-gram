@@ -1,21 +1,24 @@
 [package]
 name = "time_format"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
 
 [lib]
-doctest = false
 path = "src/time_format.rs"
+doctest = false
 
 [dependencies]
 sys-locale.workspace = true
 time.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-core-foundation.workspace = true
+core-foundation.workspace = true
+core-foundation-sys.workspace = true
 
-[lints]
-workspace = true
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true

@@ -5,8 +5,8 @@ use std::{os::windows::ffi::OsStringExt, path::PathBuf};
 use windows::{
     Win32::{
         Foundation::{
-            CLASS_E_CLASSNOTAVAILABLE, E_FAIL, E_INVALIDARG, E_NOTIMPL, ERROR_INSUFFICIENT_BUFFER, GetLastError,
-            HINSTANCE, MAX_PATH,
+            CLASS_E_CLASSNOTAVAILABLE, E_FAIL, E_INVALIDARG, E_NOTIMPL, ERROR_INSUFFICIENT_BUFFER,
+            GetLastError, HINSTANCE, MAX_PATH,
         },
         Globalization::u_strlen,
         System::{
@@ -15,8 +15,8 @@ use windows::{
             SystemServices::DLL_PROCESS_ATTACH,
         },
         UI::Shell::{
-            ECF_DEFAULT, ECS_ENABLED, IEnumExplorerCommand, IExplorerCommand, IExplorerCommand_Impl, IShellItemArray,
-            SHStrDupW, SIGDN_FILESYSPATH,
+            ECF_DEFAULT, ECS_ENABLED, IEnumExplorerCommand, IExplorerCommand,
+            IExplorerCommand_Impl, IShellItemArray, SHStrDupW, SIGDN_FILESYSPATH,
         },
     },
     core::{BOOL, GUID, HRESULT, HSTRING, Interface, Ref, Result, implement},
@@ -25,7 +25,11 @@ use windows::{
 static mut DLL_INSTANCE: HINSTANCE = HINSTANCE(std::ptr::null_mut());
 
 #[unsafe(no_mangle)]
-extern "system" fn DllMain(hinstdll: HINSTANCE, fdwreason: u32, _lpvreserved: *mut core::ffi::c_void) -> bool {
+extern "system" fn DllMain(
+    hinstdll: HINSTANCE,
+    fdwreason: u32,
+    _lpvreserved: *mut core::ffi::c_void,
+) -> bool {
     if fdwreason == DLL_PROCESS_ATTACH {
         unsafe { DLL_INSTANCE = hinstdll };
     }
@@ -39,15 +43,16 @@ struct ExplorerCommandInjector;
 #[allow(non_snake_case)]
 impl IExplorerCommand_Impl for ExplorerCommandInjector_Impl {
     fn GetTitle(&self, _: Ref<IShellItemArray>) -> Result<windows_core::PWSTR> {
-        let command_description = retrieve_command_description().unwrap_or(HSTRING::from("Open with Gram"));
+        let command_description =
+            retrieve_command_description().unwrap_or(HSTRING::from("Open with Zed"));
         unsafe { SHStrDupW(&command_description) }
     }
 
     fn GetIcon(&self, _: Ref<IShellItemArray>) -> Result<windows_core::PWSTR> {
-        let Some(gram_exe) = get_gram_exe_path() else {
+        let Some(zed_exe) = get_zed_exe_path() else {
             return Err(E_FAIL.into());
         };
-        unsafe { SHStrDupW(&HSTRING::from(gram_exe)) }
+        unsafe { SHStrDupW(&HSTRING::from(zed_exe)) }
     }
 
     fn GetToolTip(&self, _: Ref<IShellItemArray>) -> Result<windows_core::PWSTR> {
@@ -64,7 +69,7 @@ impl IExplorerCommand_Impl for ExplorerCommandInjector_Impl {
 
     fn Invoke(&self, psiitemarray: Ref<IShellItemArray>, _: Ref<IBindCtx>) -> Result<()> {
         let items = psiitemarray.ok()?;
-        let Some(gram_exe) = get_gram_exe_path() else {
+        let Some(zed_exe) = get_zed_exe_path() else {
             return Ok(());
         };
 
@@ -73,7 +78,7 @@ impl IExplorerCommand_Impl for ExplorerCommandInjector_Impl {
             let item = unsafe { items.GetItemAt(idx)? };
             let item_path = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH)?.to_string()? };
             #[allow(clippy::disallowed_methods, reason = "no async context in sight..")]
-            std::process::Command::new(&gram_exe)
+            std::process::Command::new(&zed_exe)
                 .arg(&item_path)
                 .spawn()
                 .map_err(|_| E_INVALIDARG)?;
@@ -101,18 +106,17 @@ impl IClassFactory_Impl for ExplorerCommandInjectorFactory_Impl {
         riid: *const windows_core::GUID,
         ppvobject: *mut *mut core::ffi::c_void,
     ) -> Result<()> {
+        if ppvobject.is_null() || riid.is_null() {
+            return Err(windows::Win32::Foundation::E_POINTER.into());
+        }
+
         unsafe {
             *ppvobject = std::ptr::null_mut();
         }
+
         if punkouter.is_none() {
             let factory: IExplorerCommand = ExplorerCommandInjector {}.into();
-            let ret = unsafe { factory.query(riid, ppvobject).ok() };
-            if ret.is_ok() {
-                unsafe {
-                    *ppvobject = factory.into_raw();
-                }
-            }
-            ret
+            unsafe { factory.query(riid, ppvobject).ok() }
         } else {
             Err(E_INVALIDARG.into())
         }
@@ -123,7 +127,12 @@ impl IClassFactory_Impl for ExplorerCommandInjectorFactory_Impl {
     }
 }
 
-const MODULE_ID: GUID = GUID::from_u128(0x6a1f6b13_3b82_48a1_9e06_7bb0a6d0bffd);
+const MODULE_ID: GUID = cfg_select! {
+    feature = "stable" => { GUID::from_u128(0x6a1f6b13_3b82_48a1_9e06_7bb0a6d0bffd) },
+    feature = "preview" => { GUID::from_u128(0xaf8e85ea_fb20_4db2_93cf_56513c1ec697) },
+    feature = "nightly" => { GUID::from_u128(0x266f2cfe_1653_42af_b55c_fe3590c83871) },
+    _ => { GUID::from_u128(0x685f4d49_6718_4c55_b271_ebb5c6a48d6f) },
+};
 
 #[unsafe(no_mangle)]
 extern "system" fn DllGetClassObject(
@@ -131,25 +140,23 @@ extern "system" fn DllGetClassObject(
     iid: *const GUID,
     out: *mut *mut std::ffi::c_void,
 ) -> HRESULT {
+    if out.is_null() || class_id.is_null() || iid.is_null() {
+        return E_INVALIDARG;
+    }
+
     unsafe {
         *out = std::ptr::null_mut();
     }
     let class_id = unsafe { *class_id };
     if class_id == MODULE_ID {
         let instance: IClassFactory = ExplorerCommandInjectorFactory {}.into();
-        let ret = unsafe { instance.query(iid, out) };
-        if ret.is_ok() {
-            unsafe {
-                *out = instance.into_raw();
-            }
-        }
-        ret
+        unsafe { instance.query(iid, out) }
     } else {
         CLASS_E_CLASSNOTAVAILABLE
     }
 }
 
-fn get_gram_install_folder() -> Option<PathBuf> {
+fn get_zed_install_folder() -> Option<PathBuf> {
     let mut buf = vec![0u16; MAX_PATH as usize];
     unsafe { GetModuleFileNameW(Some(DLL_INSTANCE.into()), &mut buf) };
 
@@ -166,13 +173,19 @@ fn get_gram_install_folder() -> Option<PathBuf> {
 }
 
 #[inline]
-fn get_gram_exe_path() -> Option<String> {
-    get_gram_install_folder().map(|path| path.join("Gram.exe").to_string_lossy().into_owned())
+fn get_zed_exe_path() -> Option<String> {
+    get_zed_install_folder().map(|path| path.join("Zed.exe").to_string_lossy().into_owned())
 }
 
 #[inline]
 fn retrieve_command_description() -> Result<HSTRING> {
-    const REG_PATH: &str = "Software\\Classes\\GramEditorContextMenu";
+    const REG_PATH: &str = cfg_select! {
+        feature = "stable" => { r#"Software\Classes\ZedContextMenu"# },
+        feature = "preview" => { r#"Software\Classes\ZedPreviewContextMenu"# },
+        feature = "nightly" => { r#"Software\Classes\ZedNightlyContextMenu"# },
+        _ => { r#"Software\Classes\ZedDevContextMenu"# },
+    };
+
     let key = windows_registry::CURRENT_USER.open(REG_PATH)?;
     key.get_hstring("Title")
 }

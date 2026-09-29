@@ -6,7 +6,7 @@ use crate::{
 };
 use collections::{HashMap, HashSet};
 use editor::{
-    Bias, DisplayPoint,
+    Bias, DisplayPoint, EditPredictionRequestTrigger,
     display_map::{DisplaySnapshot, ToDisplayPoint},
 };
 use gpui::{Context, Window};
@@ -24,18 +24,25 @@ impl Vim {
     ) {
         self.stop_recording(cx);
         self.update_editor(cx, |vim, editor, cx| {
-            let text_layout_details = editor.text_layout_details(window);
+            let text_layout_details = editor.text_layout_details(window, cx);
             editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
                 let mut original_columns: HashMap<_, _> = Default::default();
                 let mut motion_kind = None;
                 let mut ranges_to_copy = Vec::new();
                 editor.change_selections(Default::default(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let original_head = selection.head();
                         original_columns.insert(selection.id, original_head.column());
-                        let kind = motion.expand_selection(map, selection, times, &text_layout_details, forced_motion);
-                        ranges_to_copy.push(selection.start.to_point(map)..selection.end.to_point(map));
+                        let kind = motion.expand_selection(
+                            map,
+                            selection,
+                            times,
+                            &text_layout_details,
+                            forced_motion,
+                        );
+                        ranges_to_copy
+                            .push(selection.start.to_point(map)..selection.end.to_point(map));
 
                         // When deleting line-wise, we always want to delete a newline.
                         // If there is one after the current line, it goes; otherwise we
@@ -48,7 +55,8 @@ impl Vim {
                             } else if start.row > 0 {
                                 selection.start = Point::new(
                                     start.row - 1,
-                                    map.buffer_snapshot().line_len(MultiBufferRow(start.row - 1)),
+                                    map.buffer_snapshot()
+                                        .line_len(MultiBufferRow(start.row - 1)),
                                 )
                                 .to_display_point(map)
                             }
@@ -60,12 +68,12 @@ impl Vim {
                 });
                 let Some(kind) = motion_kind else { return };
                 vim.copy_ranges(editor, kind, false, ranges_to_copy, window, cx);
-                editor.insert("", window, cx);
+                editor.delete_selections_with_linked_edits(window, cx);
 
                 // Fixup cursor position after the deletion
                 editor.set_clip_at_line_ends(true, cx);
                 editor.change_selections(Default::default(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let mut cursor = selection.head();
                         if kind.linewise()
                             && let Some(column) = original_columns.get(&selection.id)
@@ -76,6 +84,13 @@ impl Vim {
                         selection.collapse_to(cursor, selection.goal)
                     });
                 });
+                editor.refresh_edit_prediction(
+                    true,
+                    false,
+                    EditPredictionRequestTrigger::BufferEdit,
+                    window,
+                    cx,
+                );
             });
         });
     }
@@ -103,7 +118,7 @@ impl Vim {
                 let target_mode = object.target_visual_mode(vim.mode, around);
 
                 editor.change_selections(Default::default(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let cursor_point = selection.head().to_point(map);
                         if target_mode == Mode::VisualLine {
                             column_before_move.insert(selection.id, cursor_point.column);
@@ -116,11 +131,12 @@ impl Vim {
                                 let start = selection.start.to_offset(map, Bias::Left);
                                 if selection.start.row().0 > 0 {
                                     should_move_to_start.insert(selection.id);
-                                    selection.start = (start - '\n'.len_utf8()).to_display_point(map);
+                                    selection.start =
+                                        (start - '\n'.len_utf8()).to_display_point(map);
                                 }
                             };
-                        let range =
-                            selection.start.to_offset(map, Bias::Left)..selection.end.to_offset(map, Bias::Right);
+                        let range = selection.start.to_offset(map, Bias::Left)
+                            ..selection.end.to_offset(map, Bias::Right);
                         let contains_only_newlines = map
                             .buffer_chars_at(range.start)
                             .take_while(|(_, p)| p < &range.end)
@@ -159,12 +175,12 @@ impl Vim {
                     });
                 });
                 vim.copy_selections_content(editor, MotionKind::Exclusive, window, cx);
-                editor.insert("", window, cx);
+                editor.delete_selections_with_linked_edits(window, cx);
 
                 // Fixup cursor position after the deletion
                 editor.set_clip_at_line_ends(true, cx);
                 editor.change_selections(Default::default(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let mut cursor = selection.head();
                         if should_move_to_start.contains(&selection.id) {
                             *cursor.column_mut() = 0;
@@ -182,6 +198,13 @@ impl Vim {
                         selection.collapse_to(cursor, selection.goal)
                     });
                 });
+                editor.refresh_edit_prediction(
+                    true,
+                    false,
+                    EditPredictionRequestTrigger::BufferEdit,
+                    window,
+                    cx,
+                );
             });
         });
     }
@@ -200,7 +223,419 @@ fn ends_at_eof(map: &DisplaySnapshot, selection: &mut Selection<DisplayPoint>) -
 mod test {
     use indoc::indoc;
 
-    use crate::{state::Mode, test::VimTestContext};
+    use crate::{
+        state::Mode,
+        test::{NeovimBackedTestContext, VimTestContext},
+    };
+
+    #[gpui::test]
+    async fn test_delete_h(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate("d h", "Teˇst").await.assert_matches();
+        cx.simulate("d h", "Tˇest").await.assert_matches();
+        cx.simulate("d h", "ˇTest").await.assert_matches();
+        cx.simulate(
+            "d h",
+            indoc! {"
+            Test
+            ˇtest"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_l(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate("d l", "ˇTest").await.assert_matches();
+        cx.simulate("d l", "Teˇst").await.assert_matches();
+        cx.simulate("d l", "Tesˇt").await.assert_matches();
+        cx.simulate(
+            "d l",
+            indoc! {"
+                Tesˇt
+                test"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_w(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "d w",
+            indoc! {"
+            Test tesˇt
+                test"},
+        )
+        .await
+        .assert_matches();
+
+        cx.simulate("d w", "Teˇst").await.assert_matches();
+        cx.simulate("d w", "Tˇest test").await.assert_matches();
+        cx.simulate(
+            "d w",
+            indoc! {"
+            Test teˇst
+            test"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d w",
+            indoc! {"
+            Test tesˇt
+            test"},
+        )
+        .await
+        .assert_matches();
+
+        cx.simulate(
+            "d w",
+            indoc! {"
+            Test test
+            ˇ
+            test"},
+        )
+        .await
+        .assert_matches();
+
+        cx.simulate("d shift-w", "Test teˇst-test test")
+            .await
+            .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_next_word_end(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate("d e", "Teˇst Test\n").await.assert_matches();
+        cx.simulate("d e", "Tˇest test\n").await.assert_matches();
+        cx.simulate(
+            "d e",
+            indoc! {"
+            Test teˇst
+            test"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d e",
+            indoc! {"
+            Test tesˇt
+            test"},
+        )
+        .await
+        .assert_matches();
+
+        cx.simulate("d e", "Test teˇst-test test")
+            .await
+            .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_b(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate("d b", "Teˇst Test").await.assert_matches();
+        cx.simulate("d b", "Test ˇtest").await.assert_matches();
+        cx.simulate("d b", "Test1 test2 ˇtest3")
+            .await
+            .assert_matches();
+        cx.simulate(
+            "d b",
+            indoc! {"
+            Test test
+            ˇtest"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d b",
+            indoc! {"
+            Test test
+            ˇ
+            test"},
+        )
+        .await
+        .assert_matches();
+
+        cx.simulate("d shift-b", "Test test-test ˇtest")
+            .await
+            .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_end_of_line(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "d $",
+            indoc! {"
+            The qˇuick
+            brown fox"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d $",
+            indoc! {"
+            The quick
+            ˇ
+            brown fox"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_end_of_paragraph(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "d }",
+            indoc! {"
+            ˇhello world.
+
+            hello world."},
+        )
+        .await
+        .assert_matches();
+
+        cx.simulate(
+            "d }",
+            indoc! {"
+            ˇhello world.
+            hello world."},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_0(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "d 0",
+            indoc! {"
+            The qˇuick
+            brown fox"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d 0",
+            indoc! {"
+            The quick
+            ˇ
+            brown fox"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_k(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "d k",
+            indoc! {"
+            The quick
+            brown ˇfox
+            jumps over"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d k",
+            indoc! {"
+            The quick
+            brown fox
+            jumps ˇover"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d k",
+            indoc! {"
+            The qˇuick
+            brown fox
+            jumps over"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d k",
+            indoc! {"
+            ˇbrown fox
+            jumps over"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_j(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "d j",
+            indoc! {"
+            The quick
+            brown ˇfox
+            jumps over"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d j",
+            indoc! {"
+            The quick
+            brown fox
+            jumps ˇover"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d j",
+            indoc! {"
+            The qˇuick
+            brown fox
+            jumps over"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d j",
+            indoc! {"
+            The quick
+            brown fox
+            ˇ"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_end_of_document(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "d shift-g",
+            indoc! {"
+            The quick
+            brownˇ fox
+            jumps over
+            the lazy"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d shift-g",
+            indoc! {"
+            The quick
+            brownˇ fox
+            jumps over
+            the lazy"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d shift-g",
+            indoc! {"
+            The quick
+            brown fox
+            jumps over
+            the lˇazy"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d shift-g",
+            indoc! {"
+            The quick
+            brown fox
+            jumps over
+            ˇ"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_to_line(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "d 3 shift-g",
+            indoc! {"
+            The quick
+            brownˇ fox
+            jumps over
+            the lazy"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d 3 shift-g",
+            indoc! {"
+            The quick
+            brown fox
+            jumps over
+            the lˇazy"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d 2 shift-g",
+            indoc! {"
+            The quick
+            brown fox
+            jumps over
+            ˇ"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_gg(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "d g g",
+            indoc! {"
+            The quick
+            brownˇ fox
+            jumps over
+            the lazy"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d g g",
+            indoc! {"
+            The quick
+            brown fox
+            jumps over
+            the lˇazy"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d g g",
+            indoc! {"
+            The qˇuick
+            brown fox
+            jumps over
+            the lazy"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d g g",
+            indoc! {"
+            ˇ
+            brown fox
+            jumps over
+            the lazy"},
+        )
+        .await
+        .assert_matches();
+    }
 
     #[gpui::test]
     async fn test_cancel_delete_operator(cx: &mut gpui::TestAppContext) {
@@ -238,5 +673,103 @@ mod test {
         cx.simulate_keystrokes("d y");
         assert_eq!(cx.active_operator(), None);
         assert_eq!(cx.mode(), Mode::Normal);
+    }
+
+    #[gpui::test]
+    async fn test_delete_with_counts(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.set_shared_state(indoc! {"
+                The ˇquick brown
+                fox jumps over
+                the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("d 2 d").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+        the ˇlazy dog"});
+
+        cx.set_shared_state(indoc! {"
+                The ˇquick brown
+                fox jumps over
+                the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("2 d d").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+        the ˇlazy dog"});
+
+        cx.set_shared_state(indoc! {"
+                The ˇquick brown
+                fox jumps over
+                the moon,
+                a star, and
+                the lazy dog"})
+            .await;
+        cx.simulate_shared_keystrokes("2 d 2 d").await;
+        cx.shared_state().await.assert_eq(indoc! {"
+        the ˇlazy dog"});
+    }
+
+    #[gpui::test]
+    async fn test_delete_to_adjacent_character(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate("d t x", "ˇax").await.assert_matches();
+        cx.simulate("d t x", "aˇx").await.assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_sentence(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        // cx.simulate(
+        //     "d )",
+        //     indoc! {"
+        //     Fiˇrst. Second. Third.
+        //     Fourth.
+        //     "},
+        // )
+        // .await
+        // .assert_matches();
+
+        // cx.simulate(
+        //     "d )",
+        //     indoc! {"
+        //     First. Secˇond. Third.
+        //     Fourth.
+        //     "},
+        // )
+        // .await
+        // .assert_matches();
+
+        // // Two deletes
+        // cx.simulate(
+        //     "d ) d )",
+        //     indoc! {"
+        //     First. Second. Thirˇd.
+        //     Fourth.
+        //     "},
+        // )
+        // .await
+        // .assert_matches();
+
+        // Should delete whole line if done on first column
+        cx.simulate(
+            "d )",
+            indoc! {"
+            ˇFirst.
+            Fourth.
+            "},
+        )
+        .await
+        .assert_matches();
+
+        // Backwards it should also delete the whole first line
+        cx.simulate(
+            "d (",
+            indoc! {"
+            First.
+            ˇSecond.
+            Fourth.
+            "},
+        )
+        .await
+        .assert_matches();
     }
 }

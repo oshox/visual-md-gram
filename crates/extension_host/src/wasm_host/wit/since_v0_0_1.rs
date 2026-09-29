@@ -1,15 +1,15 @@
-use super::latest;
+use super::{latest, since_v0_6_0};
 use crate::wasm_host::WasmState;
 use crate::wasm_host::wit::since_v0_0_4;
 use anyhow::Result;
 use extension::{ExtensionLanguageServerProxy, WorktreeDelegate};
 use gpui::BackgroundExecutor;
 use language::BinaryStatus;
-use semver::Version as SemanticVersion;
+use semver::Version;
 use std::sync::{Arc, OnceLock};
 use wasmtime::component::{Linker, Resource};
 
-pub const MIN_VERSION: SemanticVersion = SemanticVersion::new(0, 0, 1);
+pub const MIN_VERSION: Version = Version::new(0, 0, 1);
 
 wasmtime::component::bindgen!({
     imports: {
@@ -20,9 +20,9 @@ wasmtime::component::bindgen!({
     },
     path: "../extension_api/wit/since_v0.0.1",
     with: {
-         "worktree": ExtensionWorktree,
-         "zed:extension/github": latest::zed::extension::github,
-         "zed:extension/platform": latest::zed::extension::platform,
+        "worktree": ExtensionWorktree,
+        "zed:extension/github": since_v0_6_0::zed::extension::github,
+        "zed:extension/platform": since_v0_6_0::zed::extension::platform,
     },
 });
 
@@ -76,7 +76,10 @@ impl HostWorktree for WasmState {
         latest::HostWorktree::read_text_file(self, delegate, path).await
     }
 
-    async fn shell_env(&mut self, delegate: Resource<Arc<dyn WorktreeDelegate>>) -> wasmtime::Result<EnvVars> {
+    async fn shell_env(
+        &mut self,
+        delegate: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> wasmtime::Result<EnvVars> {
         latest::HostWorktree::shell_env(self, delegate).await
     }
 
@@ -88,7 +91,7 @@ impl HostWorktree for WasmState {
         latest::HostWorktree::which(self, delegate, binary_name).await
     }
 
-    async fn drop(&mut self, _worktree: Resource<Worktree>) -> Result<()> {
+    async fn drop(&mut self, _worktree: Resource<Worktree>) -> wasmtime::Result<()> {
         Ok(())
     }
 }
@@ -98,7 +101,10 @@ impl ExtensionImports for WasmState {
         latest::nodejs::Host::node_binary_path(self).await
     }
 
-    async fn npm_package_latest_version(&mut self, package_name: String) -> wasmtime::Result<Result<String, String>> {
+    async fn npm_package_latest_version(
+        &mut self,
+        package_name: String,
+    ) -> wasmtime::Result<Result<String, String>> {
         latest::nodejs::Host::npm_package_latest_version(self, package_name).await
     }
 
@@ -122,11 +128,11 @@ impl ExtensionImports for WasmState {
         repo: String,
         options: GithubReleaseOptions,
     ) -> wasmtime::Result<Result<GithubRelease, String>> {
-        latest::zed::extension::github::Host::latest_github_release(self, repo, options).await
+        since_v0_6_0::zed::extension::github::Host::latest_github_release(self, repo, options).await
     }
 
-    async fn current_platform(&mut self) -> Result<(Os, Architecture)> {
-        latest::zed::extension::platform::Host::current_platform(self).await
+    async fn current_platform(&mut self) -> wasmtime::Result<(Os, Architecture)> {
+        since_v0_6_0::zed::extension::platform::Host::current_platform(self).await
     }
 
     async fn set_language_server_installation_status(
@@ -137,15 +143,16 @@ impl ExtensionImports for WasmState {
         let status = match status {
             LanguageServerInstallationStatus::CheckingForUpdate => BinaryStatus::CheckingForUpdate,
             LanguageServerInstallationStatus::Downloading => BinaryStatus::Downloading,
-            LanguageServerInstallationStatus::Cached | LanguageServerInstallationStatus::Downloaded => {
-                BinaryStatus::None
-            }
+            LanguageServerInstallationStatus::Cached
+            | LanguageServerInstallationStatus::Downloaded => BinaryStatus::None,
             LanguageServerInstallationStatus::Failed(error) => BinaryStatus::Failed { error },
         };
 
-        self.host
-            .proxy
-            .update_language_server_status(lsp::LanguageServerName(server_name.into()), status);
+        self.host.proxy.update_language_server_status(
+            self.language_server_status_source,
+            lsp::LanguageServerName(server_name.into()),
+            status,
+        );
 
         Ok(())
     }

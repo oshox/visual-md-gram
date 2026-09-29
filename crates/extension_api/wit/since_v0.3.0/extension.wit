@@ -10,6 +10,7 @@ world extension {
     use common.{env-vars, range};
     use lsp.{completion, symbol};
     use process.{command};
+    use slash-command.{slash-command, slash-command-argument-completion, slash-command-output};
 
     /// Initializes the extension.
     export init-extension: func();
@@ -57,7 +58,7 @@ world extension {
     /// Updates the installation status for the given language server.
     import set-language-server-installation-status: func(language-server-name: string, status: language-server-installation-status);
 
-    /// A Gram worktree.
+    /// A Zed worktree.
     resource worktree {
         /// Returns the ID of the worktree.
         id: func() -> u64;
@@ -71,7 +72,7 @@ world extension {
         shell-env: func() -> env-vars;
     }
 
-    /// A Gram project.
+    /// A Zed project.
     resource project {
         /// Returns the IDs of all of the worktrees in this project.
         worktree-ids: func() -> list<u64>;
@@ -122,6 +123,15 @@ world extension {
 
     export labels-for-completions: func(language-server-id: string, completions: list<completion>) -> result<list<option<code-label>>, string>;
     export labels-for-symbols: func(language-server-id: string, symbols: list<symbol>) -> result<list<option<code-label>>, string>;
+
+    /// Returns the completions that should be shown when completing the provided slash command with the given query.
+    export complete-slash-command-argument: func(command: slash-command, args: list<string>) -> result<list<slash-command-argument-completion>, string>;
+
+    /// Returns the output from running the provided slash command.
+    export run-slash-command: func(command: slash-command, args: list<string>, worktree: option<borrow<worktree>>) -> result<slash-command-output, string>;
+
+    /// Returns the command used to start up a context server.
+    export context-server-command: func(context-server-id: string, project: borrow<project>) -> result<command, string>;
 
     /// Returns a list of packages as suggestions to be included in the `/docs`
     /// search results.

@@ -1,14 +1,16 @@
 [package]
 name = "line_ending_selector"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
 
 [lib]
-doctest = false
 path = "src/line_ending_selector.rs"
+doctest = false
 test = false
 
 [dependencies]
@@ -18,8 +20,4 @@ language.workspace = true
 picker.workspace = true
 project.workspace = true
 ui.workspace = true
-util.workspace = true
 workspace.workspace = true
-
-[lints]
-workspace = true

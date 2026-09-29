@@ -1,4 +1,6 @@
-fn main() {
+#![cfg_attr(target_family = "wasm", no_main)]
+
+fn run_example() {
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     example::main();
 
@@ -6,14 +8,27 @@ fn main() {
     panic!("This example requires the `wayland` feature and a linux system.");
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
+}
+
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 mod example {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use gpui::{
-        App, Application, Bounds, Context, FontWeight, Size, Window, WindowBackgroundAppearance, WindowBounds,
+        App, Bounds, Context, FontWeight, Size, Window, WindowBackgroundAppearance, WindowBounds,
         WindowKind, WindowOptions, div, layer_shell::*, point, prelude::*, px, rems, rgba, white,
     };
+    use gpui_platform::application;
 
     struct LayerShellExample;
 
@@ -22,7 +37,9 @@ mod example {
             cx.spawn(async move |this, cx| {
                 loop {
                     let _ = this.update(cx, |_, cx| cx.notify());
-                    cx.background_executor().timer(Duration::from_millis(500)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
                 }
             })
             .detach();
@@ -33,7 +50,10 @@ mod example {
 
     impl Render for LayerShellExample {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
 
             let hours = (now / 3600) % 24;
             let minutes = (now / 60) % 60;
@@ -54,7 +74,7 @@ mod example {
     }
 
     pub fn main() {
-        Application::new().run(|cx: &mut App| {
+        application().run(|cx: &mut App| {
             cx.open_window(
                 WindowOptions {
                     titlebar: None,

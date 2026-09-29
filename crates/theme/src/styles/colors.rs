@@ -5,7 +5,10 @@ use refineable::Refineable;
 use std::sync::Arc;
 use strum::{AsRefStr, EnumIter, IntoEnumIterator};
 
-use crate::{AccentColors, ActiveTheme, PlayerColors, StatusColors, StatusColorsRefinement, SyntaxTheme, SystemColors};
+use crate::{
+    AccentColors, ActiveTheme, PlayerColors, StatusColors, StatusColorsRefinement, SyntaxTheme,
+    SystemColors,
+};
 
 #[derive(Refineable, Clone, Debug, PartialEq)]
 #[refineable(Debug, serde::Deserialize)]
@@ -172,17 +175,39 @@ pub struct ThemeColors {
     pub vim_visual_line_background: Hsla,
     /// Background color for Vim Visual Block mode indicator.
     pub vim_visual_block_background: Hsla,
+    /// Background color for Vim yank highlight.
+    pub vim_yank_background: Hsla,
+    /// Foreground color for Helix jump labels.
+    pub vim_helix_jump_label_foreground: Hsla,
     /// Background color for Vim Helix Normal mode indicator.
     pub vim_helix_normal_background: Hsla,
     /// Background color for Vim Helix Select mode indicator.
     pub vim_helix_select_background: Hsla,
-    /// Text color for Vim mode indicator label.
-    pub vim_mode_text: Hsla,
+    /// Foreground color for Vim Normal mode indicator.
+    pub vim_normal_foreground: Hsla,
+    /// Foreground color for Vim Insert mode indicator.
+    pub vim_insert_foreground: Hsla,
+    /// Foreground color for Vim Replace mode indicator.
+    pub vim_replace_foreground: Hsla,
+    /// Foreground color for Vim Visual mode indicator.
+    pub vim_visual_foreground: Hsla,
+    /// Foreground color for Vim Visual Line mode indicator.
+    pub vim_visual_line_foreground: Hsla,
+    /// Foreground color for Vim Visual Block mode indicator.
+    pub vim_visual_block_foreground: Hsla,
+    /// Foreground color for Vim Helix Normal mode indicator.
+    pub vim_helix_normal_foreground: Hsla,
+    /// Foreground color for Vim Helix Select mode indicator.
+    pub vim_helix_select_foreground: Hsla,
 
     // ===
     // Editor
     // ===
     pub editor_foreground: Hsla,
+    /// Text color used for CodeLens items in the editor.
+    ///
+    /// Falls back to `text_muted` when not explicitly set.
+    pub editor_code_lens_foreground: Option<Hsla>,
     pub editor_background: Hsla,
     pub editor_gutter_background: Hsla,
     pub editor_subheader_background: Hsla,
@@ -220,6 +245,18 @@ pub struct ThemeColors {
     ///
     /// Matching brackets in the cursor scope are highlighted with this background color.
     pub editor_document_highlight_bracket_background: Hsla,
+    /// Filled background color for added diff hunk row highlights in the editor.
+    pub editor_diff_hunk_added_background: Hsla,
+    /// Hollow background color for added diff hunk row highlights in the editor.
+    pub editor_diff_hunk_added_hollow_background: Hsla,
+    /// Hollow border color for added diff hunk row highlights in the editor.
+    pub editor_diff_hunk_added_hollow_border: Hsla,
+    /// Filled background color for deleted diff hunk row highlights in the editor.
+    pub editor_diff_hunk_deleted_background: Hsla,
+    /// Hollow background color for deleted diff hunk row highlights in the editor.
+    pub editor_diff_hunk_deleted_hollow_background: Hsla,
+    /// Hollow border color for deleted diff hunk row highlights in the editor.
+    pub editor_diff_hunk_deleted_hollow_border: Hsla,
 
     // ===
     // Terminal
@@ -371,6 +408,7 @@ pub enum ThemeColorField {
     MinimapThumbActiveBackground,
     MinimapThumbBorder,
     EditorForeground,
+    EditorCodeLensForeground,
     EditorBackground,
     EditorGutterBackground,
     EditorSubheaderBackground,
@@ -425,6 +463,14 @@ pub enum ThemeColorField {
 }
 
 impl ThemeColors {
+    pub fn surface_overlay_background(&self) -> Hsla {
+        if self.background.a >= 1.0 || self.surface_background.a >= 1.0 {
+            self.background.blend(self.surface_background)
+        } else {
+            self.panel_overlay_background
+        }
+    }
+
     pub fn color(&self, field: ThemeColorField) -> Hsla {
         match field {
             ThemeColorField::Border => self.border,
@@ -478,7 +524,9 @@ impl ThemeColors {
             ThemeColorField::PaneGroupBorder => self.pane_group_border,
             ThemeColorField::ScrollbarThumbBackground => self.scrollbar_thumb_background,
             ThemeColorField::ScrollbarThumbHoverBackground => self.scrollbar_thumb_hover_background,
-            ThemeColorField::ScrollbarThumbActiveBackground => self.scrollbar_thumb_active_background,
+            ThemeColorField::ScrollbarThumbActiveBackground => {
+                self.scrollbar_thumb_active_background
+            }
             ThemeColorField::ScrollbarThumbBorder => self.scrollbar_thumb_border,
             ThemeColorField::ScrollbarTrackBackground => self.scrollbar_track_background,
             ThemeColorField::ScrollbarTrackBorder => self.scrollbar_track_border,
@@ -487,11 +535,16 @@ impl ThemeColors {
             ThemeColorField::MinimapThumbActiveBackground => self.minimap_thumb_active_background,
             ThemeColorField::MinimapThumbBorder => self.minimap_thumb_border,
             ThemeColorField::EditorForeground => self.editor_foreground,
+            ThemeColorField::EditorCodeLensForeground => {
+                self.editor_code_lens_foreground.unwrap_or(self.text_muted)
+            }
             ThemeColorField::EditorBackground => self.editor_background,
             ThemeColorField::EditorGutterBackground => self.editor_gutter_background,
             ThemeColorField::EditorSubheaderBackground => self.editor_subheader_background,
             ThemeColorField::EditorActiveLineBackground => self.editor_active_line_background,
-            ThemeColorField::EditorHighlightedLineBackground => self.editor_highlighted_line_background,
+            ThemeColorField::EditorHighlightedLineBackground => {
+                self.editor_highlighted_line_background
+            }
             ThemeColorField::EditorLineNumber => self.editor_line_number,
             ThemeColorField::EditorActiveLineNumber => self.editor_active_line_number,
             ThemeColorField::EditorInvisible => self.editor_invisible,
@@ -499,8 +552,12 @@ impl ThemeColors {
             ThemeColorField::EditorActiveWrapGuide => self.editor_active_wrap_guide,
             ThemeColorField::EditorIndentGuide => self.editor_indent_guide,
             ThemeColorField::EditorIndentGuideActive => self.editor_indent_guide_active,
-            ThemeColorField::EditorDocumentHighlightReadBackground => self.editor_document_highlight_read_background,
-            ThemeColorField::EditorDocumentHighlightWriteBackground => self.editor_document_highlight_write_background,
+            ThemeColorField::EditorDocumentHighlightReadBackground => {
+                self.editor_document_highlight_read_background
+            }
+            ThemeColorField::EditorDocumentHighlightWriteBackground => {
+                self.editor_document_highlight_write_background
+            }
             ThemeColorField::EditorDocumentHighlightBracketBackground => {
                 self.editor_document_highlight_bracket_background
             }
@@ -586,9 +643,33 @@ pub struct ThemeStyles {
 
 #[cfg(test)]
 mod tests {
+    use gpui::Rgba;
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn surface_overlay_background() {
+        let mut colors = ThemeColors::light();
+        colors.panel_overlay_background = Hsla::from(gpui::rgb(0xff0000));
+
+        for (surface, background, expected) in [
+            (0x58585a00, 0xdcdcddff, 0xdcdcddff),
+            (0x00000080, 0xdcdcddff, 0x6d6d6eff),
+            (0xebebecff, 0x24252900, 0xebebecff),
+            (0xebebec00, 0x24252900, 0xff0000ff),
+            (0xebebec00, 0x24252980, 0xff0000ff),
+            (0x24252980, 0x24252980, 0xff0000ff),
+        ] {
+            colors.surface_background = Hsla::from(gpui::rgba(surface));
+            colors.background = Hsla::from(gpui::rgba(background));
+            assert_eq!(
+                u32::from(Rgba::from(colors.surface_overlay_background())),
+                expected,
+                "surface {surface:#010x}, background {background:#010x}"
+            );
+        }
+    }
 
     #[test]
     fn override_a_single_theme_color() {

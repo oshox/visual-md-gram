@@ -17,7 +17,7 @@ use theme::{Appearance, AppearanceContent};
 use crate::vscode::VsCodeTheme;
 use crate::vscode::VsCodeThemeConverter;
 
-const GRAM_THEME_SCHEMA_URL: &str = "https://zed.dev/schema/themes/v0.2.0.json";
+const ZED_THEME_SCHEMA_URL: &str = "https://zed.dev/schema/themes/v0.2.0.json";
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,8 +79,13 @@ fn main() -> Result<()> {
         config.build()
     };
 
-    TermLogger::init(LevelFilter::Trace, log_config, TerminalMode::Stderr, ColorChoice::Auto)
-        .expect("could not initialize logger");
+    TermLogger::init(
+        LevelFilter::Trace,
+        log_config,
+        TerminalMode::Stderr,
+        ColorChoice::Auto,
+    )
+    .expect("could not initialize logger");
 
     let theme_file_path = args.theme_path;
 
@@ -93,8 +98,8 @@ fn main() -> Result<()> {
         }
     };
 
-    let vscode_theme: VsCodeTheme =
-        serde_json_lenient::from_slice(&buffer).context(format!("failed to parse theme {theme_file_path:?}"))?;
+    let vscode_theme: VsCodeTheme = serde_json_lenient::from_slice(&buffer)
+        .context(format!("failed to parse theme {theme_file_path:?}"))?;
 
     let theme_metadata = ThemeMetadata {
         name: vscode_theme.name.clone().unwrap_or("".to_string()),
@@ -108,7 +113,7 @@ fn main() -> Result<()> {
     let mut theme = serde_json::to_value(theme).unwrap();
     theme.as_object_mut().unwrap().insert(
         "$schema".to_string(),
-        serde_json::Value::String(GRAM_THEME_SCHEMA_URL.to_string()),
+        serde_json::Value::String(ZED_THEME_SCHEMA_URL.to_string()),
     );
     let theme_json = serde_json::to_string_pretty(&theme).unwrap();
 

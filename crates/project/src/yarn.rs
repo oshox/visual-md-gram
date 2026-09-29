@@ -23,7 +23,7 @@ pub(crate) struct YarnPathStore {
 }
 
 /// Returns `None` when passed path is a malformed virtual path or it's not a virtual path at all.
-fn resolve_virtual(path: &Path) -> Option<Arc<Path>> {
+pub fn resolve_virtual(path: &Path) -> Option<Arc<Path>> {
     let components: Vec<_> = path.components().collect();
     let mut non_virtual_path = PathBuf::new();
 
@@ -33,7 +33,12 @@ fn resolve_virtual(path: &Path) -> Option<Arc<Path>> {
         if let Some(os_str) = components[i].as_os_str().to_str() {
             // Detect the __virtual__ segment
             if os_str == "__virtual__" {
-                let pop_count = components.get(i + 2)?.as_os_str().to_str()?.parse::<usize>().ok()?;
+                let pop_count = components
+                    .get(i + 2)?
+                    .as_os_str()
+                    .to_str()?
+                    .parse::<usize>()
+                    .ok()?;
 
                 // Apply dirname operation pop_count times
                 for _ in 0..pop_count {
@@ -67,14 +72,19 @@ impl YarnPathStore {
     ) -> Task<Option<(Arc<Path>, Arc<RelPath>)>> {
         let mut is_zip = protocol.eq("zip");
 
-        let path: &Path =
-            if let Some(non_zip_part) = path.as_os_str().as_encoded_bytes().strip_prefix("/zip:".as_bytes()) {
-                // typescript-language-server prepends the paths with zip:, which is messy.
-                is_zip = true;
-                Path::new(OsStr::new(std::str::from_utf8(non_zip_part).expect("Invalid UTF-8")))
-            } else {
-                path
-            };
+        let path: &Path = if let Some(non_zip_part) = path
+            .as_os_str()
+            .as_encoded_bytes()
+            .strip_prefix("/zip:".as_bytes())
+        {
+            // typescript-language-server prepends the paths with zip:, which is messy.
+            is_zip = true;
+            Path::new(OsStr::new(
+                std::str::from_utf8(non_zip_part).expect("Invalid UTF-8"),
+            ))
+        } else {
+            path
+        };
 
         let as_virtual = resolve_virtual(path);
         let Some(path) = as_virtual.or_else(|| is_zip.then(|| Arc::from(path))) else {
@@ -85,7 +95,9 @@ impl YarnPathStore {
             cx.spawn(async move |this, cx| {
                 let dir = this
                     .read_with(cx, |this, _| {
-                        this.temp_dirs.get(&zip_file).map(|temp| temp.path().to_owned())
+                        this.temp_dirs
+                            .get(&zip_file)
+                            .map(|temp| temp.path().to_owned())
                     })
                     .ok()?;
                 let zip_root = if let Some(dir) = dir {
@@ -101,7 +113,8 @@ impl YarnPathStore {
                     new_path
                 };
                 // Rebase zip-path onto new temp path.
-                let as_relative = RelPath::new(path.strip_prefix(zip_file).ok()?, PathStyle::local()).ok()?;
+                let as_relative =
+                    RelPath::new(path.strip_prefix(zip_file).ok()?, PathStyle::local()).ok()?;
                 Some((zip_root.into(), as_relative.into_arc()))
             })
         } else {
@@ -122,42 +135,4 @@ async fn dump_zip(path: Arc<Path>, fs: Arc<dyn Fs>) -> Result<tempfile::TempDir>
     let contents = fs.load_bytes(&path).await?;
     extract_zip(dir.path(), futures::io::Cursor::new(contents)).await?;
     Ok(dir)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn test_resolve_virtual() {
-        let test_cases = vec![
-            (
-                "/path/to/some/folder/__virtual__/a0b1c2d3/0/subpath/to/file.dat",
-                Some(Path::new("/path/to/some/folder/subpath/to/file.dat")),
-            ),
-            (
-                "/path/to/some/folder/__virtual__/e4f5a0b1/0/subpath/to/file.dat",
-                Some(Path::new("/path/to/some/folder/subpath/to/file.dat")),
-            ),
-            (
-                "/path/to/some/folder/__virtual__/a0b1c2d3/1/subpath/to/file.dat",
-                Some(Path::new("/path/to/some/subpath/to/file.dat")),
-            ),
-            (
-                "/path/to/some/folder/__virtual__/a0b1c2d3/3/subpath/to/file.dat",
-                Some(Path::new("/path/subpath/to/file.dat")),
-            ),
-            ("/path/to/nonvirtual/", None),
-            ("/path/to/malformed/__virtual__", None),
-            ("/path/to/malformed/__virtual__/a0b1c2d3", None),
-            ("/path/to/malformed/__virtual__/a0b1c2d3/this-should-be-a-number", None),
-        ];
-
-        for (input, expected) in test_cases {
-            let input_path = Path::new(input);
-            let resolved_path = resolve_virtual(input_path);
-            assert_eq!(resolved_path.as_deref(), expected);
-        }
-    }
 }

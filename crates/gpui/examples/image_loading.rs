@@ -1,21 +1,35 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
+#[path = "example_support/fonts.rs"]
+mod example_support;
+
 use std::{path::Path, sync::Arc, time::Duration};
 
 use gpui::{
-    Animation, AnimationExt, App, Application, Asset, AssetLogger, AssetSource, Bounds, Context, Hsla,
-    ImageAssetLoader, ImageCacheError, ImgResourceLoader, LOADING_DELAY, Length, RenderImage, Resource, SharedString,
-    Window, WindowBounds, WindowOptions, black, div, img, prelude::*, pulsating_between, px, red, size,
+    Animation, AnimationExt, App, Asset, AssetLogger, AssetSource, Bounds, Context, Hsla,
+    ImageAssetLoader, ImageCacheError, ImgResourceLoader, LOADING_DELAY, Length, RenderImage,
+    Resource, SharedString, Window, WindowBounds, WindowOptions, black, div, img, prelude::*,
+    pulsating_between, px, red, size,
 };
+use gpui_platform::application;
 
 struct Assets {}
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        std::fs::read(path).map(Into::into).map_err(Into::into).map(Some)
+        std::fs::read(path)
+            .map(Into::into)
+            .map_err(Into::into)
+            .map(Some)
     }
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
         Ok(std::fs::read_dir(path)?
-            .filter_map(|entry| Some(SharedString::from(entry.ok()?.path().to_string_lossy().into_owned())))
+            .filter_map(|entry| {
+                Some(SharedString::from(
+                    entry.ok()?.path().to_string_lossy().into_owned(),
+                ))
+            })
             .collect::<Vec<_>>())
     }
 }
@@ -40,7 +54,10 @@ impl Asset for LoadImageWithParameters {
         cx: &mut App,
     ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
         let timer = cx.background_executor().timer(parameters.timeout);
-        let data = AssetLogger::<ImageAssetLoader>::load(Resource::Path(Path::new(IMAGE).to_path_buf().into()), cx);
+        let data = AssetLogger::<ImageAssetLoader>::load(
+            Resource::Path(Path::new(IMAGE).to_path_buf().into()),
+            cx,
+        );
         async move {
             timer.await;
             if parameters.fail {
@@ -160,8 +177,10 @@ impl Render for ImageLoadingExample {
                     })
                     .child({
                         // Ensure that the normal image loader doesn't spam logs
-                        let image_source =
-                            Path::new("this/file/really/shouldn't/exist/or/won't/be/an/image/I/hope").to_path_buf();
+                        let image_source = Path::new(
+                            "this/file/really/shouldn't/exist/or/won't/be/an/image/I/hope",
+                        )
+                        .to_path_buf();
                         img(image_source.clone())
                             .id("image-4")
                             .border_1()
@@ -178,9 +197,11 @@ impl Render for ImageLoadingExample {
     }
 }
 
-fn main() {
-    env_logger::init();
-    Application::new().with_assets(Assets {}).run(|cx: &mut App| {
+fn run_example() {
+    application().with_assets(Assets {}).run(|cx: &mut App| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
@@ -190,9 +211,22 @@ fn main() {
             ..Default::default()
         };
         cx.open_window(options, |_, cx| {
-            cx.activate();
+            cx.activate(false);
             cx.new(|_| ImageLoadingExample {})
         })
         .unwrap();
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    env_logger::init();
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

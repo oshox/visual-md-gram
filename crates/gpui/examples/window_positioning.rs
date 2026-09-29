@@ -1,7 +1,14 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
+#[path = "example_support/fonts.rs"]
+mod example_support;
+
 use gpui::{
-    App, Application, Bounds, Context, DisplayId, Hsla, Pixels, SharedString, Size, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowOptions, div, point, prelude::*, px, rgb,
+    App, Bounds, Context, DisplayId, Hsla, Pixels, SharedString, Size, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, prelude::*,
+    px, rgb,
 };
+use gpui_platform::application;
 
 struct WindowContent {
     text: SharedString,
@@ -30,7 +37,10 @@ impl Render for WindowContent {
                     .size_full()
                     .child(format!(
                         "origin: {}, {} size: {}, {}",
-                        self.bounds.origin.x, self.bounds.origin.y, self.bounds.size.width, self.bounds.size.height
+                        self.bounds.origin.x,
+                        self.bounds.origin.y,
+                        self.bounds.size.width,
+                        self.bounds.size.height
                     ))
                     .child(format!(
                         "cx.bounds() origin: {}, {} size {}, {}",
@@ -63,8 +73,11 @@ fn build_window_options(display_id: DisplayId, bounds: Bounds<Pixels>) -> Window
     }
 }
 
-fn main() {
-    Application::new().run(|cx: &mut App| {
+fn run_example() {
+    application().run(|cx: &mut App| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         // Create several new windows, positioned in the top right corner of each screen
         let size = Size {
             width: px(350.),
@@ -88,7 +101,8 @@ fn main() {
             .unwrap();
 
             let bounds = Bounds {
-                origin: screen.bounds().top_right() - point(size.width + margin_offset, -margin_offset),
+                origin: screen.bounds().top_right()
+                    - point(size.width + margin_offset, -margin_offset),
                 size,
             };
 
@@ -102,7 +116,8 @@ fn main() {
             .unwrap();
 
             let bounds = Bounds {
-                origin: screen.bounds().bottom_left() - point(-margin_offset, size.height + margin_offset),
+                origin: screen.bounds().bottom_left()
+                    - point(-margin_offset, size.height + margin_offset),
                 size,
             };
 
@@ -116,7 +131,8 @@ fn main() {
             .unwrap();
 
             let bounds = Bounds {
-                origin: screen.bounds().bottom_right() - point(size.width + margin_offset, size.height + margin_offset),
+                origin: screen.bounds().bottom_right()
+                    - point(size.width + margin_offset, size.height + margin_offset),
                 size,
             };
 
@@ -209,4 +225,16 @@ fn main() {
             .unwrap();
         }
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

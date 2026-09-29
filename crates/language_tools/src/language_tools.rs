@@ -1,6 +1,6 @@
+mod highlights_tree_view;
 mod key_context_view;
 pub mod lsp_button;
-pub mod lsp_config_view;
 pub mod lsp_log_view;
 mod syntax_tree_view;
 
@@ -9,14 +9,15 @@ mod lsp_log_view_tests;
 
 use gpui::{App, AppContext, Entity};
 
+pub use highlights_tree_view::{HighlightsTreeToolbarItemView, HighlightsTreeView};
 pub use lsp_log_view::LspLogView;
 pub use syntax_tree_view::{SyntaxTreeToolbarItemView, SyntaxTreeView};
 use ui::{Context, Window};
 use workspace::{Item, ItemHandle, SplitDirection, Workspace};
 
 pub fn init(cx: &mut App) {
+    highlights_tree_view::init(cx);
     lsp_log_view::init(false, cx);
-    lsp_config_view::init(cx);
     syntax_tree_view::init(cx);
     key_context_view::init(cx);
 }
@@ -38,7 +39,15 @@ where
     let new_tool = cx.new(|cx| new_tool(window, cx));
     match workspace.find_pane_in_direction(destination, cx) {
         Some(right_pane) => {
-            workspace.add_item(right_pane, new_tool.boxed_clone(), None, true, true, window, cx);
+            workspace.add_item(
+                right_pane,
+                new_tool.boxed_clone(),
+                None,
+                true,
+                true,
+                window,
+                cx,
+            );
         }
         None => {
             workspace.split_item(destination, new_tool.boxed_clone(), window, cx);

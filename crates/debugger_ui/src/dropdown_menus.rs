@@ -1,9 +1,9 @@
 use std::rc::Rc;
 
 use collections::HashMap;
-use gpui::{Corner, Entity, WeakEntity};
+use gpui::{Anchor, Entity, WeakEntity};
 use project::debugger::session::{ThreadId, ThreadStatus};
-use ui::{CommonAnimationExt, ContextMenu, DropdownMenu, DropdownStyle, Indicator, prelude::*};
+use ui::{CommonAnimationExt, ContextMenu, DropdownMenu, Indicator, Tooltip, prelude::*};
 use util::{maybe, truncate_and_trailoff};
 
 use crate::{
@@ -22,7 +22,9 @@ impl SessionListEntry {
 
         let mut label = String::new();
         for ancestor in &self.ancestors {
-            label.push_str(&ancestor.update(cx, |ancestor, cx| ancestor.label(cx).unwrap_or("(child)".into())));
+            label.push_str(&ancestor.update(cx, |ancestor, cx| {
+                ancestor.label(cx).unwrap_or("(child)".into())
+            }));
             label.push_str(" » ");
         }
         label.push_str(
@@ -52,7 +54,9 @@ impl SessionListEntry {
                     .thread_status(cx)
                     .unwrap_or_default()
                 {
-                    project::debugger::session::ThreadStatus::Stopped => Some(Indicator::dot().color(Color::Conflict)),
+                    project::debugger::session::ThreadStatus::Stopped => {
+                        Some(Indicator::dot().color(Color::Conflict))
+                    }
                     _ => Some(Indicator::dot().color(Color::Success)),
                 }
             }
@@ -122,12 +126,13 @@ impl DebugPanel {
         let running_state = running_state.read(cx);
 
         let is_terminated = running_state.session().read(cx).is_terminated();
-        let is_started = active_session.is_some_and(|session| session.read(cx).session(cx).read(cx).is_started());
+        let is_started = active_session
+            .is_some_and(|session| session.read(cx).session(cx).read(cx).is_started());
 
         let session_state_indicator = if is_terminated {
             Indicator::dot().color(Color::Error).into_any_element()
         } else if !is_started {
-            Icon::new(IconName::ArrowCircle)
+            Icon::new(IconName::LoadCircle)
                 .size(IconSize::Small)
                 .color(Color::Muted)
                 .with_rotate_animation(2)
@@ -142,8 +147,10 @@ impl DebugPanel {
         let trigger = h_flex()
             .gap_2()
             .child(session_state_indicator)
-            .justify_between()
-            .child(DebugPanel::dropdown_label(trigger_label).when(is_terminated, |this| this.strikethrough()))
+            .child(
+                DebugPanel::dropdown_label(trigger_label)
+                    .when(is_terminated, |this| this.strikethrough()),
+            )
             .into_any_element();
 
         let menu = DropdownMenu::new_with_element(
@@ -203,9 +210,9 @@ impl DebugPanel {
                 this
             }),
         )
-        .attach(Corner::BottomLeft)
-        .style(DropdownStyle::Ghost)
-        .handle(self.session_picker_menu_handle.clone());
+        .attach(Anchor::BottomLeft)
+        .handle(self.session_picker_menu_handle.clone())
+        .trigger_tooltip(Tooltip::text("Select a Debug Session"));
 
         Some(menu)
     }
@@ -230,7 +237,11 @@ impl DebugPanel {
             return div().into_any_element();
         };
 
-        let id: SharedString = format!("debug-session-{}", session_entry.leaf.read(cx).session_id(cx).0).into();
+        let id: SharedString = format!(
+            "debug-session-{}",
+            session_entry.leaf.read(cx).session_id(cx).0
+        )
+        .into();
         let session_entity_id = session_entry.leaf.entity_id();
 
         h_flex()
@@ -311,9 +322,8 @@ impl DebugPanel {
                         this
                     }),
                 )
-                .attach(Corner::BottomLeft)
+                .attach(Anchor::BottomLeft)
                 .disabled(session_terminated)
-                .style(DropdownStyle::Ghost)
                 .handle(self.thread_picker_menu_handle.clone()),
             )
         } else {

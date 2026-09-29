@@ -66,7 +66,7 @@ pub struct IconDefinition {
 }
 
 const FILE_STEMS_BY_ICON_KEY: &[(&str, &[&str])] = &[
-    ("docker", &["Dockerfile"]),
+    ("docker", &["Containerfile", "Dockerfile", ".dockerignore"]),
     ("ruby", &["Podfile"]),
     ("heroku", &["Procfile"]),
 ];
@@ -75,9 +75,12 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("astro", &["astro"]),
     (
         "audio",
-        &["aac", "flac", "m4a", "mka", "mp3", "ogg", "opus", "wav", "wma", "wv"],
+        &[
+            "aac", "flac", "m4a", "mka", "mp3", "ogg", "opus", "wav", "wma", "wv",
+        ],
     ),
     ("backup", &["bak"]),
+    ("ballerina", &["bal"]),
     ("bicep", &["bicep"]),
     ("bun", &["lockb"]),
     ("c", &["c", "h"]),
@@ -98,12 +101,23 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("dart", &["dart"]),
     ("diff", &["diff"]),
     (
-        "document",
+        "docker",
         &[
-            "doc", "docx", "mdx", "odp", "ods", "odt", "pdf", "ppt", "pptx", "rtf", "txt", "xls", "xlsx",
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.yml",
+            "compose.yaml",
         ],
     ),
-    ("elixir", &["eex", "ex", "exs", "heex"]),
+    (
+        "document",
+        &[
+            "doc", "docx", "mdx", "odp", "ods", "odt", "pdf", "ppt", "pptx", "rtf", "txt", "xls",
+            "xlsx",
+        ],
+    ),
+    ("editorconfig", &["editorconfig"]),
+    ("elixir", &["eex", "ex", "exs", "heex", "leex", "neex"]),
     ("elm", &["elm"]),
     (
         "erlang",
@@ -135,20 +149,36 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("font", &["otf", "ttf", "woff", "woff2"]),
     ("fsharp", &["fs"]),
     ("fsproj", &["fsproj"]),
-    ("gitlab", &["gitlab-ci.yml"]),
+    ("gitlab", &["gitlab-ci.yml", "gitlab-ci.yaml"]),
     ("gleam", &["gleam"]),
     ("go", &["go", "mod", "work"]),
     ("graphql", &["gql", "graphql", "graphqls"]),
     ("haskell", &["hs"]),
     ("hcl", &["hcl"]),
+    (
+        "helm",
+        &[
+            "helmfile.yaml",
+            "helmfile.yml",
+            "Chart.yaml",
+            "Chart.yml",
+            "Chart.lock",
+            "values.yaml",
+            "values.yml",
+            "requirements.yaml",
+            "requirements.yml",
+            "tpl",
+        ],
+    ),
     ("html", &["htm", "html"]),
     (
         "image",
         &[
-            "avif", "bmp", "gif", "heic", "heif", "ico", "j2k", "jfif", "jp2", "jpeg", "jpg", "jxl", "png", "psd",
-            "qoi", "svg", "tiff", "webp",
+            "avif", "bmp", "gif", "heic", "heif", "ico", "j2k", "jfif", "jp2", "jpeg", "jpg",
+            "jxl", "png", "psd", "qoi", "svg", "tiff", "webp",
         ],
     ),
+    ("ipynb", &["ipynb"]),
     ("java", &["java"]),
     ("javascript", &["cjs", "js", "mjs"]),
     ("json", &["json", "jsonc"]),
@@ -161,9 +191,9 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("luau", &["luau"]),
     ("markdown", &["markdown", "md"]),
     ("metal", &["metal"]),
-    ("nim", &["nim"]),
+    ("nim", &["nim", "nims", "nimble"]),
     ("nix", &["nix"]),
-    ("ocaml", &["ml", "mli"]),
+    ("ocaml", &["ml", "mli", "mlx"]),
     ("odin", &["odin"]),
     ("php", &["php"]),
     (
@@ -194,13 +224,14 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("rust", &["rs"]),
     ("sass", &["sass", "scss"]),
     ("scala", &["scala", "sc"]),
-    ("settings", &["conf", "ini", "yaml", "yml"]),
+    ("settings", &["conf", "ini"]),
     ("solidity", &["sol"]),
     (
         "storage",
         &[
-            "accdb", "csv", "dat", "db", "dbf", "dll", "fmp", "fp7", "frm", "gdb", "ib", "ldf", "mdb", "mdf", "myd",
-            "myi", "pdb", "RData", "rdata", "sav", "sdf", "sql", "sqlite", "tsv",
+            "accdb", "csv", "dat", "db", "dbf", "dll", "fmp", "fp7", "frm", "gdb", "ib", "ldf",
+            "mdb", "mdf", "myd", "myi", "pdb", "psv", "RData", "rdata", "sav", "sdf", "sql",
+            "sqlite", "ssv", "tsv",
         ],
     ),
     (
@@ -233,6 +264,7 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
             "bash_logout",
             "bash_profile",
             "bashrc",
+            "brushrc",
             "fish",
             "nu",
             "profile",
@@ -274,6 +306,7 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("vue", &["vue"]),
     ("vyper", &["vy", "vyi"]),
     ("wgsl", &["wgsl"]),
+    ("yaml", &["yaml", "yml"]),
     ("zig", &["zig"]),
 ];
 
@@ -281,6 +314,7 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
 const FILE_ICONS: &[(&str, &str)] = &[
     ("astro", "icons/file_icons/astro.svg"),
     ("audio", "icons/file_icons/audio.svg"),
+    ("ballerina", "icons/file_icons/ballerina.svg"),
     ("bicep", "icons/file_icons/file.svg"),
     ("bun", "icons/file_icons/bun.svg"),
     ("c", "icons/file_icons/c.svg"),
@@ -298,6 +332,7 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("diff", "icons/file_icons/diff.svg"),
     ("docker", "icons/file_icons/docker.svg"),
     ("document", "icons/file_icons/book.svg"),
+    ("editorconfig", "icons/file_icons/editorconfig.svg"),
     ("elixir", "icons/file_icons/elixir.svg"),
     ("elm", "icons/file_icons/elm.svg"),
     ("erlang", "icons/file_icons/erlang.svg"),
@@ -305,15 +340,17 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("font", "icons/file_icons/font.svg"),
     ("fsharp", "icons/file_icons/fsharp.svg"),
     ("fsproj", "icons/file_icons/file.svg"),
-    ("gitlab", "icons/file_icons/settings.svg"),
+    ("gitlab", "icons/file_icons/gitlab.svg"),
     ("gleam", "icons/file_icons/gleam.svg"),
     ("go", "icons/file_icons/go.svg"),
     ("graphql", "icons/file_icons/graphql.svg"),
     ("haskell", "icons/file_icons/haskell.svg"),
     ("hcl", "icons/file_icons/hcl.svg"),
+    ("helm", "icons/file_icons/helm.svg"),
     ("heroku", "icons/file_icons/heroku.svg"),
     ("html", "icons/file_icons/html.svg"),
     ("image", "icons/file_icons/image.svg"),
+    ("ipynb", "icons/file_icons/jupyter.svg"),
     ("java", "icons/file_icons/java.svg"),
     ("javascript", "icons/file_icons/javascript.svg"),
     ("json", "icons/file_icons/code.svg"),
@@ -365,11 +402,14 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("vue", "icons/file_icons/vue.svg"),
     ("vyper", "icons/file_icons/vyper.svg"),
     ("wgsl", "icons/file_icons/wgsl.svg"),
+    ("yaml", "icons/file_icons/yaml.svg"),
     ("zig", "icons/file_icons/zig.svg"),
 ];
 
 /// Returns a mapping of file associations to icon keys.
-fn icon_keys_by_association(associations_by_icon_key: &[(&str, &[&str])]) -> HashMap<String, String> {
+fn icon_keys_by_association(
+    associations_by_icon_key: &[(&str, &[&str])],
+) -> HashMap<String, String> {
     let mut icon_keys_by_association = HashMap::default();
     for (icon_key, associations) in associations_by_icon_key {
         for association in *associations {
@@ -381,11 +421,11 @@ fn icon_keys_by_association(associations_by_icon_key: &[(&str, &[&str])]) -> Has
 }
 
 /// The name of the default icon theme.
-pub(crate) const DEFAULT_ICON_THEME_NAME: &str = "Gram (Default)";
+pub const DEFAULT_ICON_THEME_NAME: &str = "Zed (Default)";
 
 static DEFAULT_ICON_THEME: LazyLock<Arc<IconTheme>> = LazyLock::new(|| {
     Arc::new(IconTheme {
-        id: "gram".into(),
+        id: "zed".into(),
         name: DEFAULT_ICON_THEME_NAME.into(),
         appearance: Appearance::Dark,
         directory_icons: DirectoryIcons {
@@ -399,11 +439,14 @@ static DEFAULT_ICON_THEME: LazyLock<Arc<IconTheme>> = LazyLock::new(|| {
         },
         file_stems: icon_keys_by_association(FILE_STEMS_BY_ICON_KEY),
         file_suffixes: icon_keys_by_association(FILE_SUFFIXES_BY_ICON_KEY),
-        file_icons: HashMap::from_iter(
-            FILE_ICONS
-                .iter()
-                .map(|(ty, path)| (ty.to_string(), IconDefinition { path: (*path).into() })),
-        ),
+        file_icons: HashMap::from_iter(FILE_ICONS.iter().map(|(ty, path)| {
+            (
+                ty.to_string(),
+                IconDefinition {
+                    path: (*path).into(),
+                },
+            )
+        })),
     })
 });
 

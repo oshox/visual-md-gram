@@ -2,13 +2,27 @@ use super::{
     Highlights,
     dimensions::RowDelta,
     fold_map::{Chunk, FoldRows},
+    invisibles::{is_invisible, is_standalone_grapheme, replacement},
     tab_map::{self, TabEdit, TabPoint, TabSnapshot},
 };
-use gpui::{App, AppContext as _, Context, Entity, Font, LineWrapper, Pixels, Task};
-use language::Point;
-use multi_buffer::{MultiBufferSnapshot, RowInfo};
-use smol::future::yield_now;
-use std::{cmp, collections::VecDeque, mem, ops::Range, sync::LazyLock, time::Duration};
+
+use collections::HashMap;
+use futures_lite::future::yield_now;
+use gpui::{
+    App, AppContext as _, Context, Entity, Font, FontId, IndentAdjustment, LineWrapper, Pixels,
+    Task, TextSystem,
+};
+use language::{LanguageAwareStyling, Point, language_settings::SoftWrapIndent};
+use multi_buffer::RowInfo;
+use std::{
+    cmp,
+    collections::VecDeque,
+    mem,
+    num::NonZeroU32,
+    ops::Range,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 use sum_tree::{Bias, Cursor, Dimensions, SumTree};
 use text::Patch;
 
@@ -18,6 +32,8 @@ pub type WrapPatch = text::Patch<WrapRow>;
 
 #[derive(Copy, Clone, Debug, Default, Eq, Ord, PartialOrd, PartialEq)]
 pub struct WrapRow(pub u32);
+
+const WRAP_YIELD_ROW_INTERVAL: usize = 100;
 
 impl_for_row_types! {
     WrapRow => RowDelta
@@ -32,6 +48,7 @@ pub struct WrapMap {
     interpolated_edits: WrapPatch,
     edits_since_sync: WrapPatch,
     wrap_width: Option<Pixels>,
+    soft_wrap_indent: SoftWrapIndent,
     background_task: Option<Task<()>>,
     font_with_size: (Font, Pixels),
 }
@@ -63,8 +80,69 @@ struct TransformSummary {
     output: TextSummary,
 }
 
+impl TransformSummary {
+    fn has_wraps(&self) -> bool {
+        self.input.lines != self.output.lines
+    }
+}
+
 #[derive(Copy, Clone, Debug, Default, Eq, Ord, PartialOrd, PartialEq)]
 pub struct WrapPoint(pub Point);
+
+struct LineFragmentBuilder {
+    text_system: Arc<TextSystem>,
+    font_id: FontId,
+    font_size: Pixels,
+    cached_replacement_widths: HashMap<char, Pixels>,
+}
+
+impl LineFragmentBuilder {
+    fn new(text_system: Arc<TextSystem>, font: &Font, font_size: Pixels) -> Self {
+        let font_id = text_system.resolve_font(font);
+        Self {
+            text_system,
+            font_id,
+            font_size,
+            cached_replacement_widths: HashMap::default(),
+        }
+    }
+
+    fn push_fragments<'a>(&mut self, fragments: &mut Vec<gpui::LineFragment<'a>>, text: &'a str) {
+        let mut prefix_start = 0;
+        for (offset, ch) in text.char_indices() {
+            if !is_invisible(ch) {
+                continue;
+            }
+            let ch_end = offset + ch.len_utf8();
+            if !is_standalone_grapheme(text, offset, ch_end) {
+                continue;
+            }
+            let Some(width) = self.replacement_width(ch) else {
+                continue;
+            };
+            if prefix_start < offset {
+                fragments.push(gpui::LineFragment::text(&text[prefix_start..offset]));
+            }
+            fragments.push(gpui::LineFragment::element(width, ch_end - offset));
+            prefix_start = ch_end;
+        }
+        if prefix_start < text.len() || text.is_empty() {
+            fragments.push(gpui::LineFragment::text(&text[prefix_start..]));
+        }
+    }
+
+    fn replacement_width(&mut self, ch: char) -> Option<Pixels> {
+        let replacement_char = replacement(ch)?;
+        let width = *self
+            .cached_replacement_widths
+            .entry(replacement_char)
+            .or_insert_with(|| {
+                self.text_system
+                    .layout_width(self.font_id, self.font_size, replacement_char)
+            });
+        Some(width)
+    }
+}
 
 pub struct WrapChunks<'a> {
     input_chunks: tab_map::TabChunks<'a>,
@@ -86,8 +164,10 @@ pub struct WrapRows<'a> {
 }
 
 impl WrapRows<'_> {
+    #[ztracing::instrument(skip_all)]
     pub(crate) fn seek(&mut self, start_row: WrapRow) {
-        self.transforms.seek(&WrapPoint::new(start_row, 0), Bias::Left);
+        self.transforms
+            .seek(&WrapPoint::new(start_row, 0), Bias::Left);
         let mut input_row = self.transforms.start().1.row();
         if self.transforms.item().is_some_and(|t| t.is_isomorphic()) {
             input_row += (start_row - self.transforms.start().0.row()).0;
@@ -100,6 +180,7 @@ impl WrapRows<'_> {
 }
 
 impl WrapMap {
+    #[ztracing::instrument(skip_all)]
     pub fn new(
         tab_snapshot: TabSnapshot,
         font: Font,
@@ -111,6 +192,7 @@ impl WrapMap {
             let mut this = Self {
                 font_with_size: (font, font_size),
                 wrap_width: None,
+                soft_wrap_indent: SoftWrapIndent::default(),
                 pending_edits: Default::default(),
                 interpolated_edits: Default::default(),
                 edits_since_sync: Default::default(),
@@ -125,11 +207,11 @@ impl WrapMap {
         (handle, snapshot)
     }
 
-    #[cfg(test)]
     pub fn is_rewrapping(&self) -> bool {
-        self.background_task.is_some()
+        self.background_task.is_some() || (self.wrap_width.is_some() && self.snapshot.interpolated)
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn sync(
         &mut self,
         tab_snapshot: TabSnapshot,
@@ -146,10 +228,23 @@ impl WrapMap {
             self.snapshot.interpolated = false;
         }
 
+        debug_assert!(
+            self.background_task.is_some()
+                || self.wrap_width.is_none()
+                || !self.snapshot.interpolated,
+            "an interpolated snapshot must always have a background task rewrapping it, \
+             otherwise is_rewrapping never settles and frozen scrollbar ranges leak"
+        );
         (self.snapshot.clone(), mem::take(&mut self.edits_since_sync))
     }
 
-    pub fn set_font_with_size(&mut self, font: Font, font_size: Pixels, cx: &mut Context<Self>) -> bool {
+    #[ztracing::instrument(skip_all)]
+    pub fn set_font_with_size(
+        &mut self,
+        font: Font,
+        font_size: Pixels,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let font_with_size = (font, font_size);
 
         if font_with_size == self.font_with_size {
@@ -161,6 +256,7 @@ impl WrapMap {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn set_wrap_width(&mut self, wrap_width: Option<Pixels>, cx: &mut Context<Self>) -> bool {
         if wrap_width == self.wrap_width {
             return false;
@@ -171,6 +267,22 @@ impl WrapMap {
         true
     }
 
+    #[ztracing::instrument(skip_all)]
+    pub fn set_soft_wrap_indent(&mut self, indent: SoftWrapIndent, cx: &mut Context<Self>) -> bool {
+        if indent == self.soft_wrap_indent {
+            return false;
+        }
+
+        self.soft_wrap_indent = indent;
+        self.rewrap(cx);
+        true
+    }
+
+    fn indent_adjustment(&self, tab_size: NonZeroU32) -> IndentAdjustment {
+        indent_adjustment_for(self.soft_wrap_indent, tab_size)
+    }
+
+    #[ztracing::instrument(skip_all)]
     fn rewrap(&mut self, cx: &mut Context<Self>) {
         self.background_task.take();
         self.interpolated_edits.clear();
@@ -179,49 +291,70 @@ impl WrapMap {
         if let Some(wrap_width) = self.wrap_width {
             let mut new_snapshot = self.snapshot.clone();
 
-            let text_system = cx.text_system().clone();
+            let text_system = cx.text_system();
             let (font, font_size) = self.font_with_size.clone();
-            let task = cx.background_spawn(async move {
-                let mut line_wrapper = text_system.line_wrapper(font, font_size);
-                let tab_snapshot = new_snapshot.tab_snapshot.clone();
-                let range = TabPoint::zero()..tab_snapshot.max_point();
-                let edits = new_snapshot
-                    .update(
-                        tab_snapshot,
-                        &[TabEdit {
-                            old: range.clone(),
-                            new: range.clone(),
-                        }],
-                        wrap_width,
-                        &mut line_wrapper,
-                    )
-                    .await;
-                (new_snapshot, edits)
-            });
+            let mut fragment_builder =
+                LineFragmentBuilder::new(text_system.clone(), &font, font_size);
+            let mut line_wrapper = text_system.line_wrapper(font, font_size);
+            let tab_snapshot = new_snapshot.tab_snapshot.clone();
+            let total_rows = tab_snapshot.max_point().row() as usize + 1;
+            let range = TabPoint::zero()..tab_snapshot.max_point();
+            let tab_edits = [TabEdit {
+                old: range.clone(),
+                new: range,
+            }];
 
-            match cx
-                .background_executor()
-                .block_with_timeout(Duration::from_millis(5), task)
-            {
-                Ok((snapshot, edits)) => {
-                    self.snapshot = snapshot;
-                    self.edits_since_sync = self.edits_since_sync.compose(&edits);
-                }
-                Err(wrap_task) => {
-                    self.background_task = Some(cx.spawn(async move |this, cx| {
-                        let (snapshot, edits) = wrap_task.await;
-                        this.update(cx, |this, cx| {
-                            this.snapshot = snapshot;
-                            this.edits_since_sync = this
-                                .edits_since_sync
-                                .compose(mem::take(&mut this.interpolated_edits).invert())
-                                .compose(&edits);
-                            this.background_task = None;
-                            this.flush_edits(cx);
-                            cx.notify();
-                        })
-                        .ok();
-                    }));
+            if total_rows < WRAP_YIELD_ROW_INTERVAL {
+                let edits = gpui::block_on(new_snapshot.update(
+                    tab_snapshot.clone(),
+                    &tab_edits,
+                    wrap_width,
+                    self.indent_adjustment(tab_snapshot.tab_size),
+                    &mut line_wrapper,
+                    &mut fragment_builder,
+                ));
+                self.snapshot = new_snapshot;
+                self.edits_since_sync = self.edits_since_sync.compose(&edits);
+            } else {
+                let indent_adjustment = self.indent_adjustment(tab_snapshot.tab_size);
+                let task = cx.background_spawn(async move {
+                    let edits = new_snapshot
+                        .update(
+                            tab_snapshot,
+                            &tab_edits,
+                            wrap_width,
+                            indent_adjustment,
+                            &mut line_wrapper,
+                            &mut fragment_builder,
+                        )
+                        .await;
+                    (new_snapshot, edits)
+                });
+
+                match cx
+                    .foreground_executor()
+                    .block_with_timeout(Duration::from_millis(5), task)
+                {
+                    Ok((snapshot, edits)) => {
+                        self.snapshot = snapshot;
+                        self.edits_since_sync = self.edits_since_sync.compose(&edits);
+                    }
+                    Err(wrap_task) => {
+                        self.background_task = Some(cx.spawn(async move |this, cx| {
+                            let (snapshot, edits) = wrap_task.await;
+                            this.update(cx, |this, cx| {
+                                this.snapshot = snapshot;
+                                this.edits_since_sync = this
+                                    .edits_since_sync
+                                    .compose(mem::take(&mut this.interpolated_edits).invert())
+                                    .compose(&edits);
+                                this.background_task = None;
+                                this.flush_edits(cx);
+                                cx.notify();
+                            })
+                            .ok();
+                        }));
+                    }
                 }
             }
         } else {
@@ -229,7 +362,9 @@ impl WrapMap {
             self.snapshot.transforms = SumTree::default();
             let summary = self.snapshot.tab_snapshot.text_summary();
             if !summary.lines.is_zero() {
-                self.snapshot.transforms.push(Transform::isomorphic(summary), ());
+                self.snapshot
+                    .transforms
+                    .push(Transform::isomorphic(summary), ());
             }
             let new_rows = self.snapshot.transforms.summary().output.lines.row + 1;
             self.snapshot.interpolated = false;
@@ -240,6 +375,7 @@ impl WrapMap {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     fn flush_edits(&mut self, cx: &mut Context<Self>) {
         if !self.snapshot.interpolated {
             let mut to_remove_len = 0;
@@ -264,41 +400,78 @@ impl WrapMap {
             let mut snapshot = self.snapshot.clone();
             let text_system = cx.text_system().clone();
             let (font, font_size) = self.font_with_size.clone();
-            let update_task = cx.background_spawn(async move {
-                let mut edits = Patch::default();
-                let mut line_wrapper = text_system.line_wrapper(font, font_size);
-                for (tab_snapshot, tab_edits) in pending_edits {
-                    let wrap_edits = snapshot
-                        .update(tab_snapshot, &tab_edits, wrap_width, &mut line_wrapper)
-                        .await;
-                    edits = edits.compose(&wrap_edits);
-                }
-                (snapshot, edits)
-            });
+            let mut fragment_builder =
+                LineFragmentBuilder::new(text_system.clone(), &font, font_size);
+            let mut line_wrapper = text_system.line_wrapper(font, font_size);
 
-            match cx
-                .background_executor()
-                .block_with_timeout(Duration::from_millis(1), update_task)
-            {
-                Ok((snapshot, output_edits)) => {
-                    self.snapshot = snapshot;
-                    self.edits_since_sync = self.edits_since_sync.compose(&output_edits);
+            let update_passes = pending_edits.len();
+            let total_new_rows = pending_edits
+                .iter()
+                .flat_map(|(_, tab_edits)| tab_edits.iter())
+                .map(|edit| (edit.new.end.row().saturating_sub(edit.new.start.row()) + 1) as usize)
+                .sum::<usize>();
+            if update_passes + total_new_rows < WRAP_YIELD_ROW_INTERVAL {
+                let mut wrap_edits = Patch::default();
+                for (tab_snapshot, tab_edits) in pending_edits {
+                    let indent_adjustment = self.indent_adjustment(tab_snapshot.tab_size);
+                    let edits = gpui::block_on(snapshot.update(
+                        tab_snapshot,
+                        &tab_edits,
+                        wrap_width,
+                        indent_adjustment,
+                        &mut line_wrapper,
+                        &mut fragment_builder,
+                    ));
+                    wrap_edits = wrap_edits.compose(&edits);
                 }
-                Err(update_task) => {
-                    self.background_task = Some(cx.spawn(async move |this, cx| {
-                        let (snapshot, edits) = update_task.await;
-                        this.update(cx, |this, cx| {
-                            this.snapshot = snapshot;
-                            this.edits_since_sync = this
-                                .edits_since_sync
-                                .compose(mem::take(&mut this.interpolated_edits).invert())
-                                .compose(&edits);
-                            this.background_task = None;
-                            this.flush_edits(cx);
-                            cx.notify();
-                        })
-                        .ok();
-                    }));
+                self.snapshot = snapshot;
+                self.edits_since_sync = self.edits_since_sync.compose(&wrap_edits);
+            } else {
+                let soft_wrap_indent = self.soft_wrap_indent;
+                let update_task = cx.background_spawn(async move {
+                    let mut edits = Patch::default();
+                    for (tab_snapshot, tab_edits) in pending_edits {
+                        let indent_adjustment =
+                            indent_adjustment_for(soft_wrap_indent, tab_snapshot.tab_size);
+                        let wrap_edits = snapshot
+                            .update(
+                                tab_snapshot,
+                                &tab_edits,
+                                wrap_width,
+                                indent_adjustment,
+                                &mut line_wrapper,
+                                &mut fragment_builder,
+                            )
+                            .await;
+                        edits = edits.compose(&wrap_edits);
+                    }
+                    (snapshot, edits)
+                });
+
+                match cx
+                    .foreground_executor()
+                    .block_with_timeout(Duration::from_millis(1), update_task)
+                {
+                    Ok((snapshot, output_edits)) => {
+                        self.snapshot = snapshot;
+                        self.edits_since_sync = self.edits_since_sync.compose(&output_edits);
+                    }
+                    Err(update_task) => {
+                        self.background_task = Some(cx.spawn(async move |this, cx| {
+                            let (snapshot, edits) = update_task.await;
+                            this.update(cx, |this, cx| {
+                                this.snapshot = snapshot;
+                                this.edits_since_sync = this
+                                    .edits_since_sync
+                                    .compose(mem::take(&mut this.interpolated_edits).invert())
+                                    .compose(&edits);
+                                this.background_task = None;
+                                this.flush_edits(cx);
+                                cx.notify();
+                            })
+                            .ok();
+                        }));
+                    }
                 }
             }
         }
@@ -322,6 +495,7 @@ impl WrapMap {
 }
 
 impl WrapSnapshot {
+    #[ztracing::instrument(skip_all)]
     fn new(tab_snapshot: TabSnapshot) -> Self {
         let mut transforms = SumTree::default();
         let extent = tab_snapshot.text_summary();
@@ -335,24 +509,29 @@ impl WrapSnapshot {
         }
     }
 
-    pub fn buffer_snapshot(&self) -> &MultiBufferSnapshot {
-        self.tab_snapshot.buffer_snapshot()
-    }
-
+    #[ztracing::instrument(skip_all)]
     fn interpolate(&mut self, new_tab_snapshot: TabSnapshot, tab_edits: &[TabEdit]) -> WrapPatch {
         let mut new_transforms;
         if tab_edits.is_empty() {
             new_transforms = self.transforms.clone();
+        } else if !self.transforms.summary().has_wraps()
+            && !new_tab_snapshot.text_summary().lines.is_zero()
+        {
+            // Fast path: without existing wraps, interpolation is a passthrough over the new tab snapshot.
+            new_transforms = SumTree::default();
+            new_transforms.push(Transform::isomorphic(new_tab_snapshot.text_summary()), ());
         } else {
             let mut old_cursor = self.transforms.cursor::<TabPoint>(());
 
             let mut tab_edits_iter = tab_edits.iter().peekable();
-            new_transforms = old_cursor.slice(&tab_edits_iter.peek().unwrap().old.start, Bias::Right);
+            new_transforms =
+                old_cursor.slice(&tab_edits_iter.peek().unwrap().old.start, Bias::Right);
 
             while let Some(edit) = tab_edits_iter.next() {
                 if edit.new.start > TabPoint::from(new_transforms.summary().input.lines) {
-                    let summary = new_tab_snapshot
-                        .text_summary_for_range(TabPoint::from(new_transforms.summary().input.lines)..edit.new.start);
+                    let summary = new_tab_snapshot.text_summary_for_range(
+                        TabPoint::from(new_transforms.summary().input.lines)..edit.new.start,
+                    );
                     new_transforms.push_or_extend(Transform::isomorphic(summary));
                 }
 
@@ -366,16 +545,21 @@ impl WrapSnapshot {
                 if let Some(next_edit) = tab_edits_iter.peek() {
                     if next_edit.old.start > old_cursor.end() {
                         if old_cursor.end() > edit.old.end {
-                            let summary = self.tab_snapshot.text_summary_for_range(edit.old.end..old_cursor.end());
+                            let summary = self
+                                .tab_snapshot
+                                .text_summary_for_range(edit.old.end..old_cursor.end());
                             new_transforms.push_or_extend(Transform::isomorphic(summary));
                         }
 
                         old_cursor.next();
-                        new_transforms.append(old_cursor.slice(&next_edit.old.start, Bias::Right), ());
+                        new_transforms
+                            .append(old_cursor.slice(&next_edit.old.start, Bias::Right), ());
                     }
                 } else {
                     if old_cursor.end() > edit.old.end {
-                        let summary = self.tab_snapshot.text_summary_for_range(edit.old.end..old_cursor.end());
+                        let summary = self
+                            .tab_snapshot
+                            .text_summary_for_range(edit.old.end..old_cursor.end());
                         new_transforms.push_or_extend(Transform::isomorphic(summary));
                     }
                     old_cursor.next();
@@ -396,12 +580,15 @@ impl WrapSnapshot {
         old_snapshot.compute_edits(tab_edits, self)
     }
 
+    #[ztracing::instrument(skip_all)]
     async fn update(
         &mut self,
         new_tab_snapshot: TabSnapshot,
         tab_edits: &[TabEdit],
         wrap_width: Pixels,
+        indent_adjustment: IndentAdjustment,
         line_wrapper: &mut LineWrapper,
+        fragment_builder: &mut LineFragmentBuilder,
     ) -> WrapPatch {
         #[derive(Debug)]
         struct RowEdit {
@@ -419,8 +606,10 @@ impl WrapSnapshot {
 
             while let Some(next_edit) = tab_edits_iter.peek() {
                 if next_edit.old.start.row() <= row_edit.old_rows.end {
-                    row_edit.old_rows.end = next_edit.old.end.row() + 1;
-                    row_edit.new_rows.end = next_edit.new.end.row() + 1;
+                    row_edit.old_rows.end =
+                        cmp::max(row_edit.old_rows.end, next_edit.old.end.row() + 1);
+                    row_edit.new_rows.end =
+                        cmp::max(row_edit.new_rows.end, next_edit.new.end.row() + 1);
                     tab_edits_iter.next();
                 } else {
                     break;
@@ -437,12 +626,16 @@ impl WrapSnapshot {
             let mut row_edits = row_edits.into_iter().peekable();
             let mut old_cursor = self.transforms.cursor::<TabPoint>(());
 
-            new_transforms = old_cursor.slice(&TabPoint::new(row_edits.peek().unwrap().old_rows.start, 0), Bias::Right);
+            new_transforms = old_cursor.slice(
+                &TabPoint::new(row_edits.peek().unwrap().old_rows.start, 0),
+                Bias::Right,
+            );
 
             while let Some(edit) = row_edits.next() {
                 if edit.new_rows.start > new_transforms.summary().input.lines.row {
                     let summary = new_tab_snapshot.text_summary_for_range(
-                        TabPoint(new_transforms.summary().input.lines)..TabPoint::new(edit.new_rows.start, 0),
+                        TabPoint(new_transforms.summary().input.lines)
+                            ..TabPoint::new(edit.new_rows.start, 0),
                     );
                     new_transforms.push_or_extend(Transform::isomorphic(summary));
                 }
@@ -452,23 +645,32 @@ impl WrapSnapshot {
                 let mut remaining = None;
                 let mut chunks = new_tab_snapshot.chunks(
                     TabPoint::new(edit.new_rows.start, 0)..new_tab_snapshot.max_point(),
-                    false,
+                    LanguageAwareStyling {
+                        tree_sitter: false,
+                        diagnostics: false,
+                    },
                     Highlights::default(),
                 );
                 let mut edit_transforms = Vec::<Transform>::new();
-                for _ in edit.new_rows.start..edit.new_rows.end {
+                for (i, _) in (edit.new_rows.start..edit.new_rows.end).enumerate() {
                     while let Some(chunk) = remaining.take().or_else(|| chunks.next()) {
                         if let Some(ix) = chunk.text.find('\n') {
                             let (prefix, suffix) = chunk.text.split_at(ix + 1);
-                            line_fragments.push(gpui::LineFragment::text(prefix));
+                            fragment_builder.push_fragments(&mut line_fragments, prefix);
                             line.push_str(prefix);
-                            remaining = Some(Chunk { text: suffix, ..chunk });
+                            remaining = Some(Chunk {
+                                text: suffix,
+                                ..chunk
+                            });
                             break;
                         } else {
-                            if let Some(width) = chunk.renderer.as_ref().and_then(|r| r.measured_width) {
-                                line_fragments.push(gpui::LineFragment::element(width, chunk.text.len()));
+                            if let Some(width) =
+                                chunk.renderer.as_ref().and_then(|r| r.measured_width)
+                            {
+                                line_fragments
+                                    .push(gpui::LineFragment::element(width, chunk.text.len()));
                             } else {
-                                line_fragments.push(gpui::LineFragment::text(chunk.text));
+                                fragment_builder.push_fragments(&mut line_fragments, chunk.text);
                             }
                             line.push_str(chunk.text);
                         }
@@ -479,7 +681,9 @@ impl WrapSnapshot {
                     }
 
                     let mut prev_boundary_ix = 0;
-                    for boundary in line_wrapper.wrap_line(&line_fragments, wrap_width) {
+                    for boundary in
+                        line_wrapper.wrap_line(&line_fragments, wrap_width, indent_adjustment)
+                    {
                         let wrapped = &line[prev_boundary_ix..boundary.ix];
                         push_isomorphic(&mut edit_transforms, TextSummary::from(wrapped));
                         edit_transforms.push(Transform::wrap(boundary.next_indent));
@@ -487,12 +691,17 @@ impl WrapSnapshot {
                     }
 
                     if prev_boundary_ix < line.len() {
-                        push_isomorphic(&mut edit_transforms, TextSummary::from(&line[prev_boundary_ix..]));
+                        push_isomorphic(
+                            &mut edit_transforms,
+                            TextSummary::from(&line[prev_boundary_ix..]),
+                        );
                     }
 
                     line.clear();
                     line_fragments.clear();
-                    yield_now().await;
+                    if i % WRAP_YIELD_ROW_INTERVAL == WRAP_YIELD_ROW_INTERVAL - 1 {
+                        yield_now().await;
+                    }
                 }
 
                 let mut edit_transforms = edit_transforms.into_iter();
@@ -505,22 +714,24 @@ impl WrapSnapshot {
                 if let Some(next_edit) = row_edits.peek() {
                     if next_edit.old_rows.start > old_cursor.end().row() {
                         if old_cursor.end() > TabPoint::new(edit.old_rows.end, 0) {
-                            let summary = self
-                                .tab_snapshot
-                                .text_summary_for_range(TabPoint::new(edit.old_rows.end, 0)..old_cursor.end());
+                            let summary = self.tab_snapshot.text_summary_for_range(
+                                TabPoint::new(edit.old_rows.end, 0)..old_cursor.end(),
+                            );
                             new_transforms.push_or_extend(Transform::isomorphic(summary));
                         }
                         old_cursor.next();
                         new_transforms.append(
-                            old_cursor.slice(&TabPoint::new(next_edit.old_rows.start, 0), Bias::Right),
+                            old_cursor
+                                .slice(&TabPoint::new(next_edit.old_rows.start, 0), Bias::Right),
                             (),
                         );
                     }
+                    yield_now().await;
                 } else {
                     if old_cursor.end() > TabPoint::new(edit.old_rows.end, 0) {
-                        let summary = self
-                            .tab_snapshot
-                            .text_summary_for_range(TabPoint::new(edit.old_rows.end, 0)..old_cursor.end());
+                        let summary = self.tab_snapshot.text_summary_for_range(
+                            TabPoint::new(edit.old_rows.end, 0)..old_cursor.end(),
+                        );
                         new_transforms.push_or_extend(Transform::isomorphic(summary));
                     }
                     old_cursor.next();
@@ -541,6 +752,7 @@ impl WrapSnapshot {
         old_snapshot.compute_edits(tab_edits, self)
     }
 
+    #[ztracing::instrument(skip_all)]
     fn compute_edits(&self, tab_edits: &[TabEdit], new_snapshot: &WrapSnapshot) -> WrapPatch {
         let mut wrap_edits = Vec::with_capacity(tab_edits.len());
         let mut old_cursor = self.transforms.cursor::<TransformSummary>(());
@@ -577,15 +789,18 @@ impl WrapSnapshot {
         Patch::new(wrap_edits)
     }
 
+    #[ztracing::instrument(skip_all)]
     pub(crate) fn chunks<'a>(
         &'a self,
         rows: Range<WrapRow>,
-        language_aware: bool,
+        language_aware: LanguageAwareStyling,
         highlights: Highlights<'a>,
     ) -> WrapChunks<'a> {
         let output_start = WrapPoint::new(rows.start, 0);
         let output_end = WrapPoint::new(rows.end, 0);
-        let mut transforms = self.transforms.cursor::<Dimensions<WrapPoint, TabPoint>>(());
+        let mut transforms = self
+            .transforms
+            .cursor::<Dimensions<WrapPoint, TabPoint>>(());
         transforms.seek(&output_start, Bias::Right);
         let mut input_start = TabPoint(transforms.start().1.0);
         if transforms.item().is_some_and(|t| t.is_isomorphic()) {
@@ -596,9 +811,11 @@ impl WrapSnapshot {
         let input_start = input_start.min(max_point);
         let input_end = input_end.min(max_point);
         WrapChunks {
-            input_chunks: self
-                .tab_snapshot
-                .chunks(input_start..input_end, language_aware, highlights),
+            input_chunks: self.tab_snapshot.chunks(
+                input_start..input_end,
+                language_aware,
+                highlights,
+            ),
             input_chunk: Default::default(),
             output_position: output_start,
             max_output_row: rows.end,
@@ -607,10 +824,12 @@ impl WrapSnapshot {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn max_point(&self) -> WrapPoint {
         WrapPoint(self.transforms.summary().output.lines)
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn line_len(&self, row: WrapRow) -> u32 {
         let (start, _, item) = self.transforms.find::<Dimensions<WrapPoint, TabPoint>, _>(
             (),
@@ -631,13 +850,16 @@ impl WrapSnapshot {
         }
     }
 
+    #[ztracing::instrument(skip_all, fields(rows))]
     pub fn text_summary_for_range(&self, rows: Range<WrapRow>) -> TextSummary {
         let mut summary = TextSummary::default();
 
         let start = WrapPoint::new(rows.start, 0);
         let end = WrapPoint::new(rows.end, 0);
 
-        let mut cursor = self.transforms.cursor::<Dimensions<WrapPoint, TabPoint>>(());
+        let mut cursor = self
+            .transforms
+            .cursor::<Dimensions<WrapPoint, TabPoint>>(());
         cursor.seek(&start, Bias::Right);
         if let Some(transform) = cursor.item() {
             let start_in_transform = start.0 - cursor.start().0.0;
@@ -671,7 +893,9 @@ impl WrapSnapshot {
                 if transform.is_isomorphic() {
                     let char_start = cursor.start().1;
                     let char_end = TabPoint(char_start.0 + end_in_transform);
-                    summary += &self.tab_snapshot.text_summary_for_range(char_start..char_end);
+                    summary += &self
+                        .tab_snapshot
+                        .text_summary_for_range(char_start..char_end);
                 } else {
                     debug_assert_eq!(end_in_transform, Point::new(1, 0));
                     summary += &TextSummary {
@@ -688,10 +912,13 @@ impl WrapSnapshot {
         summary
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn soft_wrap_indent(&self, row: WrapRow) -> Option<u32> {
-        let (.., item) = self
-            .transforms
-            .find::<WrapPoint, _>((), &WrapPoint::new(row + WrapRow(1), 0), Bias::Right);
+        let (.., item) = self.transforms.find::<WrapPoint, _>(
+            (),
+            &WrapPoint::new(row + WrapRow(1), 0),
+            Bias::Left,
+        );
         item.and_then(|transform| {
             if transform.is_isomorphic() {
                 None
@@ -701,12 +928,16 @@ impl WrapSnapshot {
         })
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn longest_row(&self) -> u32 {
         self.transforms.summary().output.longest_row
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn row_infos(&self, start_row: WrapRow) -> WrapRows<'_> {
-        let mut transforms = self.transforms.cursor::<Dimensions<WrapPoint, TabPoint>>(());
+        let mut transforms = self
+            .transforms
+            .cursor::<Dimensions<WrapPoint, TabPoint>>(());
         transforms.seek(&WrapPoint::new(start_row, 0), Bias::Left);
         let mut input_row = transforms.start().1.row();
         if transforms.item().is_some_and(|t| t.is_isomorphic()) {
@@ -725,10 +956,11 @@ impl WrapSnapshot {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn to_tab_point(&self, point: WrapPoint) -> TabPoint {
-        let (start, _, item) = self
-            .transforms
-            .find::<Dimensions<WrapPoint, TabPoint>, _>((), &point, Bias::Right);
+        let (start, _, item) =
+            self.transforms
+                .find::<Dimensions<WrapPoint, TabPoint>, _>((), &point, Bias::Right);
         let mut tab_point = start.1.0;
         if item.is_some_and(|t| t.is_isomorphic()) {
             tab_point += point.0 - start.0.0;
@@ -736,30 +968,40 @@ impl WrapSnapshot {
         TabPoint(tab_point)
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn to_point(&self, point: WrapPoint, bias: Bias) -> Point {
-        self.tab_snapshot.tab_point_to_point(self.to_tab_point(point), bias)
+        self.tab_snapshot
+            .tab_point_to_point(self.to_tab_point(point), bias)
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn make_wrap_point(&self, point: Point, bias: Bias) -> WrapPoint {
         self.tab_point_to_wrap_point(self.tab_snapshot.point_to_tab_point(point, bias))
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn tab_point_to_wrap_point(&self, point: TabPoint) -> WrapPoint {
-        let (start, ..) = self
-            .transforms
-            .find::<Dimensions<TabPoint, WrapPoint>, _>((), &point, Bias::Right);
+        let (start, ..) =
+            self.transforms
+                .find::<Dimensions<TabPoint, WrapPoint>, _>((), &point, Bias::Right);
         WrapPoint(start.1.0 + (point.0 - start.0.0))
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn wrap_point_cursor(&self) -> WrapPointCursor<'_> {
         WrapPointCursor {
-            cursor: self.transforms.cursor::<Dimensions<TabPoint, WrapPoint>>(()),
+            cursor: self
+                .transforms
+                .cursor::<Dimensions<TabPoint, WrapPoint>>(()),
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn clip_point(&self, mut point: WrapPoint, bias: Bias) -> WrapPoint {
         if bias == Bias::Left {
-            let (start, _, item) = self.transforms.find::<WrapPoint, _>((), &point, Bias::Right);
+            let (start, _, item) = self
+                .transforms
+                .find::<WrapPoint, _>((), &point, Bias::Right);
             if item.is_some_and(|t| !t.is_isomorphic()) {
                 point = start;
                 *point.column_mut() -= 1;
@@ -771,6 +1013,7 @@ impl WrapSnapshot {
 
     /// Try to find a TabRow start that is also a WrapRow start
     /// Every TabRow start is a WrapRow start
+    #[ztracing::instrument(skip_all, fields(point=?point))]
     pub fn prev_row_boundary(&self, point: WrapPoint) -> WrapRow {
         if self.transforms.is_empty() {
             return WrapRow(0);
@@ -778,7 +1021,9 @@ impl WrapSnapshot {
 
         let point = WrapPoint::new(point.row(), 0);
 
-        let mut cursor = self.transforms.cursor::<Dimensions<WrapPoint, TabPoint>>(());
+        let mut cursor = self
+            .transforms
+            .cursor::<Dimensions<WrapPoint, TabPoint>>(());
 
         cursor.seek(&point, Bias::Right);
         if cursor.item().is_none() {
@@ -824,10 +1069,13 @@ impl WrapSnapshot {
         WrapRow(0)
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn next_row_boundary(&self, mut point: WrapPoint) -> Option<WrapRow> {
         point.0 += Point::new(1, 0);
 
-        let mut cursor = self.transforms.cursor::<Dimensions<WrapPoint, TabPoint>>(());
+        let mut cursor = self
+            .transforms
+            .cursor::<Dimensions<WrapPoint, TabPoint>>(());
         cursor.seek(&point, Bias::Right);
         while let Some(transform) = cursor.item() {
             if transform.is_isomorphic() && cursor.start().1.column() == 0 {
@@ -849,12 +1097,16 @@ impl WrapSnapshot {
     pub fn text_chunks(&self, wrap_row: WrapRow) -> impl Iterator<Item = &str> {
         self.chunks(
             wrap_row..self.max_point().row() + WrapRow(1),
-            false,
+            LanguageAwareStyling {
+                tree_sitter: false,
+                diagnostics: false,
+            },
             Highlights::default(),
         )
         .map(|h| h.text)
     }
 
+    #[ztracing::instrument(skip_all)]
     fn check_invariants(&self) {
         #[cfg(test)]
         {
@@ -908,9 +1160,15 @@ pub struct WrapPointCursor<'transforms> {
 }
 
 impl WrapPointCursor<'_> {
+    /// Resets the cursor to the start so it can seek backward again.
+    pub fn reset(&mut self) {
+        self.cursor.reset();
+    }
+
+    #[ztracing::instrument(skip_all)]
     pub fn map(&mut self, point: TabPoint) -> WrapPoint {
         let cursor = &mut self.cursor;
-        if cursor.did_seek() {
+        if cursor.did_seek() && point >= cursor.start().0 {
             cursor.seek_forward(&point, Bias::Right);
         } else {
             cursor.seek(&point, Bias::Right);
@@ -920,6 +1178,7 @@ impl WrapPointCursor<'_> {
 }
 
 impl WrapChunks<'_> {
+    #[ztracing::instrument(skip_all)]
     pub(crate) fn seek(&mut self, rows: Range<WrapRow>) {
         let output_start = WrapPoint::new(rows.start, 0);
         let output_end = WrapPoint::new(rows.end, 0);
@@ -942,6 +1201,7 @@ impl WrapChunks<'_> {
 impl<'a> Iterator for WrapChunks<'a> {
     type Item = Chunk<'a>;
 
+    #[ztracing::instrument(skip_all)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.output_position.row() >= self.max_output_row {
             return None;
@@ -998,14 +1258,17 @@ impl<'a> Iterator for WrapChunks<'a> {
         let mask = 1u128.unbounded_shl(input_len as u32).wrapping_sub(1);
         let chars = self.input_chunk.chars & mask;
         let tabs = self.input_chunk.tabs & mask;
+        let newlines = self.input_chunk.newlines & mask;
         self.input_chunk.tabs = self.input_chunk.tabs.unbounded_shr(input_len as u32);
         self.input_chunk.chars = self.input_chunk.chars.unbounded_shr(input_len as u32);
+        self.input_chunk.newlines = self.input_chunk.newlines.unbounded_shr(input_len as u32);
 
         self.input_chunk.text = suffix;
         Some(Chunk {
             text: prefix,
             chars,
             tabs,
+            newlines,
             ..self.input_chunk.clone()
         })
     }
@@ -1014,6 +1277,7 @@ impl<'a> Iterator for WrapChunks<'a> {
 impl Iterator for WrapRows<'_> {
     type Item = RowInfo;
 
+    #[ztracing::instrument(skip_all)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.output_row > self.max_output_row {
             return None;
@@ -1048,7 +1312,17 @@ impl Iterator for WrapRows<'_> {
     }
 }
 
+fn indent_adjustment_for(indent: SoftWrapIndent, tab_size: NonZeroU32) -> IndentAdjustment {
+    match indent {
+        SoftWrapIndent::None => IndentAdjustment::NoIndent,
+        SoftWrapIndent::Same => IndentAdjustment::SameIndent,
+        SoftWrapIndent::ExtraOne => IndentAdjustment::ExtraColumns(tab_size.get()),
+        SoftWrapIndent::ExtraTwo => IndentAdjustment::ExtraColumns(tab_size.get() * 2),
+    }
+}
+
 impl Transform {
+    #[ztracing::instrument(skip_all)]
     fn isomorphic(summary: TextSummary) -> Self {
         #[cfg(test)]
         assert!(!summary.lines.is_zero());
@@ -1062,6 +1336,7 @@ impl Transform {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     fn wrap(indent: u32) -> Self {
         static WRAP_TEXT: LazyLock<String> = LazyLock::new(|| {
             let mut wrap_text = String::new();
@@ -1114,6 +1389,7 @@ trait SumTreeExt {
 }
 
 impl SumTreeExt for SumTree<Transform> {
+    #[ztracing::instrument(skip_all)]
     fn push_or_extend(&mut self, transform: Transform) {
         let mut transform = Some(transform);
         self.update_last(
@@ -1177,6 +1453,7 @@ impl<'a> sum_tree::Dimension<'a, TransformSummary> for TabPoint {
 }
 
 impl sum_tree::SeekTarget<'_, TransformSummary, TransformSummary> for TabPoint {
+    #[ztracing::instrument(skip_all)]
     fn cmp(&self, cursor_location: &TransformSummary, _: ()) -> std::cmp::Ordering {
         Ord::cmp(&self.0, &cursor_location.input.lines)
     }
@@ -1225,16 +1502,115 @@ mod tests {
     use super::*;
     use crate::{
         MultiBuffer,
-        display_map::{fold_map::FoldMap, inlay_map::InlayMap, tab_map::TabMap},
+        display_map::{
+            fold_map::{FoldMap, FoldSnapshot},
+            inlay_map::InlayMap,
+            tab_map::TabMap,
+        },
         test::test_font,
     };
+    use futures::stream::StreamExt;
     use gpui::{LineFragment, px, test::observe};
     use rand::prelude::*;
     use settings::SettingsStore;
-    use smol::stream::StreamExt;
     use std::{cmp, env, num::NonZeroU32};
     use text::Rope;
     use theme::LoadThemes;
+
+    fn init_wrap_test(
+        text: &str,
+        tab_size: NonZeroU32,
+        soft_wrapping: Option<Pixels>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<WrapMap>, TabMap, FoldSnapshot) {
+        let text_system = cx.read(|cx| cx.text_system().clone());
+        let font = test_font();
+        let _font_id = text_system.resolve_font(&font);
+        let font_size = px(14.0);
+
+        let buffer = cx.new(|cx| language::Buffer::local(text, cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+        let (_inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let (_fold_map, fold_snapshot) = FoldMap::new(inlay_snapshot);
+        let (mut tab_map, _) = TabMap::new(fold_snapshot.clone(), tab_size);
+        let tabs_snapshot = tab_map.set_max_expansion_column(32);
+        let (wrap_map, _) =
+            cx.update(|cx| WrapMap::new(tabs_snapshot, font, font_size, soft_wrapping, cx));
+        (wrap_map, tab_map, fold_snapshot)
+    }
+
+    #[gpui::test]
+    async fn test_soft_wrap_indent(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let text = "fn main() {\n    let some_variable = 1;\n    let some_variable = 2;\n}";
+        let (wrap_map, _, _) =
+            init_wrap_test(text, 4.try_into().unwrap(), Some(px(14.0) * 15.0), cx);
+
+        // Test None
+        wrap_map.update(cx, |map, cx| {
+            map.set_soft_wrap_indent(language::language_settings::SoftWrapIndent::None, cx)
+        });
+        let wrap_snapshot = wrap_map.update(cx, |map, _cx| map.snapshot.clone());
+        assert_eq!(
+            wrap_snapshot.text(),
+            "fn main() {\n    let some_variable = \n1;\n    let some_variable = \n2;\n}"
+        );
+        assert_eq!(wrap_snapshot.soft_wrap_indent(WrapRow(1)), Some(0));
+
+        // Test Same
+        wrap_map.update(cx, |map, cx| {
+            map.set_soft_wrap_indent(language::language_settings::SoftWrapIndent::Same, cx)
+        });
+        let wrap_snapshot = wrap_map.update(cx, |map, _cx| map.snapshot.clone());
+        assert_eq!(
+            wrap_snapshot.text(),
+            "fn main() {\n    let some_variable = \n    1;\n    let some_variable = \n    2;\n}"
+        );
+
+        // Test ExtraOne
+        wrap_map.update(cx, |map, cx| {
+            map.set_soft_wrap_indent(language::language_settings::SoftWrapIndent::ExtraOne, cx)
+        });
+        let wrap_snapshot = wrap_map.update(cx, |map, _cx| map.snapshot.clone());
+        assert_eq!(
+            wrap_snapshot.text(),
+            "fn main() {\n    let some_variable = \n        1;\n    let some_variable = \n        2;\n}"
+        );
+
+        // Test ExtraTwo
+        wrap_map.update(cx, |map, cx| {
+            map.set_soft_wrap_indent(language::language_settings::SoftWrapIndent::ExtraTwo, cx)
+        });
+        let wrap_snapshot = wrap_map.update(cx, |map, _cx| map.snapshot.clone());
+        assert_eq!(
+            wrap_snapshot.text(),
+            "fn main() {\n    let some_variable = \n            1;\n    let some_variable = \n            2;\n}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_soft_wrap_indent_updates_on_tab_size_change(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let text = "    let x = 1;\n";
+        let (wrap_map, mut tab_map, fold_snapshot) =
+            init_wrap_test(text, 4.try_into().unwrap(), Some(px(14.0) * 8.0), cx);
+
+        wrap_map.update(cx, |map, cx| {
+            map.set_soft_wrap_indent(language::language_settings::SoftWrapIndent::ExtraOne, cx)
+        });
+        let wrap_snapshot = wrap_map.update(cx, |map, _cx| map.snapshot.clone());
+        assert_eq!(wrap_snapshot.text(), "    let x = \n        1;\n");
+
+        // Change tab_size to 2
+        let (tabs_snapshot, tab_edits) =
+            tab_map.sync(fold_snapshot, Vec::new(), 2.try_into().unwrap());
+        let (wrap_snapshot, _) =
+            wrap_map.update(cx, |map, cx| map.sync(tabs_snapshot, tab_edits, cx));
+        assert_eq!(wrap_snapshot.text(), "    let x = \n      1;\n");
+    }
 
     #[gpui::test]
     async fn test_prev_row_boundary(cx: &mut gpui::TestAppContext) {
@@ -1301,6 +1677,115 @@ mod tests {
         assert_eq!(row.0, 3);
     }
 
+    #[gpui::test]
+    async fn test_invisibles_become_width_measured_elements(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let text_system = cx.read(|cx| cx.text_system().clone());
+        let font = test_font();
+        let font_size = px(14.0);
+        let mut fragment_builder = LineFragmentBuilder::new(text_system, &font, font_size);
+
+        let mut fragments = Vec::new();
+        fragment_builder.push_fragments(&mut fragments, "ab\u{7f}cd\u{80}\u{81}e");
+        let shapes = fragments
+            .iter()
+            .map(|fragment| match fragment {
+                LineFragment::Text { text } => (false, text.len()),
+                LineFragment::Element { len_utf8, width } => {
+                    assert!(
+                        *width > px(0.),
+                        "invisible characters must carry the measured width of their \
+                         replacement glyph so the wrapper accounts for what the renderer \
+                         actually draws"
+                    );
+                    (true, *len_utf8)
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shapes,
+            vec![
+                (false, 2),
+                (true, 1),
+                (false, 2),
+                (true, 2),
+                (true, 2),
+                (false, 1),
+            ],
+            "invisible chars must become single-char elements with exact utf8 lengths, \
+             keeping the wrapper's byte offsets aligned with the source text"
+        );
+
+        let mut plain_fragments = Vec::new();
+        fragment_builder.push_fragments(&mut plain_fragments, "plain text");
+        assert_eq!(
+            plain_fragments.len(),
+            1,
+            "text without invisibles must stay one fragment"
+        );
+        assert_eq!(
+            plain_fragments.first().map(|fragment| match fragment {
+                LineFragment::Text { text } => text.len(),
+                LineFragment::Element { len_utf8, .. } => *len_utf8,
+            }),
+            Some(10),
+        );
+
+        let mut preserved_fragments = Vec::new();
+        fragment_builder.push_fragments(&mut preserved_fragments, "a\u{200d}b");
+        assert_eq!(
+            preserved_fragments.len(),
+            1,
+            "combining-class invisibles like ZWJ have no replacement and must stay \
+             inside their text fragment"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_invisibles_wrap_at_replacement_glyph_width(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let text_system = cx.read(|cx| cx.text_system().clone());
+        let font = test_font();
+        let font_id = text_system.resolve_font(&font);
+        let font_size = px(14.0);
+        let wrap_width = px(140.0);
+
+        let text = "\u{7f}\u{80}\u{81}\u{82}\u{83}\u{84}".repeat(20);
+        let buffer = cx.new(|cx| language::Buffer::local(text, cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+        let (_inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let (_fold_map, fold_snapshot) = FoldMap::new(inlay_snapshot);
+        let (mut tab_map, _) = TabMap::new(fold_snapshot, 4.try_into().unwrap());
+        let tabs_snapshot = tab_map.set_max_expansion_column(32);
+        let (_wrap_map, wrap_snapshot) =
+            cx.update(|cx| WrapMap::new(tabs_snapshot, font, font_size, Some(wrap_width), cx));
+
+        let wrapped_text = wrap_snapshot.text();
+        for row in wrapped_text.split('\n') {
+            let rendered_width = row
+                .chars()
+                .map(|ch| {
+                    let rendered_char = if is_invisible(ch) {
+                        replacement(ch).unwrap_or(ch)
+                    } else {
+                        ch
+                    };
+                    text_system.layout_width(font_id, font_size, rendered_char)
+                })
+                .fold(px(0.), |width, char_width| width + char_width);
+            assert!(
+                rendered_width <= wrap_width,
+                "a soft-wrapped row must fit the wrap width when drawn with the \
+                 replacement glyphs the renderer substitutes for invisible characters, \
+                 but this row renders at {rendered_width:?} against a wrap width of \
+                 {wrap_width:?}: {row:?}"
+            );
+        }
+    }
+
     #[gpui::test(iterations = 100)]
     async fn test_random_wraps(cx: &mut gpui::TestAppContext, mut rng: StdRng) {
         // todo this test is flaky
@@ -1331,7 +1816,9 @@ mod tests {
                 MultiBuffer::build_random(&mut rng, cx)
             } else {
                 let len = rng.random_range(0..10);
-                let text = util::RandomCharIter::new(&mut rng).take(len).collect::<String>();
+                let text = util::RandomCharIter::new(&mut rng)
+                    .take(len)
+                    .collect::<String>();
                 MultiBuffer::build_simple(&text, cx)
             }
         });
@@ -1346,9 +1833,16 @@ mod tests {
         log::info!("TabMap text: {:?}", tabs_snapshot.text());
 
         let mut line_wrapper = text_system.line_wrapper(font.clone(), font_size);
-        let expected_text = wrap_text(&tabs_snapshot, wrap_width, &mut line_wrapper);
+        let mut indent_adjustment = IndentAdjustment::default();
+        let expected_text = wrap_text(
+            &tabs_snapshot,
+            wrap_width,
+            indent_adjustment,
+            &mut line_wrapper,
+        );
 
-        let (wrap_map, _) = cx.update(|cx| WrapMap::new(tabs_snapshot.clone(), font, font_size, wrap_width, cx));
+        let (wrap_map, _) =
+            cx.update(|cx| WrapMap::new(tabs_snapshot.clone(), font, font_size, wrap_width, cx));
         let mut notifications = observe(&wrap_map, cx);
 
         if wrap_map.read_with(cx, |map, _| map.is_rewrapping()) {
@@ -1382,12 +1876,27 @@ mod tests {
                     } else {
                         Some(px(rng.random_range(0.0..=1000.0)))
                     };
-                    log::info!("Setting wrap width to {:?}", wrap_width);
-                    wrap_map.update(cx, |map, cx| map.set_wrap_width(wrap_width, cx));
+                    let soft_wrap_indent = match rng.random_range(0..=3) {
+                        0 => SoftWrapIndent::None,
+                        1 => SoftWrapIndent::Same,
+                        2 => SoftWrapIndent::ExtraOne,
+                        _ => SoftWrapIndent::ExtraTwo,
+                    };
+                    indent_adjustment = indent_adjustment_for(soft_wrap_indent, tab_size);
+                    log::info!(
+                        "Setting wrap width to {:?}, indent to {:?}",
+                        wrap_width,
+                        soft_wrap_indent
+                    );
+                    wrap_map.update(cx, |map, cx| {
+                        map.set_wrap_width(wrap_width, cx);
+                        map.set_soft_wrap_indent(soft_wrap_indent, cx);
+                    });
                 }
                 20..=39 => {
                     for (fold_snapshot, fold_edits) in fold_map.randomly_mutate(&mut rng) {
-                        let (tabs_snapshot, tab_edits) = tab_map.sync(fold_snapshot, fold_edits, tab_size);
+                        let (tabs_snapshot, tab_edits) =
+                            tab_map.sync(fold_snapshot, fold_edits, tab_size);
                         let (mut snapshot, wrap_edits) =
                             wrap_map.update(cx, |map, cx| map.sync(tabs_snapshot, tab_edits, cx));
                         snapshot.check_invariants();
@@ -1396,9 +1905,11 @@ mod tests {
                     }
                 }
                 40..=59 => {
-                    let (inlay_snapshot, inlay_edits) = inlay_map.randomly_mutate(&mut next_inlay_id, &mut rng);
+                    let (inlay_snapshot, inlay_edits) =
+                        inlay_map.randomly_mutate(&mut next_inlay_id, &mut rng);
                     let (fold_snapshot, fold_edits) = fold_map.read(inlay_snapshot, inlay_edits);
-                    let (tabs_snapshot, tab_edits) = tab_map.sync(fold_snapshot, fold_edits, tab_size);
+                    let (tabs_snapshot, tab_edits) =
+                        tab_map.sync(fold_snapshot, fold_edits, tab_size);
                     let (mut snapshot, wrap_edits) =
                         wrap_map.update(cx, |map, cx| map.sync(tabs_snapshot, tab_edits, cx));
                     snapshot.check_invariants();
@@ -1417,14 +1928,20 @@ mod tests {
             }
 
             log::info!("Buffer text: {:?}", buffer_snapshot.text());
-            let (inlay_snapshot, inlay_edits) = inlay_map.sync(buffer_snapshot.clone(), buffer_edits);
+            let (inlay_snapshot, inlay_edits) =
+                inlay_map.sync(buffer_snapshot.clone(), buffer_edits);
             log::info!("InlayMap text: {:?}", inlay_snapshot.text());
             let (fold_snapshot, fold_edits) = fold_map.read(inlay_snapshot, inlay_edits);
             log::info!("FoldMap text: {:?}", fold_snapshot.text());
             let (tabs_snapshot, tab_edits) = tab_map.sync(fold_snapshot, fold_edits, tab_size);
             log::info!("TabMap text: {:?}", tabs_snapshot.text());
 
-            let expected_text = wrap_text(&tabs_snapshot, wrap_width, &mut line_wrapper);
+            let expected_text = wrap_text(
+                &tabs_snapshot,
+                wrap_width,
+                indent_adjustment,
+                &mut line_wrapper,
+            );
             let (mut snapshot, wrap_edits) =
                 wrap_map.update(cx, |map, cx| map.sync(tabs_snapshot.clone(), tab_edits, cx));
             snapshot.check_invariants();
@@ -1440,8 +1957,9 @@ mod tests {
             }
 
             if !wrap_map.read_with(cx, |map, _| map.is_rewrapping()) {
-                let (mut wrapped_snapshot, wrap_edits) =
-                    wrap_map.update(cx, |map, cx| map.sync(tabs_snapshot.clone(), Vec::new(), cx));
+                let (mut wrapped_snapshot, wrap_edits) = wrap_map.update(cx, |map, cx| {
+                    map.sync(tabs_snapshot.clone(), Vec::new(), cx)
+                });
                 let actual_text = wrapped_snapshot.text();
                 let actual_longest_row = wrapped_snapshot.longest_row();
                 log::info!("Wrapping finished: {:?}", actual_text);
@@ -1456,12 +1974,23 @@ mod tests {
                 );
 
                 let mut summary = TextSummary::default();
-                for (ix, item) in wrapped_snapshot.transforms.items(()).into_iter().enumerate() {
+                for (ix, item) in wrapped_snapshot
+                    .transforms
+                    .items(())
+                    .into_iter()
+                    .enumerate()
+                {
                     summary += &item.summary.output;
                     log::info!("{} summary: {:?}", ix, item.summary.output,);
                 }
 
-                if tab_size.get() == 1 || !wrapped_snapshot.tab_snapshot.fold_snapshot.text().contains('\t') {
+                if tab_size.get() == 1
+                    || !wrapped_snapshot
+                        .tab_snapshot
+                        .fold_snapshot
+                        .text()
+                        .contains('\t')
+                {
                     let mut expected_longest_rows = Vec::new();
                     let mut longest_line_len = -1;
                     for (row, line) in expected_text.split('\n').enumerate() {
@@ -1496,9 +2025,13 @@ mod tests {
                     initial_text.max_point(),
                 ));
                 let new_start = snapshot_text.point_to_offset(Point::new(edit.new.start.0, 0));
-                let new_end =
-                    snapshot_text.point_to_offset(cmp::min(Point::new(edit.new.end.0, 0), snapshot_text.max_point()));
-                let new_text = snapshot_text.chunks_in_range(new_start..new_end).collect::<String>();
+                let new_end = snapshot_text.point_to_offset(cmp::min(
+                    Point::new(edit.new.end.0, 0),
+                    snapshot_text.max_point(),
+                ));
+                let new_text = snapshot_text
+                    .chunks_in_range(new_start..new_end)
+                    .collect::<String>();
 
                 initial_text.replace(old_start..old_end, &new_text);
             }
@@ -1518,11 +2051,16 @@ mod tests {
         cx.update(|cx| {
             let settings = SettingsStore::test(cx);
             cx.set_global(settings);
-            theme::init(LoadThemes::JustBase, cx);
+            theme_settings::init(LoadThemes::JustBase, cx);
         });
     }
 
-    fn wrap_text(tab_snapshot: &TabSnapshot, wrap_width: Option<Pixels>, line_wrapper: &mut LineWrapper) -> String {
+    fn wrap_text(
+        tab_snapshot: &TabSnapshot,
+        wrap_width: Option<Pixels>,
+        indent_adjustment: IndentAdjustment,
+        line_wrapper: &mut LineWrapper,
+    ) -> String {
         if let Some(wrap_width) = wrap_width {
             let mut wrapped_text = String::new();
             for (row, line) in tab_snapshot.text().split('\n').enumerate() {
@@ -1531,7 +2069,11 @@ mod tests {
                 }
 
                 let mut prev_ix = 0;
-                for boundary in line_wrapper.wrap_line(&[LineFragment::text(line)], wrap_width) {
+                for boundary in line_wrapper.wrap_line(
+                    &[LineFragment::text(line)],
+                    wrap_width,
+                    indent_adjustment,
+                ) {
                     wrapped_text.push_str(&line[prev_ix..boundary.ix]);
                     wrapped_text.push('\n');
                     wrapped_text.push_str(&" ".repeat(boundary.next_indent as usize));
@@ -1567,7 +2109,14 @@ mod tests {
                 }
 
                 let actual_text = self
-                    .chunks(WrapRow(start_row)..WrapRow(end_row), true, Highlights::default())
+                    .chunks(
+                        WrapRow(start_row)..WrapRow(end_row),
+                        LanguageAwareStyling {
+                            tree_sitter: true,
+                            diagnostics: true,
+                        },
+                        Highlights::default(),
+                    )
                     .map(|c| c.text)
                     .collect::<String>();
                 assert_eq!(

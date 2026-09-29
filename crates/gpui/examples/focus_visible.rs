@@ -1,7 +1,13 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
+#[path = "example_support/fonts.rs"]
+mod example_support;
+
 use gpui::{
-    App, Application, Bounds, Context, Div, ElementId, FocusHandle, KeyBinding, SharedString, Stateful, Window,
+    App, Bounds, Context, Div, ElementId, FocusHandle, KeyBinding, SharedString, Stateful, Window,
     WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
+use gpui_platform::application;
 
 actions!(example, [Tab, TabPrev, Quit]);
 
@@ -34,7 +40,9 @@ impl Example {
         Self {
             focus_handle,
             items,
-            message: SharedString::from("Try clicking vs tabbing! Click shows no border, Tab shows border."),
+            message: SharedString::from(
+                "Try clicking vs tabbing! Click shows no border, Tab shows border.",
+            ),
         }
     }
 
@@ -45,7 +53,8 @@ impl Example {
 
     fn on_tab_prev(&mut self, _: &TabPrev, window: &mut Window, cx: &mut Context<Self>) {
         window.focus_prev(cx);
-        self.message = SharedString::from("Pressed Shift-Tab - focus-visible border should appear!");
+        self.message =
+            SharedString::from("Pressed Shift-Tab - focus-visible border should appear!");
     }
 
     fn on_quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
@@ -118,9 +127,12 @@ impl Render for Example {
                             .child(
                                 button_base("button1", self.items[0].1)
                                     .track_focus(&self.items[0].0)
-                                    .focus(|style| style.border_4().border_color(gpui::rgb(0xfbbf24)))
+                                    .focus(|style| {
+                                        style.border_4().border_color(gpui::rgb(0xfbbf24))
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.message = "Clicked button 1 - focus border is visible!".into();
+                                        this.message =
+                                            "Clicked button 1 - focus border is visible!".into();
                                         cx.notify();
                                     })),
                             ),
@@ -140,9 +152,12 @@ impl Render for Example {
                             .child(
                                 button_base("button2", self.items[1].1)
                                     .track_focus(&self.items[1].0)
-                                    .focus_visible(|style| style.border_4().border_color(gpui::rgb(0x10b981)))
+                                    .focus_visible(|style| {
+                                        style.border_4().border_color(gpui::rgb(0x10b981))
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.message = "Clicked button 2 - no border! Try Tab instead.".into();
+                                        this.message =
+                                            "Clicked button 2 - no border! Try Tab instead.".into();
                                         cx.notify();
                                     })),
                             ),
@@ -157,15 +172,23 @@ impl Render for Example {
                                     .text_sm()
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(gpui::rgb(0x374151))
-                                    .child("3. Both .focus() (yellow) and .focus_visible() (green):"),
+                                    .child(
+                                        "3. Both .focus() (yellow) and .focus_visible() (green):",
+                                    ),
                             )
                             .child(
                                 button_base("button3", self.items[2].1)
                                     .track_focus(&self.items[2].0)
-                                    .focus(|style| style.border_4().border_color(gpui::rgb(0xfbbf24)))
-                                    .focus_visible(|style| style.border_4().border_color(gpui::rgb(0x10b981)))
+                                    .focus(|style| {
+                                        style.border_4().border_color(gpui::rgb(0xfbbf24))
+                                    })
+                                    .focus_visible(|style| {
+                                        style.border_4().border_color(gpui::rgb(0x10b981))
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.message = "Clicked button 3 - yellow border. Tab shows green!".into();
+                                        this.message =
+                                            "Clicked button 3 - yellow border. Tab shows green!"
+                                                .into();
                                         cx.notify();
                                     })),
                             ),
@@ -174,8 +197,11 @@ impl Render for Example {
     }
 }
 
-fn main() {
-    Application::new().run(|cx: &mut App| {
+fn run_example() {
+    application().run(|cx: &mut App| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         cx.bind_keys([
             KeyBinding::new("tab", Tab, None),
             KeyBinding::new("shift-tab", TabPrev, None),
@@ -192,6 +218,18 @@ fn main() {
         )
         .unwrap();
 
-        cx.activate();
+        cx.activate(true);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

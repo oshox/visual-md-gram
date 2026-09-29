@@ -1,6 +1,5 @@
 use gpui::Context;
 use settings::SettingsStore;
-use smol::Timer;
 use std::time::Duration;
 use ui::App;
 
@@ -11,17 +10,23 @@ pub struct BlinkManager {
     blinking_paused: bool,
     /// Whether the cursor should be visibly rendered or not.
     visible: bool,
-    /// Whether the blinking currently enabled.
+    /// Whether the blinking is currently enabled.
     enabled: bool,
     /// Whether the blinking is enabled in the settings.
     blink_enabled_in_settings: fn(&App) -> bool,
 }
 
 impl BlinkManager {
-    pub fn new(blink_interval: Duration, blink_enabled_in_settings: fn(&App) -> bool, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        blink_interval: Duration,
+        blink_enabled_in_settings: fn(&App) -> bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Make sure we blink the cursors if the setting is re-enabled
-        cx.observe_global::<SettingsStore>(move |this, cx| this.blink_cursors(this.blink_epoch, cx))
-            .detach();
+        cx.observe_global::<SettingsStore>(move |this, cx| {
+            this.blink_cursors(this.blink_epoch, cx)
+        })
+        .detach();
 
         Self {
             blink_interval,
@@ -42,9 +47,9 @@ impl BlinkManager {
         self.show_cursor(cx);
 
         let epoch = self.next_blink_epoch();
-        let interval = self.blink_interval;
+        let interval = Duration::from_millis(500);
         cx.spawn(async move |this, cx| {
-            Timer::after(interval).await;
+            cx.background_executor().timer(interval).await;
             this.update(cx, |this, cx| this.resume_cursor_blinking(epoch, cx))
         })
         .detach();
@@ -66,9 +71,9 @@ impl BlinkManager {
                 let epoch = self.next_blink_epoch();
                 let interval = self.blink_interval;
                 cx.spawn(async move |this, cx| {
-                    Timer::after(interval).await;
+                    cx.background_executor().timer(interval).await;
                     if let Some(this) = this.upgrade() {
-                        this.update(cx, |this, cx| this.blink_cursors(epoch, cx)).ok();
+                        this.update(cx, |this, cx| this.blink_cursors(epoch, cx));
                     }
                 })
                 .detach();
@@ -106,5 +111,10 @@ impl BlinkManager {
 
     pub fn visible(&self) -> bool {
         self.visible
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
     }
 }

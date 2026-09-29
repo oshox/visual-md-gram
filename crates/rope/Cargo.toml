@@ -1,34 +1,38 @@
 [package]
 name = "rope"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
 
 [lib]
 path = "src/rope.rs"
 doctest = false
 
-[[bench]]
-harness = false
-name = "rope_benchmark"
-
 [dependencies]
-arrayvec.workspace = true
+heapless.workspace = true
 log.workspace = true
 rayon.workspace = true
 sum_tree.workspace = true
 unicode-segmentation.workspace = true
 util.workspace = true
+ztracing.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-criterion.workspace = true
 ctor.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 rand.workspace = true
 util = { workspace = true, features = ["test-support"] }
+criterion.workspace = true
 zlog.workspace = true
 
-[lints]
-workspace = true
+[[bench]]
+name = "rope_benchmark"
+harness = false
+
+[package.metadata.cargo-shear]
+ignored = ["tracing"]

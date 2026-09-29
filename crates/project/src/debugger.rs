@@ -1,4 +1,4 @@
-//! Gram's debugger data layer is implemented in terms of 3 concepts:
+//! Zed's debugger data layer is implemented in terms of 3 concepts:
 //! - DAP store - that knows about all of the available debug sessions.
 //! - Debug sessions - that bear responsibility of communicating with debug adapters and managing the state of each individual session.
 //!   For the most part it is agnostic over the communication layer (it'll use RPC for peers and actual DAP requests for the host).
@@ -15,7 +15,7 @@ pub mod breakpoint_store;
 pub mod dap_command;
 pub mod dap_store;
 pub mod locators;
-mod memory;
+pub mod memory;
 pub mod session;
 
 #[cfg(any(feature = "test-support", test))]

@@ -1,30 +1,34 @@
 use crate::multibuffer_hint::MultibufferHint;
-use app_actions::OpenOnboarding;
-use db::kvp::KEY_VALUE_STORE;
+use client::{Client, UserStore, zed_urls};
+use cloud_api_types::Plan;
+use db::kvp::KeyValueStore;
 use fs::Fs;
 use gpui::{
-    Action, AnyElement, App, AppContext, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Global, IntoElement, KeyContext, Render, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window,
-    actions,
+    Action, AnyElement, App, AppContext, AsyncWindowContext, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, Global, IntoElement, KeyContext, Render, ScrollHandle, SharedString,
+    Subscription, Task, WeakEntity, Window, actions,
 };
-use notifications::status_toast::{StatusToast, ToastIcon};
+use notifications::status_toast::StatusToast;
+use project::agent_server_store::AllAgentServersSettings;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{SettingsStore, VsCodeSettingsSource};
 use std::sync::Arc;
-use theme::Appearance;
 use ui::{
-    Divider, KeyBinding, ParentElement as _, StatefulInteractiveElement, Vector, VectorName, WithScrollbar as _,
-    prelude::*,
+    Divider, KeyBinding, ParentElement as _, StatefulInteractiveElement, Vector, VectorName,
+    WithScrollbar as _, prelude::*, rems_from_px,
 };
+
 pub use workspace::welcome::ShowWelcome;
 use workspace::welcome::WelcomePage;
 use workspace::{
     AppState, Workspace, WorkspaceId,
     dock::DockPosition,
     item::{Item, ItemEvent},
+    notifications::NotifyResultExt as _,
     open_new, register_serializable_item, with_active_or_new_workspace,
 };
+use zed_actions::OpenOnboarding;
 
 mod base_keymap_picker;
 mod basics_page;
@@ -33,21 +37,33 @@ mod theme_preview;
 
 /// Imports settings from Visual Studio Code.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
-#[action(namespace = gram)]
+#[action(namespace = zed)]
 #[serde(deny_unknown_fields)]
 pub struct ImportVsCodeSettings {
     #[serde(default)]
     pub skip_prompt: bool,
 }
 
+/// Imports settings from Cursor editor.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = zed)]
+#[serde(deny_unknown_fields)]
+pub struct ImportCursorSettings {
+    #[serde(default)]
+    pub skip_prompt: bool,
+}
+
 pub const FIRST_OPEN: &str = "first_open";
-pub const DOCS_URL: &str = "gram://docs/";
 
 actions!(
     onboarding,
     [
         /// Finish the onboarding process.
         Finish,
+        /// Sign in while in the onboarding flow.
+        SignIn,
+        /// Open the user account in zed.dev while in the onboarding flow.
+        OpenAccount,
         /// Resets the welcome screen hints to their initial state.
         ResetHints
     ]
@@ -55,7 +71,8 @@ actions!(
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _cx| {
-        workspace.register_action(|_workspace, _: &ResetHints, _, cx| MultibufferHint::set_count(0, cx));
+        workspace
+            .register_action(|_workspace, _: &ResetHints, _, cx| MultibufferHint::set_count(0, cx));
     })
     .detach();
 
@@ -73,7 +90,13 @@ pub fn init(cx: &mut App) {
                         workspace.activate_item(&existing, true, true, window, cx);
                     } else {
                         let settings_page = Onboarding::new(workspace, cx);
-                        workspace.add_item_to_active_pane(Box::new(settings_page), None, true, window, cx)
+                        workspace.add_item_to_active_pane(
+                            Box::new(settings_page),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        )
                     }
                 })
                 .detach();
@@ -93,8 +116,15 @@ pub fn init(cx: &mut App) {
                     if let Some(existing) = existing {
                         workspace.activate_item(&existing, true, true, window, cx);
                     } else {
-                        let settings_page = cx.new(|cx| WelcomePage::new(workspace.weak_handle(), window, cx));
-                        workspace.add_item_to_active_pane(Box::new(settings_page), None, true, window, cx)
+                        let settings_page = cx
+                            .new(|cx| WelcomePage::new(workspace.weak_handle(), false, window, cx));
+                        workspace.add_item_to_active_pane(
+                            Box::new(settings_page),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        )
                     }
                 })
                 .detach();
@@ -110,8 +140,34 @@ pub fn init(cx: &mut App) {
 
             window
                 .spawn(cx, async move |cx: &mut AsyncWindowContext| {
-                    handle_import_vscode_settings(workspace, VsCodeSettingsSource::VsCode, action.skip_prompt, fs, cx)
-                        .await
+                    handle_import_vscode_settings(
+                        workspace,
+                        VsCodeSettingsSource::VsCode,
+                        action.skip_prompt,
+                        fs,
+                        cx,
+                    )
+                    .await
+                })
+                .detach();
+        });
+
+        workspace.register_action(|_workspace, action: &ImportCursorSettings, window, cx| {
+            let fs = <dyn Fs>::global(cx);
+            let action = *action;
+
+            let workspace = cx.weak_entity();
+
+            window
+                .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                    handle_import_vscode_settings(
+                        workspace,
+                        VsCodeSettingsSource::Cursor,
+                        action.skip_prompt,
+                        fs,
+                        cx,
+                    )
+                    .await
                 })
                 .detach();
         });
@@ -125,25 +181,34 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn show_onboarding_view(app_state: Arc<AppState>, cx: &mut App) -> Task<anyhow::Result<()>> {
-    open_new(Default::default(), app_state, cx, |workspace, window, cx| {
-        {
-            workspace.toggle_dock(DockPosition::Left, window, cx);
-            let onboarding_page = Onboarding::new(workspace, cx);
-            workspace.add_item_to_center(Box::new(onboarding_page.clone()), window, cx);
+    telemetry::event!("Onboarding Page Opened");
+    open_new(
+        Default::default(),
+        app_state,
+        cx,
+        |workspace, window, cx| {
+            {
+                workspace.toggle_dock(DockPosition::Left, window, cx);
+                let onboarding_page = Onboarding::new(workspace, cx);
+                workspace.add_item_to_center(Box::new(onboarding_page.clone()), window, cx);
 
-            window.focus(&onboarding_page.focus_handle(cx), cx);
+                window.focus(&onboarding_page.focus_handle(cx), cx);
 
-            cx.notify();
-        };
-        db::write_and_log(cx, || {
-            KEY_VALUE_STORE.write_kvp(FIRST_OPEN.to_string(), "false".to_string())
-        });
-    })
+                cx.notify();
+            };
+            let kvp = KeyValueStore::global(cx);
+            db::write_and_log(cx, move || async move {
+                kvp.write_kvp(FIRST_OPEN.to_string(), "false".to_string())
+                    .await
+            });
+        },
+    )
 }
 
 struct Onboarding {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
+    user_store: Entity<UserStore>,
     scroll_handle: ScrollHandle,
     _settings_subscription: Subscription,
 }
@@ -151,6 +216,42 @@ struct Onboarding {
 impl Onboarding {
     fn new(workspace: &Workspace, cx: &mut App) -> Entity<Self> {
         let font_family_cache = theme::FontFamilyCache::global(cx);
+
+        let installed_agents = cx
+            .global::<SettingsStore>()
+            .get::<AllAgentServersSettings>(None)
+            .clone();
+        let client = Client::global(cx);
+        let status = *client.status().borrow();
+        let plan = workspace.user_store().read(cx).plan();
+        let zed_agent_state = if status.is_signed_out()
+            || matches!(
+                status,
+                client::Status::AuthenticationError | client::Status::ConnectionError
+            ) {
+            "signed_out"
+        } else if status.is_signing_in() {
+            "signing_in"
+        } else {
+            match plan {
+                Some(Plan::ZedPro) => "pro",
+                Some(Plan::ZedProTrial) => "trial",
+                Some(Plan::ZedBusiness) => "business",
+                Some(Plan::ZedVip) => "vip",
+                Some(Plan::ZedStudent) => "student",
+                Some(Plan::ZedFree) | None => "free",
+            }
+        };
+        let agents_installed = basics_page::FEATURED_AGENT_IDS
+            .iter()
+            .filter(|id| installed_agents.contains_key(**id))
+            .copied()
+            .collect::<Vec<_>>();
+        telemetry::event!(
+            "Welcome Agent Setup Viewed",
+            zed_agent = zed_agent_state,
+            agents_installed = agents_installed,
+        );
 
         cx.new(|cx| {
             cx.spawn(async move |this, cx| {
@@ -165,27 +266,43 @@ impl Onboarding {
                 workspace: workspace.weak_handle(),
                 focus_handle: cx.focus_handle(),
                 scroll_handle: ScrollHandle::new(),
-                _settings_subscription: cx.observe_global::<SettingsStore>(move |_, cx| cx.notify()),
+                user_store: workspace.user_store().clone(),
+                _settings_subscription: cx
+                    .observe_global::<SettingsStore>(move |_, cx| cx.notify()),
             }
         })
     }
 
     fn on_finish(_: &Finish, _: &mut Window, cx: &mut App) {
+        telemetry::event!("Finish Setup");
         go_to_welcome_page(cx);
     }
 
+    fn handle_sign_in(&mut self, _: &SignIn, window: &mut Window, cx: &mut Context<Self>) {
+        let client = Client::global(cx);
+        let workspace = self.workspace.clone();
+
+        window
+            .spawn(cx, async move |mut cx| {
+                client
+                    .sign_in_with_optional_connect(true, &cx)
+                    .await
+                    .notify_workspace_async_err(workspace, &mut cx);
+            })
+            .detach();
+    }
+
+    fn handle_open_account(_: &OpenAccount, _: &mut Window, cx: &mut App) {
+        cx.open_url(&zed_urls::account_url(cx))
+    }
+
     fn render_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        crate::basics_page::render_basics_page(cx).into_any_element()
+        crate::basics_page::render_basics_page(&self.user_store, cx).into_any_element()
     }
 }
 
 impl Render for Onboarding {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let image = match cx.theme().appearance {
-            Appearance::Light => VectorName::LogoLight,
-            Appearance::Dark => VectorName::LogoDark,
-        };
-
         div()
             .image_cache(gpui::retain_all("onboarding-page"))
             .key_context({
@@ -198,6 +315,8 @@ impl Render for Onboarding {
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .on_action(Self::on_finish)
+            .on_action(cx.listener(Self::handle_sign_in))
+            .on_action(Self::handle_open_account)
             .on_action(cx.listener(|_, _: &menu::SelectNext, window, cx| {
                 window.focus_next(cx);
                 cx.notify();
@@ -206,54 +325,62 @@ impl Render for Onboarding {
                 window.focus_prev(cx);
                 cx.notify();
             }))
+            .vertical_scrollbar_for(&self.scroll_handle, window, cx)
             .child(
                 div()
-                    .max_w(Rems(48.0))
+                    .id("page-content")
                     .size_full()
-                    .mx_auto()
+                    .overflow_y_scroll()
                     .child(
                         v_flex()
-                            .id("page-content")
-                            .m_auto()
-                            .p_12()
-                            .size_full()
-                            .max_w_full()
                             .min_w_0()
+                            .max_w(rems_from_px(780_f32))
+                            .w_full()
+                            .mx_auto()
+                            .p_12()
                             .gap_6()
-                            .overflow_y_scroll()
                             .child(
                                 h_flex()
                                     .w_full()
                                     .gap_4()
                                     .justify_between()
                                     .child(
-                                        h_flex().gap_4().child(Vector::square(image, rems(6.))).child(
-                                            v_flex().child(Headline::new("Gram").size(HeadlineSize::Large)).child(
-                                                Label::new(r#"What cannot be mended must be transcended."#)
-                                                    .size(LabelSize::Default)
-                                                    .color(Color::Muted)
-                                                    .italic(),
+                                        h_flex()
+                                            .gap_4()
+                                            .child(Vector::square(VectorName::ZedLogo, rems(2.5)))
+                                            .child(
+                                                v_flex()
+                                                    .child(
+                                                        Headline::new("Welcome to Zed")
+                                                            .size(HeadlineSize::Small),
+                                                    )
+                                                    .child(
+                                                        Label::new("The editor for what's next")
+                                                            .color(Color::Muted)
+                                                            .size(LabelSize::Small)
+                                                            .italic(),
+                                                    ),
                                             ),
-                                        ),
                                     )
                                     .child({
                                         Button::new("finish_setup", "Finish Setup")
                                             .style(ButtonStyle::Filled)
                                             .size(ButtonSize::Medium)
-                                            .key_binding(
-                                                KeyBinding::for_action_in(&Finish, &self.focus_handle, cx)
-                                                    .size(TextSize::Small.rems(cx)),
-                                            )
+                                            .width(rems_from_px(200_f32))
+                                            .key_binding(KeyBinding::for_action_in(
+                                                &Finish,
+                                                &self.focus_handle,
+                                                cx,
+                                            ))
                                             .on_click(|_, window, cx| {
                                                 window.dispatch_action(Finish.boxed_clone(), cx);
                                             })
                                     }),
                             )
                             .child(Divider::horizontal().color(ui::DividerColor::BorderVariant))
-                            .child(self.render_page(cx))
-                            .track_scroll(&self.scroll_handle),
+                            .child(self.render_page(cx)),
                     )
-                    .vertical_scrollbar_for(&self.scroll_handle, window, cx),
+                    .track_scroll(&self.scroll_handle),
             )
     }
 }
@@ -273,6 +400,10 @@ impl Item for Onboarding {
         "Onboarding".into()
     }
 
+    fn telemetry_event_text(&self) -> Option<&'static str> {
+        Some("Onboarding Page Opened")
+    }
+
     fn show_toolbar(&self) -> bool {
         false
     }
@@ -289,29 +420,29 @@ impl Item for Onboarding {
     ) -> Task<Option<Entity<Self>>> {
         Task::ready(Some(cx.new(|cx| Onboarding {
             workspace: self.workspace.clone(),
+            user_store: self.user_store.clone(),
             scroll_handle: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             _settings_subscription: cx.observe_global::<SettingsStore>(move |_, cx| cx.notify()),
         })))
     }
 
-    fn to_item_events(event: &Self::Event, mut f: impl FnMut(workspace::item::ItemEvent)) {
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(workspace::item::ItemEvent)) {
         f(*event)
     }
 }
 
 fn go_to_welcome_page(cx: &mut App) {
     with_active_or_new_workspace(cx, |workspace, window, cx| {
-        let Some((onboarding_id, onboarding_idx)) =
-            workspace
-                .active_pane()
-                .read(cx)
-                .items()
-                .enumerate()
-                .find_map(|(idx, item)| {
-                    let _ = item.downcast::<Onboarding>()?;
-                    Some((item.item_id(), idx))
-                })
+        let Some((onboarding_id, onboarding_idx)) = workspace
+            .active_pane()
+            .read(cx)
+            .items()
+            .enumerate()
+            .find_map(|(idx, item)| {
+                let _ = item.downcast::<Onboarding>()?;
+                Some((item.item_id(), idx))
+            })
         else {
             return;
         };
@@ -326,7 +457,9 @@ fn go_to_welcome_page(cx: &mut App) {
             if let Some(idx) = idx {
                 pane.activate_item(idx, true, true, window, cx);
             } else {
-                let item = Box::new(cx.new(|cx| WelcomePage::new(workspace.weak_handle(), window, cx)));
+                let item = Box::new(
+                    cx.new(|cx| WelcomePage::new(workspace.weak_handle(), false, window, cx)),
+                );
                 pane.add_item(item, true, true, Some(onboarding_idx), window, cx);
             }
 
@@ -344,19 +477,20 @@ pub async fn handle_import_vscode_settings(
 ) {
     use util::truncate_and_remove_front;
 
-    let vscode_settings = match settings::VsCodeSettings::load_user_settings(source, fs.clone()).await {
-        Ok(vscode_settings) => vscode_settings,
-        Err(err) => {
-            zlog::error!("{err:?}");
-            let _ = cx.prompt(
-                gpui::PromptLevel::Info,
-                &format!("Could not find or load a {source} settings file"),
-                None,
-                &["Ok"],
-            );
-            return;
-        }
-    };
+    let vscode_settings =
+        match settings::VsCodeSettings::load_user_settings(source, fs.clone()).await {
+            Ok(vscode_settings) => vscode_settings,
+            Err(err) => {
+                zlog::error!("{err:?}");
+                let _ = cx.prompt(
+                    gpui::PromptLevel::Info,
+                    &format!("Could not find or load a {source} settings file"),
+                    None,
+                    &["OK"],
+                );
+                return;
+            }
+        };
 
     if !skip_prompt {
         let prompt = cx.prompt(
@@ -368,7 +502,7 @@ pub async fn handle_import_vscode_settings(
                 truncate_and_remove_front(&vscode_settings.path.to_string_lossy(), 128),
             ),
             None,
-            &["Ok", "Cancel"],
+            &["Import", "Cancel"],
         );
         let result = cx.spawn(async move |_| prompt.await.ok()).await;
         if result != Some(0) {
@@ -379,7 +513,9 @@ pub async fn handle_import_vscode_settings(
     let Ok(result_channel) = cx.update(|_, cx| {
         let source = vscode_settings.source;
         let path = vscode_settings.path.clone();
-        let result_channel = cx.global::<SettingsStore>().import_vscode_settings(fs, vscode_settings);
+        let result_channel = cx
+            .global::<SettingsStore>()
+            .import_vscode_settings(fs, vscode_settings);
         zlog::info!("Imported {source} settings from {}", path.display());
         result_channel
     }) else {
@@ -394,8 +530,12 @@ pub async fn handle_import_vscode_settings(
                     format!("Your {} settings were successfully imported.", source),
                     cx,
                     |this, _| {
-                        this.icon(ToastIcon::new(IconName::Check).color(Color::Success))
-                            .dismiss_button(true)
+                        this.icon(
+                            Icon::new(IconName::Check)
+                                .size(IconSize::Small)
+                                .color(Color::Success),
+                        )
+                        .dismiss_button(true)
                     },
                 );
                 SettingsImportState::update(cx, |state, _| match source {
@@ -409,13 +549,21 @@ pub async fn handle_import_vscode_settings(
                 workspace.toggle_status_toast(confirmation_toast, cx);
             }
             Err(_) => {
-                let error_toast = StatusToast::new("Failed to import settings. See log for details", cx, |this, _| {
-                    this.icon(ToastIcon::new(IconName::Close).color(Color::Error))
+                let error_toast = StatusToast::new(
+                    "Failed to import settings. See log for details",
+                    cx,
+                    |this, _| {
+                        this.icon(
+                            Icon::new(IconName::Close)
+                                .size(IconSize::Small)
+                                .color(Color::Error),
+                        )
                         .action("Open Log", |window, cx| {
                             window.dispatch_action(workspace::OpenLog.boxed_clone(), cx)
                         })
                         .dismiss_button(true)
-                });
+                    },
+                );
                 workspace.toggle_status_toast(error_toast, cx);
             }
         })
@@ -454,7 +602,7 @@ impl workspace::SerializableItem for Onboarding {
             alive_items,
             workspace_id,
             "onboarding_pages",
-            &persistence::ONBOARDING_PAGES,
+            &persistence::OnboardingPagesDb::global(cx),
             cx,
         )
     }
@@ -467,8 +615,9 @@ impl workspace::SerializableItem for Onboarding {
         window: &mut Window,
         cx: &mut App,
     ) -> gpui::Task<gpui::Result<Entity<Self>>> {
+        let db = persistence::OnboardingPagesDb::global(cx);
         window.spawn(cx, async move |cx| {
-            if let Some(_) = persistence::ONBOARDING_PAGES.get_onboarding_page(item_id, workspace_id)? {
+            if let Some(_) = db.get_onboarding_page(item_id, workspace_id)? {
                 workspace.update(cx, |workspace, cx| Onboarding::new(workspace, cx))
             } else {
                 Err(anyhow::anyhow!("No onboarding page to deserialize"))
@@ -481,16 +630,16 @@ impl workspace::SerializableItem for Onboarding {
         workspace: &mut Workspace,
         item_id: workspace::ItemId,
         _closing: bool,
-        _window: &mut Window,
         cx: &mut ui::Context<Self>,
     ) -> Option<gpui::Task<gpui::Result<()>>> {
         let workspace_id = workspace.database_id()?;
 
-        Some(cx.background_spawn(async move {
-            persistence::ONBOARDING_PAGES
-                .save_onboarding_page(item_id, workspace_id)
-                .await
-        }))
+        let db = persistence::OnboardingPagesDb::global(cx);
+        Some(
+            cx.background_spawn(
+                async move { db.save_onboarding_page(item_id, workspace_id).await },
+            ),
+        )
     }
 
     fn should_serialize(&self, event: &Self::Event) -> bool {
@@ -539,7 +688,7 @@ mod persistence {
         ];
     }
 
-    db::static_connection!(ONBOARDING_PAGES, OnboardingPagesDb, [WorkspaceDb]);
+    db::static_connection!(OnboardingPagesDb, [WorkspaceDb]);
 
     impl OnboardingPagesDb {
         query! {

@@ -63,13 +63,15 @@ impl FontFamilyCache {
 
     /// Prefetch all font names in the background
     pub async fn prefetch(&self, cx: &gpui::AsyncApp) {
-        if self.state.try_read().is_none_or(|state| state.loaded_at.is_some()) {
+        if self
+            .state
+            .try_read()
+            .is_none_or(|state| state.loaded_at.is_some())
+        {
             return;
         }
 
-        let Ok(text_system) = cx.update(|cx| App::text_system(cx).clone()) else {
-            return;
-        };
+        let text_system = cx.update(|cx| App::text_system(cx).clone());
 
         let state = self.state.clone();
 

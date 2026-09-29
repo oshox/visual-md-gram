@@ -8,7 +8,6 @@ use picker::{Picker, PickerDelegate};
 use project::Project;
 use std::sync::Arc;
 use ui::{ListItem, ListItemSpacing, prelude::*};
-use util::ResultExt;
 use workspace::ModalView;
 
 actions!(
@@ -40,7 +39,7 @@ impl LineEndingSelector {
     fn toggle(editor: &WeakEntity<Editor>, window: &mut Window, cx: &mut App) {
         let Some((workspace, buffer)) = editor
             .update(cx, |editor, cx| {
-                Some((editor.workspace()?, editor.active_excerpt(cx)?.1))
+                Some((editor.workspace()?, editor.active_buffer(cx)?))
             })
             .ok()
             .flatten()
@@ -56,9 +55,15 @@ impl LineEndingSelector {
         })
     }
 
-    fn new(buffer: Entity<Buffer>, project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        buffer: Entity<Buffer>,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let line_ending = buffer.read(cx).line_ending();
-        let delegate = LineEndingSelectorDelegate::new(cx.entity().downgrade(), buffer, project, line_ending);
+        let delegate =
+            LineEndingSelectorDelegate::new(cx.entity().downgrade(), buffer, project, line_ending);
         let picker = cx.new(|cx| Picker::nonsearchable_uniform_list(delegate, window, cx));
         Self { picker }
     }
@@ -66,7 +71,7 @@ impl LineEndingSelector {
 
 impl Render for LineEndingSelector {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().w(rems(34.)).child(self.picker.clone())
+        v_flex().child(self.picker.clone())
     }
 }
 
@@ -109,6 +114,10 @@ impl LineEndingSelectorDelegate {
 impl PickerDelegate for LineEndingSelectorDelegate {
     type ListItem = ListItem;
 
+    fn name() -> &'static str {
+        "line ending selector"
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
         "Select a line ending…".into()
     }
@@ -136,14 +145,19 @@ impl PickerDelegate for LineEndingSelectorDelegate {
     fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
         self.line_ending_selector
             .update(cx, |_, cx| cx.emit(DismissEvent))
-            .log_err();
+            .ok();
     }
 
     fn selected_index(&self) -> usize {
         self.selected_index
     }
 
-    fn set_selected_index(&mut self, ix: usize, _window: &mut Window, _: &mut Context<Picker<Self>>) {
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _: &mut Context<Picker<Self>>,
+    ) {
         self.selected_index = ix;
     }
 

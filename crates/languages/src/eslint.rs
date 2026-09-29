@@ -8,13 +8,16 @@ use http_client::{
 use language::{LspAdapter, LspAdapterDelegate, LspInstaller, Toolchain};
 use lsp::{CodeActionKind, LanguageServerBinary, LanguageServerName, Uri};
 use node_runtime::{NodeRuntime, read_package_installed_version};
-use project::{Fs, lsp_store::language_server_settings_for};
+use project::Fs;
+use project::lsp_store::language_server_settings_for;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use settings::SettingsLocation;
 use smol::{fs, stream::StreamExt};
 use std::{
     ffi::OsString,
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -22,7 +25,11 @@ use util::merge_json_value_into;
 use util::{fs::remove_matching, rel_path::RelPath};
 
 fn eslint_server_binary_arguments(server_path: &Path) -> Vec<OsString> {
-    vec!["--max-old-space-size=8192".into(), server_path.into(), "--stdio".into()]
+    vec![
+        "--max-old-space-size=8192".into(),
+        server_path.into(),
+        "--stdio".into(),
+    ]
 }
 
 pub struct EsLintLspAdapter {
@@ -74,31 +81,9 @@ impl EsLintLspAdapter {
 impl LspInstaller for EsLintLspAdapter {
     type BinaryVersion = GitHubLspBinaryVersion;
 
-    async fn check_if_user_installed(
-        &self,
-        delegate: &dyn LspAdapterDelegate,
-        _: Option<Toolchain>,
-        _: &AsyncApp,
-    ) -> Option<LanguageServerBinary> {
-        let mut path = delegate.which("eslint-language-server".as_ref()).await;
-        if path.is_none() {
-            path = delegate.which("vscode-eslint-language-server".as_ref()).await;
-        }
-
-        if let Some(path) = path {
-            Some(LanguageServerBinary {
-                path: path,
-                env: None,
-                arguments: vec!["--stdio".into()],
-            })
-        } else {
-            None
-        }
-    }
-
     async fn fetch_latest_server_version(
         &self,
-        _delegate: &dyn LspAdapterDelegate,
+        _delegate: &Arc<dyn LspAdapterDelegate>,
         _: bool,
         _: &mut AsyncApp,
     ) -> Result<GitHubLspBinaryVersion> {
@@ -115,58 +100,63 @@ impl LspInstaller for EsLintLspAdapter {
         })
     }
 
-    async fn fetch_server_binary(
+    fn fetch_server_binary(
         &self,
         version: GitHubLspBinaryVersion,
         container_dir: PathBuf,
-        delegate: &dyn LspAdapterDelegate,
-    ) -> Result<LanguageServerBinary> {
-        let destination_path = Self::build_destination_path(&container_dir);
-        let server_path = destination_path.join(Self::SERVER_PATH);
+        delegate: &Arc<dyn LspAdapterDelegate>,
+    ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+        let delegate = delegate.clone();
+        let node = self.node.clone();
 
-        if fs::metadata(&server_path).await.is_err() {
-            remove_matching(&container_dir, |_| true).await;
+        async move {
+            let destination_path = Self::build_destination_path(&container_dir);
+            let server_path = destination_path.join(Self::SERVER_PATH);
 
-            download_server_binary(
-                &*delegate.http_client(),
-                &version.url,
-                None,
-                &destination_path,
-                Self::GITHUB_ASSET_KIND,
-            )
-            .await?;
+            if fs::metadata(&server_path).await.is_err() {
+                remove_matching(&container_dir, |_| true).await;
 
-            let mut dir = fs::read_dir(&destination_path).await?;
-            let first = dir.next().await.context("missing first file")??;
-            let repo_root = destination_path.join("vscode-eslint");
-            fs::rename(first.path(), &repo_root).await?;
-
-            #[cfg(target_os = "windows")]
-            {
-                handle_symlink(
-                    repo_root.join("$shared"),
-                    repo_root.join("client").join("src").join("shared"),
+                download_server_binary(
+                    &*delegate.http_client(),
+                    &version.url,
+                    None,
+                    &destination_path,
+                    Self::GITHUB_ASSET_KIND,
                 )
                 .await?;
-                handle_symlink(
-                    repo_root.join("$shared"),
-                    repo_root.join("server").join("src").join("shared"),
-                )
-                .await?;
+
+                let mut dir = fs::read_dir(&destination_path).await?;
+                let first = dir.next().await.context("missing first file")??;
+                let repo_root = destination_path.join("vscode-eslint");
+                fs::rename(first.path(), &repo_root).await?;
+
+                #[cfg(target_os = "windows")]
+                {
+                    handle_symlink(
+                        repo_root.join("$shared"),
+                        repo_root.join("client").join("src").join("shared"),
+                    )
+                    .await?;
+                    handle_symlink(
+                        repo_root.join("$shared"),
+                        repo_root.join("server").join("src").join("shared"),
+                    )
+                    .await?;
+                }
+
+                node.run_npm_subcommand(Some(&repo_root), "install", &[])
+                    .await?;
+
+                node.run_npm_subcommand(Some(&repo_root), "run-script", &["compile"])
+                    .await?;
             }
 
-            self.node.run_npm_subcommand(&repo_root, "install", &[]).await?;
-
-            self.node
-                .run_npm_subcommand(&repo_root, "run-script", &["compile"])
-                .await?;
+            Ok(LanguageServerBinary {
+                path: node.binary_path().await?,
+                env: None,
+                arguments: eslint_server_binary_arguments(&server_path),
+            })
         }
-
-        Ok(LanguageServerBinary {
-            path: self.node.binary_path().await?,
-            env: None,
-            arguments: eslint_server_binary_arguments(&server_path),
-        })
     }
 
     async fn cached_server_binary(
@@ -174,10 +164,9 @@ impl LspInstaller for EsLintLspAdapter {
         container_dir: PathBuf,
         _: &dyn LspAdapterDelegate,
     ) -> Option<LanguageServerBinary> {
-        let server_path = Self::build_destination_path(&container_dir).join(EsLintLspAdapter::SERVER_PATH);
-        if !server_path.is_file() {
-            return None;
-        }
+        let server_path =
+            Self::build_destination_path(&container_dir).join(EsLintLspAdapter::SERVER_PATH);
+        fs::metadata(&server_path).await.ok()?;
         Some(LanguageServerBinary {
             path: self.node.binary_path().await.ok()?,
             env: None,
@@ -213,7 +202,10 @@ impl EslintSettingsOverrides {
                 .entry("experimental")
                 .or_insert_with(|| json!({}));
             if let Some(experimental) = experimental.as_object_mut() {
-                experimental.insert("useFlatConfig".to_string(), json!(experimental_use_flat_config));
+                experimental.insert(
+                    "useFlatConfig".to_string(),
+                    json!(experimental_use_flat_config),
+                );
             }
         }
     }
@@ -236,14 +228,17 @@ impl LspAdapter for EsLintLspAdapter {
         cx: &mut AsyncApp,
     ) -> Result<Value> {
         let worktree_root = delegate.worktree_root_path();
-
         let requested_file_path = requested_uri
             .as_ref()
             .filter(|uri| uri.scheme() == "file")
             .and_then(|uri| uri.to_file_path().ok())
             .filter(|path| path.starts_with(worktree_root));
-        let eslint_version =
-            find_eslint_version(delegate.as_ref(), worktree_root, requested_file_path.as_deref()).await?;
+        let eslint_version = find_eslint_version(
+            delegate.as_ref(),
+            worktree_root,
+            requested_file_path.as_deref(),
+        )
+        .await?;
         let config_kind = find_eslint_config_kind(
             worktree_root,
             requested_file_path.as_deref(),
@@ -251,7 +246,8 @@ impl LspAdapter for EsLintLspAdapter {
             self.fs.as_ref(),
         )
         .await;
-        let eslint_settings_overrides = eslint_settings_overrides_for(eslint_version.as_ref(), config_kind);
+        let eslint_settings_overrides =
+            eslint_settings_overrides_for(eslint_version.as_ref(), config_kind);
 
         let mut default_workspace_configuration = json!({
             "validate": "on",
@@ -262,7 +258,9 @@ impl LspAdapter for EsLintLspAdapter {
                 "mode": "auto"
             },
             "workspaceFolder": {
-                "uri": worktree_root,
+                "uri": Uri::from_file_path(worktree_root)
+                    .map(|uri| uri.as_str().to_owned())
+                    .unwrap_or_default(),
                 "name": worktree_root.file_name()
                     .unwrap_or(worktree_root.as_os_str())
                     .to_string_lossy(),
@@ -270,7 +268,7 @@ impl LspAdapter for EsLintLspAdapter {
             "problems": {},
             "codeActionOnSave": {
                 // We enable this, but without also configuring code_actions_on_format
-                // in the Gram configuration, it doesn't have an effect.
+                // in the Zed configuration, it doesn't have an effect.
                 "enable": true,
             },
             "codeAction": {
@@ -281,12 +279,14 @@ impl LspAdapter for EsLintLspAdapter {
                 "showDocumentation": {
                     "enable": true
                 }
-            },
+            }
         });
         eslint_settings_overrides.apply_to(&mut default_workspace_configuration);
 
         let file_path = requested_file_path
-            .and_then(|p| RelPath::unix(&p).ok().map(ToOwned::to_owned))
+            .as_ref()
+            .and_then(|abs_path| abs_path.strip_prefix(worktree_root).ok())
+            .and_then(|p| RelPath::from_unix_str(&p).ok().map(ToOwned::to_owned))
             .unwrap_or_else(|| RelPath::empty().to_owned());
         let override_options = cx.update(|cx| {
             language_server_settings_for(
@@ -298,7 +298,7 @@ impl LspAdapter for EsLintLspAdapter {
                 cx,
             )
             .and_then(|s| s.settings.clone())
-        })?;
+        });
 
         if let Some(override_options) = override_options {
             let working_directories = override_options.get("workingDirectories").and_then(|wd| {
@@ -311,7 +311,9 @@ impl LspAdapter for EsLintLspAdapter {
 
             let working_directory = working_directories
                 .zip(requested_uri)
-                .and_then(|(wd, uri)| determine_working_directory(uri, wd, worktree_root.to_owned()));
+                .and_then(|(wd, uri)| {
+                    determine_working_directory(uri, wd, worktree_root.to_owned())
+                });
 
             if let Some(working_directory) = working_directory
                 && let Some(wd) = default_workspace_configuration.get_mut("workingDirectory")
@@ -339,29 +341,29 @@ fn ancestor_directories<'a>(
         .and_then(Path::parent)
         .unwrap_or(worktree_root);
 
-    start.ancestors().take_while(move |dir| dir.starts_with(worktree_root))
+    start
+        .ancestors()
+        .take_while(move |dir| dir.starts_with(worktree_root))
 }
 
-fn flat_config_file_names(version: Option<&String>) -> &'static [&'static str] {
-    if let Some(version) = version
-        && let Ok(version) = semver::Version::parse(version.trim().trim_start_matches('v'))
-    {
-        match version {
-            version if version.major >= 10 => EsLintLspAdapter::FLAT_CONFIG_FILE_NAMES_V10,
-            version if version.major == 9 => EsLintLspAdapter::FLAT_CONFIG_FILE_NAMES_V8_57,
-            version if version.major == 8 && version.minor >= 57 => EsLintLspAdapter::FLAT_CONFIG_FILE_NAMES_V8_57,
-            version if version.major == 8 && version.minor >= 21 => EsLintLspAdapter::FLAT_CONFIG_FILE_NAMES_V8_21,
-            _ => &[],
+fn flat_config_file_names(version: Option<&Version>) -> &'static [&'static str] {
+    match version {
+        Some(version) if version.major >= 10 => EsLintLspAdapter::FLAT_CONFIG_FILE_NAMES_V10,
+        Some(version) if version.major == 9 => EsLintLspAdapter::FLAT_CONFIG_FILE_NAMES_V8_57,
+        Some(version) if version.major == 8 && version.minor >= 57 => {
+            EsLintLspAdapter::FLAT_CONFIG_FILE_NAMES_V8_57
         }
-    } else {
-        &[]
+        Some(version) if version.major == 8 && version.minor >= 21 => {
+            EsLintLspAdapter::FLAT_CONFIG_FILE_NAMES_V8_21
+        }
+        _ => &[],
     }
 }
 
 async fn find_eslint_config_kind(
     worktree_root: &Path,
     requested_file: Option<&Path>,
-    version: Option<&String>,
+    version: Option<&Version>,
     fs: &dyn Fs,
 ) -> Option<EslintConfigKind> {
     let flat_config_file_names = flat_config_file_names(version);
@@ -384,11 +386,11 @@ async fn find_eslint_config_kind(
 }
 
 fn eslint_settings_overrides_for(
-    version: Option<&String>,
+    version: Option<&Version>,
     config_kind: Option<EslintConfigKind>,
 ) -> EslintSettingsOverrides {
     // vscode-eslint 3.x already discovers config files and chooses a working
-    // directory from the active file on its own. Only override settings
+    // directory from the active file on its own. Zed only overrides settings
     // for the two cases where leaving everything unset is known to be wrong:
     //
     // - ESLint 8.21-8.56 flat config still needs experimental.useFlatConfig.
@@ -398,22 +400,19 @@ fn eslint_settings_overrides_for(
     let Some(version) = version else {
         return EslintSettingsOverrides::default();
     };
-    if let Ok(sver) = semver::Version::parse(version.trim().trim_start_matches('v')) {
-        match config_kind {
-            Some(EslintConfigKind::Flat) if sver.major == 8 && (21..57).contains(&sver.minor) => {
-                EslintSettingsOverrides {
-                    use_flat_config: None,
-                    experimental_use_flat_config: Some(true),
-                }
+
+    match config_kind {
+        Some(EslintConfigKind::Flat) if version.major == 8 && (21..57).contains(&version.minor) => {
+            EslintSettingsOverrides {
+                use_flat_config: None,
+                experimental_use_flat_config: Some(true),
             }
-            Some(EslintConfigKind::Legacy) if sver.major == 9 => EslintSettingsOverrides {
-                use_flat_config: Some(false),
-                experimental_use_flat_config: None,
-            },
-            _ => EslintSettingsOverrides::default(),
         }
-    } else {
-        EslintSettingsOverrides::default()
+        Some(EslintConfigKind::Legacy) if version.major == 9 => EslintSettingsOverrides {
+            use_flat_config: Some(false),
+            experimental_use_flat_config: None,
+        },
+        _ => EslintSettingsOverrides::default(),
     }
 }
 
@@ -421,9 +420,11 @@ async fn find_eslint_version(
     delegate: &dyn LspAdapterDelegate,
     worktree_root: &Path,
     requested_file: Option<&Path>,
-) -> Result<Option<String>> {
+) -> Result<Option<Version>> {
     for directory in ancestor_directories(worktree_root, requested_file) {
-        if let Some(version) = read_package_installed_version(directory.join("node_modules"), "eslint").await? {
+        if let Some(version) =
+            read_package_installed_version(directory.join("node_modules"), "eslint").await?
+        {
             return Ok(Some(version));
         }
     }
@@ -486,11 +487,16 @@ fn determine_working_directory(
 
         let mut item_value: Option<String> = None;
         if directory.is_some() || pattern.is_some() {
-            let file_path: Option<PathBuf> = (uri.scheme() == "file").then(|| uri.to_file_path().ok()).flatten();
+            let file_path: Option<PathBuf> = (uri.scheme() == "file")
+                .then(|| uri.to_file_path().ok())
+                .flatten();
             if let Some(file_path) = file_path {
                 if let Some(mut directory) = directory {
                     if Path::new(&directory).is_relative() {
-                        directory = workspace_folder_path.join(directory).to_string_lossy().to_string();
+                        directory = workspace_folder_path
+                            .join(directory)
+                            .to_string_lossy()
+                            .to_string();
                     }
                     if !directory.ends_with(std::path::MAIN_SEPARATOR) {
                         directory.push(std::path::MAIN_SEPARATOR);
@@ -502,7 +508,10 @@ fn determine_working_directory(
                     && !pattern.is_empty()
                 {
                     if Path::new(&pattern).is_relative() {
-                        pattern = workspace_folder_path.join(pattern).to_string_lossy().to_string();
+                        pattern = workspace_folder_path
+                            .join(pattern)
+                            .to_string_lossy()
+                            .to_string();
                     }
                     if !pattern.ends_with(std::path::MAIN_SEPARATOR) {
                         pattern.push(std::path::MAIN_SEPARATOR);
@@ -650,9 +659,14 @@ mod tests {
         #[test]
         fn test_match_glob_pattern_globstar() {
             let pattern = unix_path_to_platform("/workspace/**/src/");
-            let file_path = PathBuf::from(unix_path_to_platform("/workspace/packages/core/src/index.ts"));
+            let file_path = PathBuf::from(unix_path_to_platform(
+                "/workspace/packages/core/src/index.ts",
+            ));
             let matched = match_glob_pattern(&pattern, &file_path);
-            assert_eq!(matched, Some(unix_path_to_platform("/workspace/packages/core/src/")));
+            assert_eq!(
+                matched,
+                Some(unix_path_to_platform("/workspace/packages/core/src/"))
+            );
         }
 
         #[test]
@@ -674,7 +688,11 @@ mod tests {
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/packages/foo/"), false);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/packages/foo/"),
+                false,
+            );
         }
 
         #[test]
@@ -686,7 +704,11 @@ mod tests {
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/packages/foo/"), false);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/packages/foo/"),
+                false,
+            );
         }
 
         #[test]
@@ -699,20 +721,29 @@ mod tests {
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/packages/foo/"), true);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/packages/foo/"),
+                true,
+            );
         }
 
         #[test]
         fn test_working_directory_legacy_item() {
             let uri = make_uri("/workspace/packages/foo/src/file.ts");
-            let working_directories = vec![WorkingDirectory::LegacyDirectoryItem(LegacyDirectoryItem {
-                directory: "packages/foo".to_string(),
-                change_process_cwd: false,
-            })];
+            let working_directories =
+                vec![WorkingDirectory::LegacyDirectoryItem(LegacyDirectoryItem {
+                    directory: "packages/foo".to_string(),
+                    change_process_cwd: false,
+                })];
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/packages/foo/"), true);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/packages/foo/"),
+                true,
+            );
         }
 
         #[test]
@@ -725,7 +756,11 @@ mod tests {
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/packages/foo/"), false);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/packages/foo/"),
+                false,
+            );
         }
 
         #[test]
@@ -744,7 +779,222 @@ mod tests {
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/apps/web/"), false);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/apps/web/"),
+                false,
+            );
+        }
+    }
+
+    mod eslint_settings {
+        use super::*;
+        use ::fs::FakeFs;
+        use gpui::TestAppContext;
+
+        #[test]
+        fn test_ancestor_directories_for_package_local_file() {
+            let worktree_root = PathBuf::from(unix_path_to_platform("/workspace"));
+            let requested_file = PathBuf::from(unix_path_to_platform(
+                "/workspace/packages/web/src/index.js",
+            ));
+
+            let directories: Vec<&Path> =
+                ancestor_directories(&worktree_root, Some(&requested_file)).collect();
+
+            assert_eq!(
+                directories,
+                vec![
+                    Path::new(&unix_path_to_platform("/workspace/packages/web/src")),
+                    Path::new(&unix_path_to_platform("/workspace/packages/web")),
+                    Path::new(&unix_path_to_platform("/workspace/packages")),
+                    Path::new(&unix_path_to_platform("/workspace")),
+                ]
+            );
+        }
+
+        #[test]
+        fn test_eslint_8_flat_root_repo_uses_experimental_flag() {
+            let version = Version::parse("8.56.0").expect("valid ESLint version");
+            let settings =
+                eslint_settings_overrides_for(Some(&version), Some(EslintConfigKind::Flat));
+
+            assert_eq!(
+                settings,
+                EslintSettingsOverrides {
+                    use_flat_config: None,
+                    experimental_use_flat_config: Some(true),
+                }
+            );
+        }
+
+        #[test]
+        fn test_eslint_8_57_flat_repo_uses_no_override() {
+            let version = Version::parse("8.57.0").expect("valid ESLint version");
+            let settings =
+                eslint_settings_overrides_for(Some(&version), Some(EslintConfigKind::Flat));
+
+            assert_eq!(settings, EslintSettingsOverrides::default());
+        }
+
+        #[test]
+        fn test_eslint_9_legacy_repo_uses_use_flat_config_false() {
+            let version = Version::parse("9.0.0").expect("valid ESLint version");
+            let settings =
+                eslint_settings_overrides_for(Some(&version), Some(EslintConfigKind::Legacy));
+
+            assert_eq!(
+                settings,
+                EslintSettingsOverrides {
+                    use_flat_config: Some(false),
+                    experimental_use_flat_config: None,
+                }
+            );
+        }
+
+        #[test]
+        fn test_eslint_10_repo_uses_no_override() {
+            let version = Version::parse("10.0.0").expect("valid ESLint version");
+            let settings =
+                eslint_settings_overrides_for(Some(&version), Some(EslintConfigKind::Flat));
+
+            assert_eq!(settings, EslintSettingsOverrides::default());
+        }
+
+        #[gpui::test]
+        async fn test_eslint_8_56_does_not_treat_cjs_as_flat_config(cx: &mut TestAppContext) {
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                unix_path_to_platform("/workspace"),
+                json!({ "eslint.config.cjs": "" }),
+            )
+            .await;
+            let worktree_root = PathBuf::from(unix_path_to_platform("/workspace"));
+            let requested_file = PathBuf::from(unix_path_to_platform("/workspace/src/index.js"));
+            let version = Version::parse("8.56.0").expect("valid ESLint version");
+
+            let config_kind = find_eslint_config_kind(
+                &worktree_root,
+                Some(&requested_file),
+                Some(&version),
+                fs.as_ref(),
+            )
+            .await;
+
+            assert_eq!(config_kind, None);
+        }
+
+        #[gpui::test]
+        async fn test_eslint_8_57_treats_cjs_as_flat_config(cx: &mut TestAppContext) {
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                unix_path_to_platform("/workspace"),
+                json!({ "eslint.config.cjs": "" }),
+            )
+            .await;
+            let worktree_root = PathBuf::from(unix_path_to_platform("/workspace"));
+            let requested_file = PathBuf::from(unix_path_to_platform("/workspace/src/index.js"));
+            let version = Version::parse("8.57.0").expect("valid ESLint version");
+
+            let config_kind = find_eslint_config_kind(
+                &worktree_root,
+                Some(&requested_file),
+                Some(&version),
+                fs.as_ref(),
+            )
+            .await;
+
+            assert_eq!(config_kind, Some(EslintConfigKind::Flat));
+        }
+
+        #[gpui::test]
+        async fn test_eslint_10_treats_typescript_config_as_flat_config(cx: &mut TestAppContext) {
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                unix_path_to_platform("/workspace"),
+                json!({ "eslint.config.ts": "" }),
+            )
+            .await;
+            let worktree_root = PathBuf::from(unix_path_to_platform("/workspace"));
+            let requested_file = PathBuf::from(unix_path_to_platform("/workspace/src/index.js"));
+            let version = Version::parse("10.0.0").expect("valid ESLint version");
+
+            let config_kind = find_eslint_config_kind(
+                &worktree_root,
+                Some(&requested_file),
+                Some(&version),
+                fs.as_ref(),
+            )
+            .await;
+
+            assert_eq!(config_kind, Some(EslintConfigKind::Flat));
+        }
+
+        #[gpui::test]
+        async fn test_package_local_flat_config_is_preferred_for_monorepo_file(
+            cx: &mut TestAppContext,
+        ) {
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                unix_path_to_platform("/workspace"),
+                json!({
+                    "eslint.config.js": "",
+                    "packages": {
+                        "web": {
+                            "eslint.config.js": ""
+                        }
+                    }
+                }),
+            )
+            .await;
+            let worktree_root = PathBuf::from(unix_path_to_platform("/workspace"));
+            let requested_file = PathBuf::from(unix_path_to_platform(
+                "/workspace/packages/web/src/index.js",
+            ));
+            let version = Version::parse("8.56.0").expect("valid ESLint version");
+
+            let config_kind = find_eslint_config_kind(
+                &worktree_root,
+                Some(&requested_file),
+                Some(&version),
+                fs.as_ref(),
+            )
+            .await;
+
+            assert_eq!(config_kind, Some(EslintConfigKind::Flat));
+        }
+
+        #[gpui::test]
+        async fn test_package_local_legacy_config_is_detected_for_eslint_9(
+            cx: &mut TestAppContext,
+        ) {
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(
+                unix_path_to_platform("/workspace"),
+                json!({
+                    "packages": {
+                        "web": {
+                            ".eslintrc.cjs": ""
+                        }
+                    }
+                }),
+            )
+            .await;
+            let worktree_root = PathBuf::from(unix_path_to_platform("/workspace"));
+            let requested_file = PathBuf::from(unix_path_to_platform(
+                "/workspace/packages/web/src/index.js",
+            ));
+            let version = Version::parse("9.0.0").expect("valid ESLint version");
+
+            let config_kind = find_eslint_config_kind(
+                &worktree_root,
+                Some(&requested_file),
+                Some(&version),
+                fs.as_ref(),
+            )
+            .await;
+
+            assert_eq!(config_kind, Some(EslintConfigKind::Legacy));
         }
     }
 
@@ -759,7 +1009,11 @@ mod tests {
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/packages/foo/"), false);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/packages/foo/"),
+                false,
+            );
         }
 
         #[test]
@@ -771,7 +1025,11 @@ mod tests {
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/packages/foo/"), false);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/packages/foo/"),
+                false,
+            );
         }
 
         #[test]
@@ -784,20 +1042,29 @@ mod tests {
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/packages/foo/"), true);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/packages/foo/"),
+                true,
+            );
         }
 
         #[test]
         fn test_working_directory_legacy_item() {
             let uri = make_uri("/workspace/packages/foo/src/file.ts");
-            let working_directories = vec![WorkingDirectory::LegacyDirectoryItem(LegacyDirectoryItem {
-                directory: "packages\\foo".to_string(),
-                change_process_cwd: false,
-            })];
+            let working_directories =
+                vec![WorkingDirectory::LegacyDirectoryItem(LegacyDirectoryItem {
+                    directory: "packages\\foo".to_string(),
+                    change_process_cwd: false,
+                })];
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/packages/foo/"), true);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/packages/foo/"),
+                true,
+            );
         }
 
         #[test]
@@ -810,7 +1077,11 @@ mod tests {
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/packages/foo/"), false);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/packages/foo/"),
+                false,
+            );
         }
 
         #[test]
@@ -829,7 +1100,11 @@ mod tests {
             let workspace_folder = PathBuf::from(unix_path_to_platform("/workspace"));
 
             let result = determine_working_directory(uri, working_directories, workspace_folder);
-            assert_directory_result(result, &unix_path_to_platform("/workspace/apps/web/"), false);
+            assert_directory_result(
+                result,
+                &unix_path_to_platform("/workspace/apps/web/"),
+                false,
+            );
         }
     }
 

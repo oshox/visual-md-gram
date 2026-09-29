@@ -2,15 +2,18 @@ use std::{
     hash::{Hash, Hasher},
     iter, mem,
     ops::Range,
+    sync::LazyLock,
 };
 
 use crate::{
-    AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners, CornersRefinement,
-    CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font, FontFallbacks, FontFeatures, FontStyle,
-    FontWeight, GridLocation, Hsla, Length, Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement,
-    Styled, TextRun, Window, black, phi, point, quad, rems, size,
+    AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
+    CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
+    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
+    point, px, quad, rems, size,
 };
 use collections::HashSet;
+use parking_lot::Mutex;
 use refineable::Refineable;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -40,7 +43,11 @@ pub enum ObjectFit {
 
 impl ObjectFit {
     /// Get the bounds of the image within the given bounds.
-    pub fn get_bounds(&self, bounds: Bounds<Pixels>, image_size: Size<DevicePixels>) -> Bounds<Pixels> {
+    pub fn get_bounds(
+        &self,
+        bounds: Bounds<Pixels>,
+        image_size: Size<DevicePixels>,
+    ) -> Bounds<Pixels> {
         let image_size = image_size.map(|dimension| Pixels::from(u32::from(dimension)));
         let image_ratio = image_size.width / image_size.height;
         let bounds_ratio = bounds.size.width / bounds.size.height;
@@ -134,26 +141,39 @@ impl ObjectFit {
 }
 
 /// The minimum size of a column or row in a grid layout
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, JsonSchema, Serialize, Deserialize)]
-pub enum TemplateColumnMinSize {
-    /// The column size may be 0
+#[derive(
+    Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, JsonSchema, Serialize, Deserialize,
+)]
+pub enum GridTemplateMinSize {
+    /// The column or row size may be 0
     #[default]
     Zero,
-    /// The column size can be determined by the min content
+    /// The column or row size can be determined by the min content
     MinContent,
-    /// The column size can be determined by the max content
+    /// The column or row size can be determined by the max content
     MaxContent,
 }
 
 /// A simplified representation of the grid-template-* value
 #[derive(
-    Copy, Clone, Refineable, PartialEq, Eq, PartialOrd, Ord, Debug, Default, JsonSchema, Serialize, Deserialize,
+    Copy,
+    Clone,
+    Refineable,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Debug,
+    Default,
+    JsonSchema,
+    Serialize,
+    Deserialize,
 )]
 pub struct GridTemplate {
     /// How this template directive should be repeated
     pub repeat: u16,
     /// The minimum size in the repeat(<>, minmax(_, 1fr)) equation
-    pub min_size: TemplateColumnMinSize,
+    pub min_size: GridTemplateMinSize,
 }
 
 /// The CSS styling that can be applied to an element via the `Styled` trait
@@ -174,11 +194,15 @@ pub struct Style {
     pub scrollbar_width: AbsoluteLength,
     /// Whether both x and y axis should be scrollable at the same time.
     pub allow_concurrent_scroll: bool,
-    /// Whether scrolling should be restricted to the axis indicated by the mouse wheel.
+    /// Whether scrolling should be restricted to the input gesture's axis.
     ///
-    /// This means that:
-    /// - The mouse wheel alone will only ever scroll the Y axis.
-    /// - Holding `Shift` and using the mouse wheel will scroll the X axis.
+    /// Pixel-based scroll gestures are locked to their initially dominant axis. The lock may be
+    /// released when the gesture changes direction strongly. Touch phases delimit gestures when
+    /// available, with a timeout fallback for platforms that only emit moved events.
+    ///
+    /// This also prevents input from being remapped to another axis. For example, horizontal input
+    /// will not scroll a container that only has vertical overflow enabled. Mouse wheel platforms
+    /// typically report ordinary wheel input on the Y axis and Shift-modified input on the X axis.
     ///
     /// ## Motivation
     ///
@@ -333,6 +357,41 @@ pub struct BoxShadow {
     pub blur_radius: Pixels,
     /// How much should the shadow spread?
     pub spread_radius: Pixels,
+    /// Whether this is an inset shadow (drawn inside the element's bounds).
+    pub inset: bool,
+}
+
+impl BoxShadow {
+    /// Creates a new [`BoxShadow`] with the given offset and color, matching the order
+    /// of the CSS `box-shadow` property. Use the builder methods to set blur radius,
+    /// spread radius, and inset.
+    pub fn new(offset_x: Pixels, offset_y: Pixels, color: Hsla) -> Self {
+        Self {
+            color,
+            offset: point(offset_x, offset_y),
+            blur_radius: px(0.),
+            spread_radius: px(0.),
+            inset: false,
+        }
+    }
+
+    /// Sets the shadow blur radius.
+    pub fn blur_radius(mut self, blur_radius: Pixels) -> Self {
+        self.blur_radius = blur_radius;
+        self
+    }
+
+    /// Sets the shadow spread radius.
+    pub fn spread_radius(mut self, spread_radius: Pixels) -> Self {
+        self.spread_radius = spread_radius;
+        self
+    }
+
+    /// Marks the shadow as inset (drawn inside the element's bounds).
+    pub fn inset(mut self) -> Self {
+        self.inset = true;
+        self
+    }
 }
 
 /// How to handle whitespace in text
@@ -355,6 +414,10 @@ pub enum TextOverflow {
     /// displaying the provided string at the beginning (e.g., "…ong text here").
     /// Typically more adequate for file paths where the end is more important than the beginning.
     TruncateStart(SharedString),
+    /// Truncate the text in the middle when it doesn't fit, preserving both the start and end
+    /// of the string (e.g., "long fi…name.rs"). Useful for filenames where both the prefix
+    /// and the extension are important context.
+    TruncateMiddle(SharedString),
 }
 
 /// How to align text within the element
@@ -448,6 +511,9 @@ impl TextStyle {
     /// Create a new text style with the given highlighting applied.
     pub fn highlight(mut self, style: impl Into<HighlightStyle>) -> Self {
         let style = style.into();
+        if let Some(family) = style.font_family {
+            self.font_family = SharedString::new_static(family.as_str());
+        }
         if let Some(weight) = style.font_weight {
             self.font_weight = weight;
         }
@@ -520,6 +586,10 @@ pub struct HighlightStyle {
     /// The color of the text
     pub color: Option<Hsla>,
 
+    /// Overrides the text's font family, e.g. to switch a code span from a
+    /// prose font back to the buffer's monospace font.
+    pub font_family: Option<FontFamilyName>,
+
     /// The font weight, e.g. bold
     pub font_weight: Option<FontWeight>,
 
@@ -537,6 +607,43 @@ pub struct HighlightStyle {
 
     /// Similar to the CSS `opacity` property, this will cause the text to be less vibrant.
     pub fade_out: Option<f32>,
+
+    /// A multiplier applied to the whole line's font size and line height when
+    /// this highlight is present (e.g. `1.8` for an H1-sized heading line).
+    ///
+    /// Unlike every other field here, this applies to the entire display row the
+    /// highlighted range falls on, not just the highlighted bytes: `shape_line`
+    /// accepts a single font size per line, so a consumer that wants per-row
+    /// sizing (see the editor's Zed MD heading support) reads this off any
+    /// chunk on the row and picks that row's font size itself.
+    pub font_size_scale: Option<f32>,
+}
+
+/// An interned font family name.
+///
+/// [`HighlightStyle`] stores font family overrides as this handle rather than a
+/// [`SharedString`] so that it can remain `Copy`. Font family names form a small,
+/// bounded set, so interned names are never freed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FontFamilyName(&'static str);
+
+impl FontFamilyName {
+    /// Returns the interned handle for the given font family name.
+    pub fn new(name: &str) -> Self {
+        static NAMES: LazyLock<Mutex<HashSet<&'static str>>> = LazyLock::new(Default::default);
+        let mut names = NAMES.lock();
+        if let Some(name) = names.get(name) {
+            return Self(name);
+        }
+        let name: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        names.insert(name);
+        Self(name)
+    }
+
+    /// The font family name.
+    pub fn as_str(&self) -> &'static str {
+        self.0
+    }
 }
 
 impl Eq for HighlightStyle {}
@@ -544,6 +651,7 @@ impl Eq for HighlightStyle {}
 impl Hash for HighlightStyle {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.color.hash(state);
+        self.font_family.hash(state);
         self.font_weight.hash(state);
         self.font_style.hash(state);
         self.background_color.hash(state);
@@ -551,6 +659,11 @@ impl Hash for HighlightStyle {
         self.strikethrough.hash(state);
         state.write_u32(u32::from_be_bytes(
             self.fade_out.map(|f| f.to_be_bytes()).unwrap_or_default(),
+        ));
+        state.write_u32(u32::from_be_bytes(
+            self.font_size_scale
+                .map(|f| f.to_be_bytes())
+                .unwrap_or_default(),
         ));
     }
 }
@@ -565,12 +678,20 @@ impl Style {
 
     /// Get the text style in this element style.
     pub fn text_style(&self) -> Option<&TextStyleRefinement> {
-        if self.text.is_some() { Some(&self.text) } else { None }
+        if self.text.is_some() {
+            Some(&self.text)
+        } else {
+            None
+        }
     }
 
     /// Get the content mask for this element style, based on the given bounds.
     /// If the element does not hide its overflow, this will return `None`.
-    pub fn overflow_mask(&self, bounds: Bounds<Pixels>, rem_size: Pixels) -> Option<ContentMask<Pixels>> {
+    pub fn overflow_mask(
+        &self,
+        bounds: Bounds<Pixels>,
+        rem_size: Pixels,
+    ) -> Option<ContentMask<Pixels>> {
         match self.overflow {
             Point {
                 x: Overflow::Visible,
@@ -580,7 +701,10 @@ impl Style {
                 let mut min = bounds.origin;
                 let mut max = bounds.bottom_right();
 
-                if self.border_color.is_some_and(|color| !color.is_transparent()) {
+                if self
+                    .border_color
+                    .is_some_and(|color| !color.is_transparent())
+                {
                     min.x += self.border_widths.left.to_pixels(rem_size);
                     max.x -= self.border_widths.right.to_pixels(rem_size);
                     min.y += self.border_widths.top.to_pixels(rem_size);
@@ -594,13 +718,15 @@ impl Style {
                     // x and y both visible
                     (true, true) => return None,
                     // x visible, y hidden
-                    (true, false) => {
-                        Bounds::from_corners(point(min.x, bounds.origin.y), point(max.x, bounds.bottom_right().y))
-                    }
+                    (true, false) => Bounds::from_corners(
+                        point(min.x, bounds.origin.y),
+                        point(max.x, bounds.bottom_right().y),
+                    ),
                     // x hidden, y visible
-                    (false, true) => {
-                        Bounds::from_corners(point(bounds.origin.x, min.y), point(bounds.bottom_right().x, max.y))
-                    }
+                    (false, true) => Bounds::from_corners(
+                        point(bounds.origin.x, min.y),
+                        point(bounds.bottom_right().x, max.y),
+                    ),
                     // both hidden
                     (false, false) => Bounds::from_corners(min, max),
                 };
@@ -634,15 +760,21 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
-        window.paint_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
                 Some(color) => match color.tag {
-                    BackgroundTag::Solid => color.solid,
-                    BackgroundTag::LinearGradient => color.colors.first().map(|stop| stop.color).unwrap_or_default(),
-                    BackgroundTag::PatternSlash => color.solid,
+                    BackgroundTag::Solid
+                    | BackgroundTag::PatternSlash
+                    | BackgroundTag::Checkerboard => color.solid,
+
+                    BackgroundTag::LinearGradient => color
+                        .colors
+                        .first()
+                        .map(|stop| stop.color)
+                        .unwrap_or_default(),
                 },
                 None => Hsla::default(),
             };
@@ -657,61 +789,22 @@ impl Style {
             ));
         }
 
+        window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+
         continuation(window, cx);
 
         if self.is_border_visible() {
             let border_widths = self.border_widths.to_pixels(rem_size);
-            let max_border_width = border_widths.max();
-            let max_corner_radius = corner_radii.max();
-            let zero_size = Size {
-                width: Pixels::ZERO,
-                height: Pixels::ZERO,
-            };
-
-            let mut top_bounds = Bounds::from_corners(
-                bounds.origin,
-                bounds.top_right() + point(Pixels::ZERO, max_border_width.max(max_corner_radius)),
-            );
-            top_bounds.size = top_bounds.size.max(&zero_size);
-            let mut bottom_bounds = Bounds::from_corners(
-                bounds.bottom_left() - point(Pixels::ZERO, max_border_width.max(max_corner_radius)),
-                bounds.bottom_right(),
-            );
-            bottom_bounds.size = bottom_bounds.size.max(&zero_size);
-            let mut left_bounds = Bounds::from_corners(
-                top_bounds.bottom_left(),
-                bottom_bounds.origin + point(max_border_width, Pixels::ZERO),
-            );
-            left_bounds.size = left_bounds.size.max(&zero_size);
-            let mut right_bounds = Bounds::from_corners(
-                top_bounds.bottom_right() - point(max_border_width, Pixels::ZERO),
-                bottom_bounds.top_right(),
-            );
-            right_bounds.size = right_bounds.size.max(&zero_size);
-
             let mut background = self.border_color.unwrap_or_default();
             background.a = 0.;
-            let quad = quad(
+            window.paint_quad(quad(
                 bounds,
                 corner_radii,
                 background,
                 border_widths,
                 self.border_color.unwrap_or_default(),
                 self.border_style,
-            );
-
-            window.with_content_mask(Some(ContentMask { bounds: top_bounds }), |window| {
-                window.paint_quad(quad.clone());
-            });
-            window.with_content_mask(Some(ContentMask { bounds: right_bounds }), |window| {
-                window.paint_quad(quad.clone());
-            });
-            window.with_content_mask(Some(ContentMask { bounds: bottom_bounds }), |window| {
-                window.paint_quad(quad.clone());
-            });
-            window.with_content_mask(Some(ContentMask { bounds: left_bounds }), |window| {
-                window.paint_quad(quad);
-            });
+            ));
         }
 
         #[cfg(debug_assertions)]
@@ -721,7 +814,8 @@ impl Style {
     }
 
     fn is_border_visible(&self) -> bool {
-        self.border_color.is_some_and(|color| !color.is_transparent())
+        self.border_color
+            .is_some_and(|color| !color.is_transparent())
             && self.border_widths.any(|length| !length.is_zero())
     }
 }
@@ -780,7 +874,9 @@ impl Default for Style {
 }
 
 /// The properties that can be applied to an underline.
-#[derive(Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct UnderlineStyle {
     /// The thickness of the underline.
     pub thickness: Pixels,
@@ -793,7 +889,9 @@ pub struct UnderlineStyle {
 }
 
 /// The properties that can be applied to a strikethrough.
-#[derive(Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct StrikethroughStyle {
     /// The thickness of the strikethrough.
     pub thickness: Pixels,
@@ -854,12 +952,14 @@ impl From<&TextStyle> for HighlightStyle {
     fn from(other: &TextStyle) -> Self {
         Self {
             color: Some(other.color),
+            font_family: Some(FontFamilyName::new(&other.font_family)),
             font_weight: Some(other.font_weight),
             font_style: Some(other.font_style),
             background_color: other.background_color,
             underline: other.underline,
             strikethrough: other.strikethrough,
             fade_out: None,
+            font_size_scale: None,
         }
     }
 }
@@ -887,6 +987,7 @@ impl HighlightStyle {
                     }
                 })
                 .or(self.color),
+            font_family: other.font_family.or(self.font_family),
             font_weight: other.font_weight.or(self.font_weight),
             font_style: other.font_style.or(self.font_style),
             background_color: other.background_color.or(self.background_color),
@@ -900,6 +1001,7 @@ impl HighlightStyle {
                         .unwrap_or(source_fade)
                 })
                 .or(self.fade_out),
+            font_size_scale: other.font_size_scale.or(self.font_size_scale),
         }
     }
 }
@@ -1316,6 +1418,8 @@ mod tests {
                 color: Some(red()),
                 wavy: true,
             }),
+            font_family: None,
+            font_size_scale: None,
         };
         let expected_style = style_b;
 
@@ -1348,6 +1452,8 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            font_family: None,
+            font_size_scale: None,
         };
 
         let expected_style = HighlightStyle {
@@ -1366,6 +1472,8 @@ mod tests {
                 color: None,
                 wavy: false,
             }),
+            font_family: None,
+            font_size_scale: None,
         };
 
         let style_c = style_c.highlight(style_d);
@@ -1475,6 +1583,9 @@ mod tests {
             style.text_style().unwrap().font_size
         );
 
-        assert_eq!(Some(FontWeight::SEMIBOLD), style.text_style().unwrap().font_weight);
+        assert_eq!(
+            Some(FontWeight::SEMIBOLD),
+            style.text_style().unwrap().font_weight
+        );
     }
 }

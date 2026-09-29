@@ -1,4 +1,4 @@
-//! Perf profiler for Gram tests. Outputs timings of tests marked with the `#[perf]`
+//! Perf profiler for Zed tests. Outputs timings of tests marked with the `#[perf]`
 //! attribute to stdout in Markdown. See the documentation of `util_macros::perf`
 //! for usage details on the actual attribute.
 //!
@@ -104,7 +104,10 @@ impl OutputKind<'_> {
                     .join("..");
                 let runs_dir = PathBuf::from(&wspace_dir).join(consts::RUNS_DIR);
                 std::fs::create_dir_all(&runs_dir).unwrap();
-                assert!(!ident.to_string_lossy().is_empty(), "FATAL: Empty filename specified!");
+                assert!(
+                    !ident.to_string_lossy().is_empty(),
+                    "FATAL: Empty filename specified!"
+                );
                 // Get the test binary's crate's name; a path like
                 // target/release-fast/deps/gpui-061ff76c9b7af5d7
                 // would be reduced to just "gpui".
@@ -117,14 +120,18 @@ impl OutputKind<'_> {
                     .unwrap()
                     .0;
                 let mut file_path = runs_dir.join(ident);
-                file_path.as_mut_os_string().push(format!(".{test_bin_stripped}.json"));
+                file_path
+                    .as_mut_os_string()
+                    .push(format!(".{test_bin_stripped}.json"));
                 let mut out_file = OpenOptions::new()
                     .write(true)
                     .create(true)
                     .truncate(true)
                     .open(&file_path)
                     .unwrap();
-                out_file.write_all(&serde_json::to_vec(&output).unwrap()).unwrap();
+                out_file
+                    .write_all(&serde_json::to_vec(&output).unwrap())
+                    .unwrap();
                 if !QUIET.load(Ordering::Relaxed) {
                     eprintln!("JSON output written to {}", file_path.display());
                 }
@@ -138,14 +145,19 @@ impl OutputKind<'_> {
 fn parse_mdata(t_bin: &str, mdata_fn: &str) -> Result<TestMdata, FailKind> {
     let mut cmd = Command::new(t_bin);
     cmd.args([mdata_fn, "--exact", "--nocapture"]);
-    let out = cmd.output().expect("FATAL: Could not run test binary {t_bin}");
+    let out = cmd
+        .output()
+        .expect("FATAL: Could not run test binary {t_bin}");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut version = None;
     let mut iterations = None;
     let mut importance = Importance::default();
     let mut weight = consts::WEIGHT_DEFAULT;
-    for line in stdout.lines().filter_map(|l| l.strip_prefix(consts::MDATA_LINE_PREF)) {
+    for line in stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix(consts::MDATA_LINE_PREF))
+    {
         let mut items = line.split_whitespace();
         // For v0, we know the ident always comes first, then one field.
         match items.next().ok_or(FailKind::BadMetadata)? {
@@ -219,10 +231,17 @@ fn compare_profiles(args: &[String]) {
             ident_idx = 1;
         }
     });
-    let ident_new = args.get(ident_idx).expect("FATAL: missing identifier for new run");
-    let ident_old = args.get(ident_idx + 1).expect("FATAL: missing identifier for old run");
+    let ident_new = args
+        .get(ident_idx)
+        .expect("FATAL: missing identifier for new run");
+    let ident_old = args
+        .get(ident_idx + 1)
+        .expect("FATAL: missing identifier for old run");
     let wspace_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let runs_dir = PathBuf::from(&wspace_dir).join("..").join("..").join(consts::RUNS_DIR);
+    let runs_dir = PathBuf::from(&wspace_dir)
+        .join("..")
+        .join("..")
+        .join(consts::RUNS_DIR);
 
     // Use the blank outputs initially, so we can merge into these with prefixes.
     let mut outputs_new = Output::blank();
@@ -288,7 +307,9 @@ fn get_tests(t_bin: &str) -> impl ExactSizeIterator<Item = (String, String)> {
     let mut cmd = Command::new(t_bin);
     // --format=json is nightly-only :(
     cmd.args(["--list", "--format=terse"]);
-    let out = cmd.output().expect("FATAL: Could not run test binary {t_bin}");
+    let out = cmd
+        .output()
+        .expect("FATAL: Could not run test binary {t_bin}");
     assert!(
         out.status.success(),
         "FATAL: Cannot do perf check - test binary {t_bin} returned an error"
@@ -311,7 +332,9 @@ fn get_tests(t_bin: &str) -> impl ExactSizeIterator<Item = (String, String)> {
             }
         })
         // Exclude tests that aren't marked for perf triage based on suffix.
-        .filter(|t_name| t_name.ends_with(consts::SUF_NORMAL) || t_name.ends_with(consts::SUF_MDATA))
+        .filter(|t_name| {
+            t_name.ends_with(consts::SUF_NORMAL) || t_name.ends_with(consts::SUF_MDATA)
+        })
         .collect();
 
     // Pulling itertools just for .dedup() would be quite a big dependency that's
@@ -329,12 +352,12 @@ fn get_tests(t_bin: &str) -> impl ExactSizeIterator<Item = (String, String)> {
         .as_chunks_mut::<2>()
         .0
         .iter()
-        .map(|pair| {
+        .map(|&[first, second]| {
             // Be resilient against changes to these constants.
             if consts::SUF_NORMAL < consts::SUF_MDATA {
-                (pair[0].to_owned(), pair[1].to_owned())
+                (first.to_owned(), second.to_owned())
             } else {
-                (pair[1].to_owned(), pair[0].to_owned())
+                (second.to_owned(), first.to_owned())
             }
         })
         .collect::<Vec<_>>();
@@ -384,7 +407,10 @@ fn triage_test(
             break Some(iter_count);
         }
         let new = step(iter_count)?;
-        assert!(new > iter_count, "FATAL: step must be monotonically increasing");
+        assert!(
+            new > iter_count,
+            "FATAL: step must be monotonically increasing"
+        );
         iter_count = new;
     }
 }
@@ -513,7 +539,9 @@ fn main() {
                     Some(c)
                 } else {
                     // This should almost never happen, but maybe..?
-                    eprintln!("WARNING: Ran nearly usize::MAX iterations of test {t_name_pretty}; skipping");
+                    eprintln!(
+                        "WARNING: Ran nearly usize::MAX iterations of test {t_name_pretty}; skipping"
+                    );
                     None
                 }
             })
@@ -528,7 +556,13 @@ fn main() {
         if let Some(timings) = hyp_profile(t_bin, t_name, final_iter_count) {
             output.success(t_name_pretty, t_mdata, final_iter_count, timings);
         } else {
-            fail!(output, t_name_pretty, t_mdata, final_iter_count, FailKind::Profile);
+            fail!(
+                output,
+                t_name_pretty,
+                t_mdata,
+                final_iter_count,
+                FailKind::Profile
+            );
         }
     }
     if !QUIET.load(Ordering::Relaxed) {

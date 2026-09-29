@@ -1,7 +1,0 @@
-app: gram
-ingredients:
-  dist: noble
-  sources:
-    - deb http://de.archive.ubuntu.com/ubuntu noble main universe
-  debs:
-    - ${gram_dir}/target/${target_triple}/debian/*

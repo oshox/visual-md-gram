@@ -1,36 +1,46 @@
 #!/usr/bin/env bash
-set -euxo pipefail
+
+set -euo pipefail
 cd "$(dirname "$0")/../.."
 shopt -s extglob
 
-script/bundle-linux --flatpak --tarball
-channel=$(<crates/gram/RELEASE_CHANNEL)
-if [[ "$channel" = "dev" ]]; then
-  archive="gram-dev-linux-$(uname -m).tar.gz"
-else
-  archive="gram-linux-$(uname -m).tar.gz"
-fi
+script/bundle-linux --flatpak
+archive_match="zed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
+archive=$(ls "target/release" | grep -E ${archive_match})
+channel=$(<crates/zed/RELEASE_CHANNEL)
 
 export CHANNEL="$channel"
 export ARCHIVE="$archive"
-export BRANDING_LIGHT="#b2d88f"
-export BRANDING_DARK="#4e4b5c"
 if [[ "$channel" == "dev" ]]; then
-    export APP_ID="app.liten.GramDev"
-    export APP_NAME="Gram Devel"
-    export ICON_SCALABLE="app.liten.Gram.Devel.svg"
-    export ICON_SYMBOLIC="app.liten.Gram-symbolic.svg"
+    export APP_ID="dev.zed.ZedDev"
+    export APP_NAME="Zed Devel"
+    export BRANDING_LIGHT="#99c1f1"
+    export BRANDING_DARK="#1a5fb4"
+    export ICON_FILE="app-icon-dev"
+elif [[ "$channel" == "nightly" ]]; then
+    export APP_ID="dev.zed.ZedNightly"
+    export APP_NAME="Zed Nightly"
+    export BRANDING_LIGHT="#e9aa6a"
+    export BRANDING_DARK="#1a5fb4"
+    export ICON_FILE="app-icon-nightly"
+elif [[ "$channel" == "preview" ]]; then
+    export APP_ID="dev.zed.ZedPreview"
+    export APP_NAME="Zed Preview"
+    export BRANDING_LIGHT="#99c1f1"
+    export BRANDING_DARK="#1a5fb4"
+    export ICON_FILE="app-icon-preview"
 elif [[ "$channel" == "stable" ]]; then
-    export APP_ID="app.liten.Gram"
-    export APP_NAME="Gram"
-    export ICON_SCALABLE="app.liten.Gram.svg"
-    export ICON_SYMBOLIC="app.liten.Gram-symbolic.svg"
+    export APP_ID="dev.zed.Zed"
+    export APP_NAME="Zed"
+    export BRANDING_LIGHT="#99c1f1"
+    export BRANDING_DARK="#1a5fb4"
+    export ICON_FILE="app-icon"
 else
     echo "Invalid channel: '$channel'"
     exit
 fi
 
-envsubst < "crates/gram/resources/flatpak/manifest-template.json" > "$APP_ID.json"
+envsubst < "crates/zed/resources/flatpak/manifest-template.json" > "$APP_ID.json"
 flatpak-builder --user --install --force-clean build "$APP_ID.json"
 flatpak build-bundle ~/.local/share/flatpak/repo "target/release/$APP_ID.flatpak" "$APP_ID"
 echo "Created 'target/release/$APP_ID.flatpak'"

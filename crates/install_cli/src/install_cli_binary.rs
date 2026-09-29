@@ -1,41 +1,52 @@
-use super::register_uri_scheme;
-use anyhow::{Context as _, Result};
+use super::register_zed_scheme;
+use anyhow::Result;
 use gpui::{AppContext as _, AsyncApp, Context, PromptLevel, Window, actions};
 use release_channel::ReleaseChannel;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use util::ResultExt;
+use workspace::notifications::simple_message_notification::MessageNotification;
 use workspace::notifications::{DetachAndPromptErr, NotificationId};
 use workspace::{Toast, Workspace};
 
 actions!(
     cli,
     [
-        /// Installs the Gram CLI tool to the system PATH.
+        /// Installs the Zed CLI tool to the system PATH.
         InstallCliBinary,
     ]
 );
 
-async fn install_script(cx: &AsyncApp) -> Result<PathBuf> {
-    let cli_path = cx.update(|cx| cx.path_for_auxiliary_executable("cli"))??;
-    let link_path = Path::new("/usr/local/bin/gram");
+const CANT_INSTALL_DOCS_URL: &str = "https://zed.dev/docs/macos#cant-install-cli";
+
+/// Attempts to install the CLI symlink. Returns the installed path on success,
+/// or `None` if the user dismissed the macOS administrator authentication
+/// prompt. Returns an error if the install could not be completed, most
+/// commonly because the user is not an admin.
+async fn install_script(cx: &AsyncApp) -> Result<Option<PathBuf>> {
+    let cli_path = cx.update(|cx| cx.path_for_auxiliary_executable("cli"))?;
+    let link_path = Path::new("/usr/local/bin/zed");
     let bin_dir_path = link_path.parent().unwrap();
 
     // Don't re-create symlink if it points to the same CLI binary.
     if smol::fs::read_link(link_path).await.ok().as_ref() == Some(&cli_path) {
-        return Ok(link_path.into());
+        return Ok(Some(link_path.into()));
     }
 
     // If the symlink is not there or is outdated, first try replacing it
     // without escalating.
     smol::fs::remove_file(link_path).await.log_err();
-    if smol::fs::unix::symlink(&cli_path, link_path).await.log_err().is_some() {
-        return Ok(link_path.into());
+    if smol::fs::unix::symlink(&cli_path, link_path)
+        .await
+        .log_err()
+        .is_some()
+    {
+        return Ok(Some(link_path.into()));
     }
 
-    // The symlink could not be created, so use osascript with admin privileges
-    // to create it.
-    let status = smol::process::Command::new("/usr/bin/osascript")
+    // The symlink could not be created without escalating, so use osascript
+    // with admin privileges to create it.
+    let output = smol::process::Command::new("/usr/bin/osascript")
         .args([
             "-e",
             &format!(
@@ -48,17 +59,28 @@ async fn install_script(cx: &AsyncApp) -> Result<PathBuf> {
                 link_path.to_string_lossy(),
             ),
         ])
-        .stdout(smol::process::Stdio::inherit())
-        .stderr(smol::process::Stdio::inherit())
         .output()
-        .await?
-        .status;
-    anyhow::ensure!(status.success(), "error running osascript");
-    Ok(link_path.into())
+        .await?;
+
+    if output.status.success() {
+        return Ok(Some(link_path.into()));
+    }
+
+    // osascript reports "User canceled." (error -128) when the administrator
+    // prompt is dismissed. Treat that as a cancellation rather than a failure
+    // so we don't show an error the user already chose to avoid.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("User canceled") || stderr.contains("-128") {
+        return Ok(None);
+    }
+
+    // The privileged write failed, most commonly because the user is not an
+    // admin.
+    anyhow::bail!("error running osascript: {}", stderr.trim());
 }
 
 pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
-    const LINUX_PROMPT_DETAIL: &str = "If you installed Gram from a release tarball, add ~/.local/bin to your PATH.\n\nIf you installed Gram from a different source like your package manager, then you may need to create an alias/symlink manually.\n\nDepending on your package manager, the CLI might be named gram-editor or something else.";
+    const LINUX_PROMPT_DETAIL: &str = "If you installed Zed from our official release add ~/.local/bin to your PATH.\n\nIf you installed Zed from a different source like your package manager, then you may need to create an alias/symlink manually.\n\nDepending on your package manager, the CLI might be named zeditor, zedit, zed-editor or something else.";
 
     cx.spawn_in(window, async move |workspace, cx| {
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
@@ -66,21 +88,48 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
                 PromptLevel::Warning,
                 "CLI should already be installed",
                 Some(LINUX_PROMPT_DETAIL),
-                &["Ok"],
+                &["OK"],
             );
             cx.background_spawn(prompt).detach();
             return Ok(());
         }
-        let path = install_script(cx.deref()).await.context("error creating CLI symlink")?;
+        let path = match install_script(cx.deref()).await {
+            Ok(Some(path)) => path,
+            // The user dismissed the administrator prompt; nothing to do.
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                log::error!("failed to install zed CLI: {error:#}");
+                workspace.update(cx, |workspace, cx| {
+                    struct CliInstallFailed;
+
+                    workspace.show_notification(
+                        NotificationId::unique::<CliInstallFailed>(),
+                        cx,
+                        |cx| {
+                            cx.new(|cx| {
+                                MessageNotification::new(
+                                    "You can add `zed` to your PATH manually.",
+                                    cx,
+                                )
+                                .with_title("Couldn't install the Zed CLI")
+                                .more_info_message("Show me how")
+                                .more_info_url(CANT_INSTALL_DOCS_URL)
+                            })
+                        },
+                    );
+                })?;
+                return Ok(());
+            }
+        };
 
         workspace.update_in(cx, |workspace, _, cx| {
-            struct InstalledGramCli;
+            struct InstalledZedCli;
 
             workspace.show_toast(
                 Toast::new(
-                    NotificationId::unique::<InstalledGramCli>(),
+                    NotificationId::unique::<InstalledZedCli>(),
                     format!(
-                        "Installed `gram` to {}. You can launch {} from your terminal.",
+                        "Installed `zed` to {}. You can launch {} from your terminal.",
                         path.to_string_lossy(),
                         ReleaseChannel::global(cx).display_name()
                     ),
@@ -88,8 +137,8 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
                 cx,
             )
         })?;
-        register_uri_scheme(cx).await.log_err();
+        register_zed_scheme(cx).await.log_err();
         Ok(())
     })
-    .detach_and_prompt_err("Error installing gram cli", window, cx, |_, _, _| None);
+    .detach_and_prompt_err("Cannot install the Zed CLI", window, cx, |_, _, _| None);
 }

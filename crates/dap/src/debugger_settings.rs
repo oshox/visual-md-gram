@@ -7,7 +7,7 @@ pub struct DebuggerSettings {
     ///
     /// Default: line
     pub stepping_granularity: SteppingGranularity,
-    /// Whether the breakpoints should be reused across Gram sessions.
+    /// Whether the breakpoints should be reused across Zed sessions.
     ///
     /// Default: true
     pub save_breakpoints: bool,
@@ -19,7 +19,7 @@ pub struct DebuggerSettings {
     ///
     /// Default: 2000ms
     pub timeout: u64,
-    /// Whether to log messages between active debug adapters and Gram
+    /// Whether to log messages between active debug adapters and Zed
     ///
     /// Default: true
     pub log_dap_communications: bool,
@@ -37,7 +37,9 @@ impl Settings for DebuggerSettings {
     fn from_settings(content: &SettingsContent) -> Self {
         let content = content.debugger.clone().unwrap();
         Self {
-            stepping_granularity: dap_granularity_from_settings(content.stepping_granularity.unwrap()),
+            stepping_granularity: dap_granularity_from_settings(
+                content.stepping_granularity.unwrap(),
+            ),
             save_breakpoints: content.save_breakpoints.unwrap(),
             button: content.button.unwrap(),
             timeout: content.timeout.unwrap(),
@@ -48,7 +50,9 @@ impl Settings for DebuggerSettings {
     }
 }
 
-fn dap_granularity_from_settings(granularity: settings::SteppingGranularity) -> dap_types::SteppingGranularity {
+fn dap_granularity_from_settings(
+    granularity: settings::SteppingGranularity,
+) -> dap_types::SteppingGranularity {
     match granularity {
         settings::SteppingGranularity::Instruction => dap_types::SteppingGranularity::Instruction,
         settings::SteppingGranularity::Line => dap_types::SteppingGranularity::Line,

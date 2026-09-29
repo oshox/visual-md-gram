@@ -1,21 +1,26 @@
 use crate::{
-    NewFile, Open, PathList, SerializedWorkspaceLocation, WORKSPACE_DB, Workspace, WorkspaceId,
+    NewFile, Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation,
+    ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
     item::{Item, ItemEvent},
+    persistence::WorkspaceDb,
 };
-use app_actions::{Extensions, OpenDocs, OpenOnboarding, OpenRecent, OpenSettings, command_palette};
+use agent_settings::AgentSettings;
 use git::Clone as GitClone;
-use gpui::WeakEntity;
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, ParentElement, Render,
-    Styled, Task, Window, actions,
+    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    ParentElement, Render, Styled, Task, TaskExt, Window, actions,
 };
+use gpui::{WeakEntity, linear_color_stop, linear_gradient};
 use menu::{SelectNext, SelectPrevious};
-use remote::RemoteConnectionOptions;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use theme::Appearance;
+use settings::{DefaultOpenBehavior, Settings};
 use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
 use util::ResultExt;
+use zed_actions::{
+    Extensions, OpenKeymap, OpenOnboarding, OpenSettings, assistant::ToggleFocus, command_palette,
+};
 
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = welcome)]
@@ -25,9 +30,9 @@ pub struct OpenRecentProject {
 }
 
 actions!(
-    gram,
+    zed,
     [
-        /// Show the Gram welcome screen
+        /// Show the Zed welcome screen
         ShowWelcome
     ]
 );
@@ -39,7 +44,9 @@ struct SectionHeader {
 
 impl SectionHeader {
     fn new(title: impl Into<SharedString>) -> Self {
-        Self { title: title.into() }
+        Self {
+            title: title.into(),
+        }
     }
 }
 
@@ -88,7 +95,7 @@ impl SectionButton {
 
 impl RenderOnce for SectionButton {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let id = format!("onb-button-{}", self.label);
+        let id = format!("onb-button-{}-{}", self.label, self.tab_index);
         let action_ref: &dyn Action = &*self.action;
 
         ButtonLike::new(id)
@@ -102,14 +109,33 @@ impl RenderOnce for SectionButton {
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(Icon::new(self.icon).color(Color::Muted).size(IconSize::Small))
+                            .child(
+                                Icon::new(self.icon)
+                                    .color(Color::Muted)
+                                    .size(IconSize::Small),
+                            )
                             .child(Label::new(self.label)),
                     )
                     .child(
-                        KeyBinding::for_action_in(action_ref, &self.focus_handle, cx).size(TextSize::Small.rems(cx)),
+                        KeyBinding::for_action_in(action_ref, &self.focus_handle, cx)
+                            .size(rems_from_px(12_f32)),
                     ),
             )
-            .on_click(move |_, window, cx| window.dispatch_action(self.action.boxed_clone(), cx))
+            .on_click(move |_, window, cx| {
+                self.focus_handle.dispatch_action(&*self.action, window, cx)
+            })
+    }
+}
+
+enum SectionVisibility {
+    Always,
+}
+
+impl SectionVisibility {
+    fn is_visible(&self) -> bool {
+        match self {
+            SectionVisibility::Always => true,
+        }
     }
 }
 
@@ -117,15 +143,24 @@ struct SectionEntry {
     icon: IconName,
     title: &'static str,
     action: &'static dyn Action,
+    visibility_guard: SectionVisibility,
 }
 
 impl SectionEntry {
-    fn render(&self, button_index: usize, focus: &FocusHandle, _cx: &App) -> impl IntoElement {
-        SectionButton::new(self.title, self.icon, self.action, button_index, focus.clone())
+    fn render(&self, button_index: usize, focus: &FocusHandle) -> Option<impl IntoElement> {
+        self.visibility_guard.is_visible().then(|| {
+            SectionButton::new(
+                self.title,
+                self.icon,
+                self.action,
+                button_index,
+                focus.clone(),
+            )
+        })
     }
 }
 
-const CONTENT: (Section<5>, Section<2>) = (
+const CONTENT: (Section<4>, Section<3>) = (
     Section {
         title: "Get Started",
         entries: [
@@ -133,26 +168,25 @@ const CONTENT: (Section<5>, Section<2>) = (
                 icon: IconName::Plus,
                 title: "New File",
                 action: &NewFile,
+                visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
                 icon: IconName::FolderOpen,
                 title: "Open Project",
-                action: &Open,
+                action: &Open::DEFAULT,
+                visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
                 icon: IconName::CloudDownload,
                 title: "Clone Repository",
                 action: &GitClone,
+                visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
                 icon: IconName::ListCollapse,
                 title: "Open Command Palette",
                 action: &command_palette::Toggle,
-            },
-            SectionEntry {
-                icon: IconName::Library,
-                title: "Open Documentation",
-                action: &OpenDocs,
+                visibility_guard: SectionVisibility::Always,
             },
         ],
     },
@@ -163,6 +197,13 @@ const CONTENT: (Section<5>, Section<2>) = (
                 icon: IconName::Settings,
                 title: "Open Settings",
                 action: &OpenSettings,
+                visibility_guard: SectionVisibility::Always,
+            },
+            SectionEntry {
+                icon: IconName::Keyboard,
+                title: "Customize Keymaps",
+                action: &OpenKeymap,
+                visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
                 icon: IconName::Blocks,
@@ -171,6 +212,7 @@ const CONTENT: (Section<5>, Section<2>) = (
                     category_filter: None,
                     id: None,
                 },
+                visibility_guard: SectionVisibility::Always,
             },
         ],
     },
@@ -182,45 +224,63 @@ struct Section<const COLS: usize> {
 }
 
 impl<const COLS: usize> Section<COLS> {
-    fn render(self, index_offset: usize, focus: &FocusHandle, cx: &App) -> impl IntoElement {
-        v_flex().min_w_full().child(SectionHeader::new(self.title)).children(
-            self.entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| entry.render(index_offset + index, focus, cx)),
-        )
+    fn render(self, index_offset: usize, focus: &FocusHandle) -> impl IntoElement {
+        v_flex()
+            .min_w_full()
+            .child(SectionHeader::new(self.title))
+            .children(
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, entry)| entry.render(index_offset + index, focus)),
+            )
     }
 }
 
 pub struct WelcomePage {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
-    recent_workspaces: Option<Vec<(WorkspaceId, SerializedWorkspaceLocation, PathList)>>,
+    fallback_to_recent_projects: bool,
+    recent_workspaces: Option<Vec<RecentWorkspace>>,
 }
 
 impl WelcomePage {
-    pub fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        workspace: WeakEntity<Workspace>,
+        fallback_to_recent_projects: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
-        cx.on_focus(&focus_handle, window, |_, _, cx| cx.notify()).detach();
+        cx.on_focus(&focus_handle, window, |_, _, cx| cx.notify())
+            .detach();
 
-        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
-            let workspaces = WORKSPACE_DB
-                .recent_workspaces_on_disk()
-                .await
-                .log_err()
-                .unwrap_or_default();
+        if fallback_to_recent_projects {
+            let fs = workspace
+                .upgrade()
+                .map(|ws| ws.read(cx).app_state().fs.clone());
+            let db = WorkspaceDb::global(cx);
+            cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+                let Some(fs) = fs else { return };
+                let workspaces = db
+                    .recent_project_workspaces(fs.as_ref())
+                    .await
+                    .log_err()
+                    .unwrap_or_default();
 
-            this.update(cx, |this, cx| {
-                this.recent_workspaces = Some(workspaces);
-                cx.notify();
+                this.update(cx, |this, cx| {
+                    this.recent_workspaces = Some(workspaces);
+                    cx.notify();
+                })
+                .ok();
             })
-            .ok();
-        })
-        .detach();
+            .detach();
+        }
 
         WelcomePage {
             workspace,
             focus_handle,
+            fallback_to_recent_projects,
             recent_workspaces: None,
         }
     }
@@ -235,37 +295,90 @@ impl WelcomePage {
         cx.notify();
     }
 
-    fn open_recent_project(&mut self, action: &OpenRecentProject, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(recent_workspaces) = &self.recent_workspaces
-            && let Some((_workspace_id, location, paths)) = recent_workspaces.get(action.index)
-        {
-            let paths = paths.clone();
-            let location = location.clone();
-            let is_local = matches!(location, SerializedWorkspaceLocation::Local);
-            let workspace = self.workspace.clone();
+    fn open_recent_project(
+        &mut self,
+        action: &OpenRecentProject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(recent_workspaces) = &self.recent_workspaces {
+            if let Some(workspace) = recent_workspaces.get(action.index) {
+                let is_local = matches!(workspace.location, SerializedWorkspaceLocation::Local);
 
-            if is_local {
-                let paths = paths.paths().to_vec();
-                cx.spawn_in(window, async move |_, cx| {
-                    workspace.update_in(cx, |workspace, window, cx| {
-                        workspace
-                            .open_workspace_for_paths(true, paths, window, cx)
-                            .detach_and_log_err(cx);
-                    })
-                })
-                .detach_and_log_err(cx);
-            } else {
-                window.dispatch_action(OpenRecent::default().boxed_clone(), cx);
+                if is_local {
+                    let paths = workspace.paths.paths().to_vec();
+                    let open_mode = match WorkspaceSettings::get_global(cx).default_open_behavior {
+                        DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
+                        DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
+                    };
+                    self.workspace
+                        .update(cx, |workspace, cx| {
+                            workspace
+                                .open_workspace_for_paths(open_mode, paths, window, cx)
+                                .detach_and_log_err(cx);
+                        })
+                        .log_err();
+                } else {
+                    use zed_actions::OpenRecent;
+                    window.dispatch_action(OpenRecent::default().boxed_clone(), cx);
+                }
             }
-        } else {
-            log::info!(
-                "open_recent_project: no recent workspace with index {} found",
-                action.index
-            );
         }
     }
 
-    fn render_recent_project_section(&self, recent_projects: Vec<impl IntoElement>) -> impl IntoElement {
+    fn render_agent_card(&self, tab_index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus = self.focus_handle.clone();
+        let color = cx.theme().colors();
+
+        let description = "Run multiple threads at once, mix and match any ACP-compatible agent, and keep work conflict-free with worktrees.";
+
+        v_flex()
+            .w_full()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(color.border_variant)
+            .bg(linear_gradient(
+                360.,
+                linear_color_stop(color.panel_background, 1.0),
+                linear_color_stop(color.editor_background, 0.45),
+            ))
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::ZedAssistant)
+                            .color(Color::Muted)
+                            .size(IconSize::Small),
+                    )
+                    .child(Label::new("Collaborate with Agents")),
+            )
+            .child(
+                Label::new(description)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .mb_2(),
+            )
+            .child(
+                Button::new("open-agent", "Open Agent Panel")
+                    .full_width()
+                    .tab_index(tab_index as isize)
+                    .style(ButtonStyle::Outlined)
+                    .key_binding(
+                        KeyBinding::for_action_in(&ToggleFocus, &self.focus_handle, cx)
+                            .size(rems_from_px(12_f32)),
+                    )
+                    .on_click(move |_, window, cx| {
+                        focus.dispatch_action(&ToggleWorkspaceSidebar, window, cx);
+                        focus.dispatch_action(&ToggleFocus, window, cx);
+                    }),
+            )
+    }
+
+    fn render_recent_project_section(
+        &self,
+        recent_projects: Vec<impl IntoElement>,
+    ) -> impl IntoElement {
         v_flex()
             .w_full()
             .child(SectionHeader::new("Recent Projects"))
@@ -274,34 +387,27 @@ impl WelcomePage {
 
     fn render_recent_project(
         &self,
-        index: usize,
+        project_index: usize,
+        tab_index: usize,
         location: &SerializedWorkspaceLocation,
         paths: &PathList,
     ) -> impl IntoElement {
+        let name = project_name(paths);
+
         let (icon, title) = match location {
-            SerializedWorkspaceLocation::Local => {
-                let path = paths.paths().first().map(|p| p.as_path());
-                path.and_then(|p| p.file_name())
-                    .map(|n| (IconName::Folder, SharedString::from(n.to_string_lossy().to_string())))
-                    .unwrap_or_else(|| (IconName::Warning, SharedString::from("Untitled")))
-            }
-            SerializedWorkspaceLocation::Remote(options) => {
-                let display_name = options.display_name();
-                match options {
-                    RemoteConnectionOptions::Ssh(options) => (
-                        IconName::Server,
-                        options
-                            .nickname
-                            .as_ref()
-                            .map(|nick| SharedString::from(nick))
-                            .unwrap_or_else(|| SharedString::from(display_name)),
-                    ),
-                    RemoteConnectionOptions::Wsl(_) => (IconName::ServerCrash, SharedString::from(display_name)),
-                }
-            }
+            SerializedWorkspaceLocation::Local => (IconName::Folder, name),
+            SerializedWorkspaceLocation::Remote(_) => (IconName::Server, name),
         };
 
-        SectionButton::new(title, icon, &OpenRecentProject { index }, 10, self.focus_handle.clone())
+        SectionButton::new(
+            title,
+            icon,
+            &OpenRecentProject {
+                index: project_index,
+            },
+            tab_index,
+            self.focus_handle.clone(),
+        )
     }
 }
 
@@ -309,7 +415,9 @@ impl Render for WelcomePage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (first_section, second_section) = CONTENT;
         let first_section_entries = first_section.entries.len();
-        let last_index = first_section_entries + second_section.entries.len();
+        let mut next_tab_index = first_section_entries + second_section.entries.len();
+
+        let ai_enabled = AgentSettings::get_global(cx).enabled(cx);
 
         let recent_projects = self
             .recent_workspaces
@@ -318,20 +426,31 @@ impl Render for WelcomePage {
             .flatten()
             .take(5)
             .enumerate()
-            .map(|(index, (_, loc, paths))| self.render_recent_project(index, loc, paths))
+            .map(|(index, workspace)| {
+                self.render_recent_project(
+                    index,
+                    first_section_entries + index,
+                    &workspace.location,
+                    &workspace.identity_paths,
+                )
+            })
             .collect::<Vec<_>>();
 
-        let second_section = if !recent_projects.is_empty() {
-            self.render_recent_project_section(recent_projects).into_any_element()
+        let showing_recent_projects =
+            self.fallback_to_recent_projects && !recent_projects.is_empty();
+        let second_section = if showing_recent_projects {
+            self.render_recent_project_section(recent_projects)
+                .into_any_element()
         } else {
             second_section
-                .render(first_section_entries, &self.focus_handle, cx)
+                .render(first_section_entries, &self.focus_handle)
                 .into_any_element()
         };
 
-        let image = match cx.theme().appearance {
-            Appearance::Light => VectorName::LogoLight,
-            Appearance::Dark => VectorName::LogoDark,
+        let welcome_label = if self.fallback_to_recent_projects {
+            "Welcome back to Zed"
+        } else {
+            "Welcome to Zed"
         };
 
         h_flex()
@@ -341,48 +460,53 @@ impl Render for WelcomePage {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::open_recent_project))
             .size_full()
-            .justify_center()
-            .overflow_hidden()
             .bg(cx.theme().colors().editor_background)
+            .justify_center()
             .child(
-                h_flex().relative().size_full().px_12().max_w(px(1100.)).child(
-                    v_flex()
-                        .flex_1()
-                        .justify_center()
-                        .max_w_128()
-                        .mx_auto()
-                        .gap_6()
-                        .overflow_x_hidden()
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .justify_center()
-                                .mb_4()
-                                .gap_4()
-                                .child(Vector::square(image, rems_from_px(90.0_f32)))
-                                .child(
-                                    v_flex().child(Headline::new("Gram").size(HeadlineSize::Large)).child(
-                                        Label::new(r#"What cannot be mended must be transcended."#)
-                                            .size(LabelSize::Default)
-                                            .color(Color::Muted)
-                                            .italic(),
-                                    ),
+                v_flex()
+                    .id("welcome-content")
+                    .p_8()
+                    .max_w_128()
+                    .size_full()
+                    .gap_6()
+                    .justify_center()
+                    .overflow_y_scroll()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_center()
+                            .mb_4()
+                            .gap_4()
+                            .child(Vector::square(VectorName::ZedLogo, rems_from_px(45_f32)))
+                            .child(
+                                v_flex().child(Headline::new(welcome_label)).child(
+                                    Label::new("The editor for what's next")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .italic(),
                                 ),
-                        )
-                        .child(first_section.render(Default::default(), &self.focus_handle, cx))
-                        .child(second_section)
-                        .child(
-                            v_flex().gap_1().child(Divider::horizontal()).child(
+                            ),
+                    )
+                    .child(first_section.render(Default::default(), &self.focus_handle))
+                    .child(second_section)
+                    .when(ai_enabled && !showing_recent_projects, |this| {
+                        let agent_tab_index = next_tab_index;
+                        next_tab_index += 1;
+                        this.child(self.render_agent_card(agent_tab_index, cx))
+                    })
+                    .when(!self.fallback_to_recent_projects, |this| {
+                        this.child(
+                            v_flex().gap_4().child(Divider::horizontal()).child(
                                 Button::new("welcome-exit", "Return to Onboarding")
-                                    .tab_index(last_index as isize)
+                                    .tab_index(next_tab_index as isize)
                                     .full_width()
                                     .label_size(LabelSize::XSmall)
                                     .on_click(|_, window, cx| {
                                         window.dispatch_action(OpenOnboarding.boxed_clone(), cx);
                                     }),
                             ),
-                        ),
-                ),
+                        )
+                    }),
             )
     }
 }
@@ -402,11 +526,15 @@ impl Item for WelcomePage {
         "Welcome".into()
     }
 
+    fn telemetry_event_text(&self) -> Option<&'static str> {
+        Some("New Welcome Page Opened")
+    }
+
     fn show_toolbar(&self) -> bool {
         false
     }
 
-    fn to_item_events(event: &Self::Event, mut f: impl FnMut(crate::item::ItemEvent)) {
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(crate::item::ItemEvent)) {
         f(*event)
     }
 }
@@ -426,7 +554,7 @@ impl crate::SerializableItem for WelcomePage {
             alive_items,
             workspace_id,
             "welcome_pages",
-            &persistence::WELCOME_PAGES,
+            &persistence::WelcomePagesDb::global(cx),
             cx,
         )
     }
@@ -439,12 +567,14 @@ impl crate::SerializableItem for WelcomePage {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<gpui::Result<Entity<Self>>> {
-        if persistence::WELCOME_PAGES
+        if persistence::WelcomePagesDb::global(cx)
             .get_welcome_page(item_id, workspace_id)
             .ok()
             .is_some_and(|is_open| is_open)
         {
-            Task::ready(Ok(cx.new(|cx| WelcomePage::new(workspace, window, cx))))
+            Task::ready(Ok(
+                cx.new(|cx| WelcomePage::new(workspace, false, window, cx))
+            ))
         } else {
             Task::ready(Err(anyhow::anyhow!("No welcome page to deserialize")))
         }
@@ -455,15 +585,13 @@ impl crate::SerializableItem for WelcomePage {
         workspace: &mut Workspace,
         item_id: crate::ItemId,
         _closing: bool,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<gpui::Result<()>>> {
         let workspace_id = workspace.database_id()?;
-        Some(cx.background_spawn(async move {
-            persistence::WELCOME_PAGES
-                .save_welcome_page(item_id, workspace_id, true)
-                .await
-        }))
+        let db = persistence::WelcomePagesDb::global(cx);
+        Some(cx.background_spawn(
+            async move { db.save_welcome_page(item_id, workspace_id, true).await },
+        ))
     }
 
     fn should_serialize(&self, event: &Self::Event) -> bool {
@@ -497,7 +625,7 @@ mod persistence {
         )]);
     }
 
-    db::static_connection!(WELCOME_PAGES, WelcomePagesDb, [WorkspaceDb]);
+    db::static_connection!(WelcomePagesDb, [WorkspaceDb]);
 
     impl WelcomePagesDb {
         query! {
@@ -521,5 +649,50 @@ mod persistence {
                 WHERE item_id = ? AND workspace_id = ?
             }
         }
+    }
+}
+
+fn project_name(paths: &PathList) -> String {
+    let joined = paths
+        .paths()
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if joined.is_empty() {
+        "Untitled".to_string()
+    } else {
+        joined
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_project_name_empty() {
+        let paths = PathList::new::<&str>(&[]);
+        assert_eq!(project_name(&paths), "Untitled");
+    }
+
+    #[test]
+    fn test_project_name_single() {
+        let paths = PathList::new(&["/home/user/my-project"]);
+        assert_eq!(project_name(&paths), "my-project");
+    }
+
+    #[test]
+    fn test_project_name_multiple() {
+        // PathList sorts lexicographically, so filenames appear in alpha order
+        let paths = PathList::new(&["/home/user/zed", "/home/user/api"]);
+        assert_eq!(project_name(&paths), "api, zed");
+    }
+
+    #[test]
+    fn test_project_name_root_path_filtered() {
+        // A bare root "/" has no file_name(), falls back to "Untitled"
+        let paths = PathList::new(&["/"]);
+        assert_eq!(project_name(&paths), "Untitled");
     }
 }

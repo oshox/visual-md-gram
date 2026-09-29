@@ -1,6 +1,6 @@
 use collections::HashMap;
 use command_palette;
-use editor::{Editor, completion::CompletionProvider};
+use editor::{CompletionProvider, Editor};
 use fuzzy::StringMatchCandidate;
 use gpui::{Context, Entity, SharedString, Window};
 use language::{self, ToOffset};
@@ -12,7 +12,10 @@ pub struct ActionCompletionProvider {
 }
 
 impl ActionCompletionProvider {
-    pub fn new(action_names: Vec<&'static str>, humanized_names: HashMap<&'static str, SharedString>) -> Self {
+    pub fn new(
+        action_names: Vec<&'static str>,
+        humanized_names: HashMap<&'static str, SharedString>,
+    ) -> Self {
         Self {
             action_names,
             humanized_names,
@@ -23,7 +26,6 @@ impl ActionCompletionProvider {
 impl CompletionProvider for ActionCompletionProvider {
     fn completions(
         &self,
-        _excerpt_id: editor::ExcerptId,
         buffer: &Entity<language::Buffer>,
         buffer_position: language::Anchor,
         _trigger: editor::CompletionContext,
@@ -41,7 +43,11 @@ impl CompletionProvider for ActionCompletionProvider {
             }
         }
 
-        let start_anchor = buffer.anchor_before(buffer_position.to_offset(&buffer).saturating_sub(count_back));
+        let start_anchor = buffer.anchor_before(
+            buffer_position
+                .to_offset(&buffer)
+                .saturating_sub(count_back),
+        );
 
         let replace_range = start_anchor..buffer_position;
         let snapshot = buffer.text_snapshot();
@@ -53,7 +59,11 @@ impl CompletionProvider for ActionCompletionProvider {
             .iter()
             .enumerate()
             .map(|(ix, &name)| {
-                let humanized = self.humanized_names.get(name).cloned().unwrap_or_else(|| name.into());
+                let humanized = self
+                    .humanized_names
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| name.into());
                 StringMatchCandidate::new(ix, &humanized)
             })
             .collect();
@@ -92,17 +102,21 @@ impl CompletionProvider for ActionCompletionProvider {
                         documentation: None,
                         source: project::CompletionSource::Custom,
                         icon_path: None,
+                        icon_color: None,
                         match_start: None,
                         snippet_deduplication_key: None,
                         insert_text_mode: None,
                         confirm: None,
+                        group: None,
                     }
                 })
                 .collect();
 
             Ok(vec![project::CompletionResponse {
                 completions,
-                display_options: CompletionDisplayOptions { dynamic_width: true },
+                display_options: CompletionDisplayOptions {
+                    dynamic_width: true,
+                },
                 is_incomplete: false,
             }])
         })
@@ -116,8 +130,8 @@ impl CompletionProvider for ActionCompletionProvider {
         _trigger_in_words: bool,
         _cx: &mut Context<Editor>,
     ) -> bool {
-        text.chars()
-            .last()
-            .is_some_and(|last_char| last_char.is_ascii_alphanumeric() || last_char == '_' || last_char == ':')
+        text.chars().last().is_some_and(|last_char| {
+            last_char.is_ascii_alphanumeric() || last_char == '_' || last_char == ':'
+        })
     }
 }

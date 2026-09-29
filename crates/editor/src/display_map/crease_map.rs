@@ -1,4 +1,4 @@
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use gpui::{AnyElement, IntoElement};
 use multi_buffer::{Anchor, AnchorRangeExt, MultiBufferRow, MultiBufferSnapshot, ToPoint};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,7 @@ pub struct CreaseMap {
 }
 
 impl CreaseMap {
+    #[ztracing::instrument(skip_all)]
     pub fn new(snapshot: &MultiBufferSnapshot) -> Self {
         CreaseMap {
             snapshot: CreaseSnapshot::new(snapshot),
@@ -40,11 +41,13 @@ impl CreaseSnapshot {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn creases(&self) -> impl Iterator<Item = (CreaseId, &Crease<Anchor>)> {
         self.creases.iter().map(|item| (item.id, &item.crease))
     }
 
     /// Returns the first Crease starting on the specified buffer row.
+    #[ztracing::instrument(skip_all)]
     pub fn query_row<'a>(
         &'a self,
         row: MultiBufferRow,
@@ -69,6 +72,7 @@ impl CreaseSnapshot {
         None
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn creases_in_range<'a>(
         &'a self,
         range: Range<MultiBufferRow>,
@@ -95,7 +99,11 @@ impl CreaseSnapshot {
         })
     }
 
-    pub fn crease_items_with_offsets(&self, snapshot: &MultiBufferSnapshot) -> Vec<(CreaseId, Range<Point>)> {
+    #[ztracing::instrument(skip_all)]
+    pub fn crease_items_with_offsets(
+        &self,
+        snapshot: &MultiBufferSnapshot,
+    ) -> Vec<(CreaseId, Range<Point>)> {
         let mut cursor = self.creases.cursor::<ItemSummary>(snapshot);
         let mut results = Vec::new();
 
@@ -123,7 +131,8 @@ type RenderToggleFn = Arc<
             &mut App,
         ) -> AnyElement,
 >;
-type RenderTrailerFn = Arc<dyn Send + Sync + Fn(MultiBufferRow, bool, &mut Window, &mut App) -> AnyElement>;
+type RenderTrailerFn =
+    Arc<dyn Send + Sync + Fn(MultiBufferRow, bool, &mut Window, &mut App) -> AnyElement>;
 
 #[derive(Clone)]
 pub enum Crease<T> {
@@ -133,6 +142,16 @@ pub enum Crease<T> {
         render_toggle: Option<RenderToggleFn>,
         render_trailer: Option<RenderTrailerFn>,
         metadata: Option<CreaseMetadata>,
+        /// If true, the gutter never shows a fold-toggle disclosure for this
+        /// crease's row, even while it's folded. `render_crease_toggle`
+        /// (in `editor.rs`) otherwise shows a toggle for *any* folded row
+        /// regardless of whether the crease responsible has its own
+        /// `render_toggle` — appropriate for a real collapsible region the
+        /// user folded themselves, but wrong for a crease that's a
+        /// permanent decorative text replacement (e.g. glass_md's hidden
+        /// Markdown markers) that was never meant to be toggled via the
+        /// gutter at all. See `Crease::without_gutter_toggle`.
+        hide_gutter_toggle: bool,
     },
     Block {
         range: Range<T>,
@@ -152,6 +171,7 @@ pub struct CreaseMetadata {
 }
 
 impl<T> Crease<T> {
+    #[ztracing::instrument(skip_all)]
     pub fn simple(range: Range<T>, placeholder: FoldPlaceholder) -> Self {
         Crease::Inline {
             range,
@@ -159,9 +179,37 @@ impl<T> Crease<T> {
             render_toggle: None,
             render_trailer: None,
             metadata: None,
+            hide_gutter_toggle: false,
         }
     }
 
+    /// Suppresses the gutter's fold-toggle disclosure for this crease's row.
+    /// See `hide_gutter_toggle`'s doc comment on why a permanent decorative
+    /// crease (as opposed to a real, user-collapsible region) wants this.
+    /// A no-op on a `Block` crease, which doesn't have a gutter disclosure
+    /// wired to it at all.
+    pub fn without_gutter_toggle(self) -> Self {
+        match self {
+            Crease::Inline {
+                range,
+                placeholder,
+                render_toggle,
+                render_trailer,
+                metadata,
+                ..
+            } => Crease::Inline {
+                range,
+                placeholder,
+                render_toggle,
+                render_trailer,
+                metadata,
+                hide_gutter_toggle: true,
+            },
+            Crease::Block { .. } => self,
+        }
+    }
+
+    #[ztracing::instrument(skip_all)]
     pub fn block(range: Range<T>, height: u32, style: BlockStyle, render: RenderBlock) -> Self {
         Self::Block {
             range,
@@ -173,6 +221,7 @@ impl<T> Crease<T> {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn inline<RenderToggle, ToggleElement, RenderTrailer, TrailerElement>(
         range: Range<T>,
         placeholder: FoldPlaceholder,
@@ -192,8 +241,11 @@ impl<T> Crease<T> {
             ) -> ToggleElement
             + 'static,
         ToggleElement: IntoElement,
-        RenderTrailer:
-            'static + Send + Sync + Fn(MultiBufferRow, bool, &mut Window, &mut App) -> TrailerElement + 'static,
+        RenderTrailer: 'static
+            + Send
+            + Sync
+            + Fn(MultiBufferRow, bool, &mut Window, &mut App) -> TrailerElement
+            + 'static,
         TrailerElement: IntoElement,
     {
         Crease::Inline {
@@ -206,9 +258,11 @@ impl<T> Crease<T> {
                 render_trailer(row, folded, window, cx).into_any_element()
             })),
             metadata: None,
+            hide_gutter_toggle: false,
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn with_metadata(self, metadata: CreaseMetadata) -> Self {
         match self {
             Crease::Inline {
@@ -216,6 +270,7 @@ impl<T> Crease<T> {
                 placeholder,
                 render_toggle,
                 render_trailer,
+                hide_gutter_toggle,
                 ..
             } => Crease::Inline {
                 range,
@@ -223,11 +278,13 @@ impl<T> Crease<T> {
                 render_toggle,
                 render_trailer,
                 metadata: Some(metadata),
+                hide_gutter_toggle,
             },
             Crease::Block { .. } => self,
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn range(&self) -> &Range<T> {
         match self {
             Crease::Inline { range, .. } => range,
@@ -235,6 +292,7 @@ impl<T> Crease<T> {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn metadata(&self) -> Option<&CreaseMetadata> {
         match self {
             Self::Inline { metadata, .. } => metadata.as_ref(),
@@ -249,13 +307,17 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Crease::Inline { range, metadata, .. } => f
+            Crease::Inline {
+                range, metadata, ..
+            } => f
                 .debug_struct("Crease::Inline")
                 .field("range", range)
                 .field("metadata", metadata)
                 .finish_non_exhaustive(),
             Crease::Block {
-                range, block_height, ..
+                range,
+                block_height,
+                ..
             } => f
                 .debug_struct("Crease::Block")
                 .field("range", range)
@@ -276,6 +338,7 @@ impl CreaseMap {
         self.snapshot.clone()
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn insert(
         &mut self,
         creases: impl IntoIterator<Item = Crease<Anchor>>,
@@ -301,40 +364,32 @@ impl CreaseMap {
         new_ids
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn remove(
         &mut self,
         ids: impl IntoIterator<Item = CreaseId>,
         snapshot: &MultiBufferSnapshot,
     ) -> Vec<(CreaseId, Range<Anchor>)> {
         let mut removals = Vec::new();
+        let mut ids_to_remove = HashSet::default();
         for id in ids {
             if let Some(range) = self.id_to_range.remove(&id) {
-                removals.push((id, range.clone()));
+                ids_to_remove.insert(id);
+                removals.push((id, range));
             }
         }
-        removals.sort_unstable_by(|(a_id, a_range), (b_id, b_range)| {
-            AnchorRangeExt::cmp(a_range, b_range, snapshot).then(b_id.cmp(a_id))
-        });
 
-        self.snapshot.creases = {
-            let mut new_creases = SumTree::new(snapshot);
-            let mut cursor = self.snapshot.creases.cursor::<ItemSummary>(snapshot);
-
-            for (id, range) in &removals {
-                new_creases.append(cursor.slice(range, Bias::Left), snapshot);
-                while let Some(item) = cursor.item() {
-                    cursor.next();
-                    if item.id == *id {
-                        break;
-                    } else {
+        if !ids_to_remove.is_empty() {
+            self.snapshot.creases = {
+                let mut new_creases = SumTree::new(snapshot);
+                for item in self.snapshot.creases.iter() {
+                    if !ids_to_remove.contains(&item.id) {
                         new_creases.push(item.clone(), snapshot);
                     }
                 }
-            }
-
-            new_creases.append(cursor.suffix(), snapshot);
-            new_creases
-        };
+                new_creases
+            };
+        }
 
         removals
     }
@@ -348,7 +403,7 @@ pub struct ItemSummary {
 impl Default for ItemSummary {
     fn default() -> Self {
         Self {
-            range: Anchor::min()..Anchor::min(),
+            range: Anchor::Min..Anchor::Min,
         }
     }
 }
@@ -368,6 +423,7 @@ impl sum_tree::Summary for ItemSummary {
 impl sum_tree::Item for CreaseItem {
     type Summary = ItemSummary;
 
+    #[ztracing::instrument(skip_all)]
     fn summary(&self, _cx: &MultiBufferSnapshot) -> Self::Summary {
         ItemSummary {
             range: self.crease.range().clone(),
@@ -377,12 +433,14 @@ impl sum_tree::Item for CreaseItem {
 
 /// Implements `SeekTarget` for `Range<Anchor>` to enable seeking within a `SumTree` of `CreaseItem`s.
 impl SeekTarget<'_, ItemSummary, ItemSummary> for Range<Anchor> {
+    #[ztracing::instrument(skip_all)]
     fn cmp(&self, cursor_location: &ItemSummary, snapshot: &MultiBufferSnapshot) -> Ordering {
         AnchorRangeExt::cmp(self, &cursor_location.range, snapshot)
     }
 }
 
 impl SeekTarget<'_, ItemSummary, ItemSummary> for Anchor {
+    #[ztracing::instrument(skip_all)]
     fn cmp(&self, other: &ItemSummary, snapshot: &MultiBufferSnapshot) -> Ordering {
         self.cmp(&other.range.start, snapshot)
     }
@@ -421,19 +479,36 @@ mod test {
 
         // Verify creases are inserted
         let crease_snapshot = crease_map.snapshot();
-        assert!(crease_snapshot.query_row(MultiBufferRow(1), &snapshot).is_some());
-        assert!(crease_snapshot.query_row(MultiBufferRow(3), &snapshot).is_some());
+        assert!(
+            crease_snapshot
+                .query_row(MultiBufferRow(1), &snapshot)
+                .is_some()
+        );
+        assert!(
+            crease_snapshot
+                .query_row(MultiBufferRow(3), &snapshot)
+                .is_some()
+        );
 
         // Remove creases
         crease_map.remove(crease_ids, &snapshot);
 
         // Verify creases are removed
         let crease_snapshot = crease_map.snapshot();
-        assert!(crease_snapshot.query_row(MultiBufferRow(1), &snapshot).is_none());
-        assert!(crease_snapshot.query_row(MultiBufferRow(3), &snapshot).is_none());
+        assert!(
+            crease_snapshot
+                .query_row(MultiBufferRow(1), &snapshot)
+                .is_none()
+        );
+        assert!(
+            crease_snapshot
+                .query_row(MultiBufferRow(3), &snapshot)
+                .is_none()
+        );
     }
 
     #[gpui::test]
+    #[ztracing::instrument(skip_all)]
     fn test_creases_in_range(cx: &mut App) {
         let text = "line1\nline2\nline3\nline4\nline5\nline6\nline7";
         let buffer = MultiBuffer::build_simple(text, cx);

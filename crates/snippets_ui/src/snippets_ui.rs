@@ -1,11 +1,11 @@
-use file_finder::file_finder_settings::FileFinderSettings;
 use file_icons::FileIcons;
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, Focusable, ParentElement, Render, Styled, WeakEntity, Window,
-    actions,
+    App, Context, DismissEvent, Entity, EventEmitter, Focusable, ParentElement, Render, Styled,
+    TaskExt, WeakEntity, Window, actions,
 };
 use language::{LanguageMatcher, LanguageName, LanguageRegistry};
+use open_path_prompt::file_finder_settings::FileFinderSettings;
 use paths::snippets_dir;
 use picker::{Picker, PickerDelegate};
 use settings::Settings;
@@ -87,7 +87,12 @@ fn configure_snippets(
     });
 }
 
-fn open_folder(workspace: &mut Workspace, _: &OpenFolder, _: &mut Window, cx: &mut Context<Workspace>) {
+fn open_folder(
+    workspace: &mut Workspace,
+    _: &OpenFolder,
+    _: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     fs::create_dir_all(snippets_dir()).notify_err(workspace, cx);
     cx.open_with_system(snippets_dir().borrow());
 }
@@ -103,7 +108,8 @@ impl ScopeSelector {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let delegate = ScopeSelectorDelegate::new(workspace, cx.entity().downgrade(), language_registry);
+        let delegate =
+            ScopeSelectorDelegate::new(workspace, cx.entity().downgrade(), language_registry);
 
         let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx));
 
@@ -123,7 +129,7 @@ impl Focusable for ScopeSelector {
 
 impl Render for ScopeSelector {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().w(rems(34.)).child(self.picker.clone())
+        v_flex().child(self.picker.clone())
     }
 }
 
@@ -161,7 +167,8 @@ impl ScopeSelectorDelegate {
                         && extension.to_os_string().to_str() == Some("json")
                         && let Ok(file_name) = stem.to_os_string().into_string()
                     {
-                        existing_scopes.insert(ScopeName::from(ScopeFileName(Cow::Owned(file_name))));
+                        existing_scopes
+                            .insert(ScopeName::from(ScopeFileName(Cow::Owned(file_name))));
                     }
                 }
             }
@@ -192,6 +199,10 @@ impl ScopeSelectorDelegate {
 impl PickerDelegate for ScopeSelectorDelegate {
     type ListItem = ListItem;
 
+    fn name() -> &'static str {
+        "snippet scope selector"
+    }
+
     fn placeholder_text(&self, _window: &mut Window, _: &mut App) -> Arc<str> {
         "Select snippet scope...".into()
     }
@@ -209,7 +220,7 @@ impl PickerDelegate for ScopeSelectorDelegate {
                 cx.spawn_in(window, async move |_, cx| {
                     let scope_file_name = ScopeFileName(match scope_name.to_lowercase().as_str() {
                         GLOBAL_SCOPE_NAME => Cow::Borrowed(GLOBAL_SCOPE_FILE_NAME),
-                        _ => Cow::Owned(language.await?.lsp_id()),
+                        _ => Cow::Owned(language.await?.snippet_scope_id()),
                     });
 
                     workspace.update_in(cx, |workspace, window, cx| {
@@ -237,18 +248,30 @@ impl PickerDelegate for ScopeSelectorDelegate {
     }
 
     fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
-        self.scope_selector.update(cx, |_, cx| cx.emit(DismissEvent)).log_err();
+        self.scope_selector
+            .update(cx, |_, cx| cx.emit(DismissEvent))
+            .ok();
     }
 
     fn selected_index(&self) -> usize {
         self.selected_index
     }
 
-    fn set_selected_index(&mut self, ix: usize, _window: &mut Window, _: &mut Context<Picker<Self>>) {
+    fn set_selected_index(
+        &mut self,
+        ix: usize,
+        _window: &mut Window,
+        _: &mut Context<Picker<Self>>,
+    ) {
         self.selected_index = ix;
     }
 
-    fn update_matches(&mut self, query: String, window: &mut Window, cx: &mut Context<Picker<Self>>) -> gpui::Task<()> {
+    fn update_matches(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> gpui::Task<()> {
         let background = cx.background_executor().clone();
         let candidates = self.candidates.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -264,13 +287,24 @@ impl PickerDelegate for ScopeSelectorDelegate {
                     })
                     .collect()
             } else {
-                match_strings(&candidates, &query, false, true, 100, &Default::default(), background).await
+                match_strings(
+                    &candidates,
+                    &query,
+                    false,
+                    true,
+                    100,
+                    &Default::default(),
+                    background,
+                )
+                .await
             };
 
             this.update(cx, |this, cx| {
                 let delegate = &mut this.delegate;
                 delegate.matches = matches;
-                delegate.selected_index = delegate.selected_index.min(delegate.matches.len().saturating_sub(1));
+                delegate.selected_index = delegate
+                    .selected_index
+                    .min(delegate.matches.len().saturating_sub(1));
                 cx.notify();
             })
             .log_err();
@@ -288,7 +322,7 @@ impl PickerDelegate for ScopeSelectorDelegate {
         let name_label = mat.string.clone();
 
         let scope_name = ScopeName(Cow::Owned(
-            LanguageName::new(&self.candidates[mat.candidate_id].string).lsp_id(),
+            LanguageName::new(&self.candidates[mat.candidate_id].string).snippet_scope_id(),
         ));
         let file_label = if self.existing_scopes.contains(&scope_name) {
             Some(ScopeFileName::from(scope_name).with_extension())
@@ -301,7 +335,12 @@ impl PickerDelegate for ScopeSelectorDelegate {
             self.language_registry
                 .available_language_for_name(language_name.as_ref())
                 .and_then(|available_language| self.scope_icon(available_language.matcher(), cx))
-                .or_else(|| Some(Icon::from_path(IconName::ToolWeb.path()).map(|icon| icon.color(Color::Muted))))
+                .or_else(|| {
+                    Some(
+                        Icon::from_path(IconName::ToolWeb.path())
+                            .map(|icon| icon.color(Color::Muted)),
+                    )
+                })
         } else {
             None
         };
@@ -317,7 +356,11 @@ impl PickerDelegate for ScopeSelectorDelegate {
                         .gap_x_2()
                         .child(HighlightedLabel::new(name_label, mat.positions.clone()))
                         .when_some(file_label, |item, path_label| {
-                            item.child(Label::new(path_label).color(Color::Muted).size(LabelSize::Small))
+                            item.child(
+                                Label::new(path_label)
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
                         }),
                 ),
         )

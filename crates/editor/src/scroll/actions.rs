@@ -1,11 +1,9 @@
-use super::Axis;
 use crate::{
-    Autoscroll, Editor, EditorMode, EditorSettings, NextScreen, NextScrollCursorCenterTopBottom,
-    SCROLL_CENTER_TOP_BOTTOM_DEBOUNCE_TIMEOUT, ScrollCursorBottom, ScrollCursorCenter, ScrollCursorCenterTopBottom,
-    ScrollCursorTop, display_map::DisplayRow, scroll::ScrollOffset,
+    Autoscroll, Editor, EditorMode, NextScreen, NextScrollCursorCenterTopBottom,
+    SCROLL_CENTER_TOP_BOTTOM_DEBOUNCE_TIMEOUT, ScrollCursorBottom, ScrollCursorCenter,
+    ScrollCursorCenterTopBottom, ScrollCursorTop, display_map::DisplayRow, scroll::ScrollOffset,
 };
 use gpui::{Context, Point, Window};
-use settings::Settings;
 
 impl Editor {
     pub fn next_screen(&mut self, _: &NextScreen, window: &mut Window, cx: &mut Context<Editor>) {
@@ -27,22 +25,10 @@ impl Editor {
     pub fn scroll(
         &mut self,
         scroll_position: Point<ScrollOffset>,
-        axis: Option<Axis>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let smooth_scroll_enabled = EditorSettings::get_global(cx).smooth_scroll.enabled;
-        if !smooth_scroll_enabled {
-            self.scroll_manager.update_ongoing_scroll(axis);
-            self.set_scroll_position(scroll_position, window, cx);
-            return;
-        }
-
-        let current_position = self.scroll_position(cx);
-        self.scroll_manager.update_ongoing_scroll(axis);
-        self.scroll_manager.start_animation(current_position, scroll_position);
-
-        cx.notify();
+        self.set_scroll_position(scroll_position, window, cx);
     }
 
     pub fn scroll_cursor_center_top_bottom(
@@ -76,20 +62,40 @@ impl Editor {
         });
     }
 
-    pub fn scroll_cursor_top(&mut self, _: &ScrollCursorTop, window: &mut Window, cx: &mut Context<Editor>) {
+    pub fn scroll_cursor_top(
+        &mut self,
+        _: &ScrollCursorTop,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) {
         let display_snapshot = self.display_snapshot(cx);
         let scroll_margin_rows = self.vertical_scroll_margin() as u32;
-        let new_screen_top = self.selections.newest_display(&display_snapshot).head().row().0;
+        let selection_head = self.selections.newest_display(&display_snapshot).head();
+
+        let sticky_headers_len =
+            self.visible_sticky_header_count_for_point(&display_snapshot, selection_head, cx)
+                as u32;
+
+        let new_screen_top = selection_head.row().0;
         let header_offset = display_snapshot
             .buffer_snapshot()
             .show_headers()
             .then(|| display_snapshot.buffer_header_height())
             .unwrap_or(0);
-        let new_screen_top = new_screen_top.saturating_sub(scroll_margin_rows + header_offset);
+
+        // If the number of sticky headers exceeds the vertical_scroll_margin,
+        // we need to adjust the scroll top a bit further
+        let adjustment = scroll_margin_rows.max(sticky_headers_len) + header_offset;
+        let new_screen_top = new_screen_top.saturating_sub(adjustment);
         self.set_scroll_top_row(DisplayRow(new_screen_top), window, cx);
     }
 
-    pub fn scroll_cursor_center(&mut self, _: &ScrollCursorCenter, window: &mut Window, cx: &mut Context<Editor>) {
+    pub fn scroll_cursor_center(
+        &mut self,
+        _: &ScrollCursorCenter,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) {
         let Some(visible_rows) = self.visible_line_count().map(|count| count as u32) else {
             return;
         };
@@ -103,7 +109,12 @@ impl Editor {
         self.set_scroll_top_row(DisplayRow(new_screen_top), window, cx);
     }
 
-    pub fn scroll_cursor_bottom(&mut self, _: &ScrollCursorBottom, window: &mut Window, cx: &mut Context<Editor>) {
+    pub fn scroll_cursor_bottom(
+        &mut self,
+        _: &ScrollCursorBottom,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) {
         let scroll_margin_rows = self.vertical_scroll_margin() as u32;
         let Some(visible_rows) = self.visible_line_count().map(|count| count as u32) else {
             return;
@@ -114,7 +125,8 @@ impl Editor {
             .head()
             .row()
             .0;
-        let new_screen_top = new_screen_top.saturating_sub(visible_rows.saturating_sub(scroll_margin_rows));
+        let new_screen_top =
+            new_screen_top.saturating_sub(visible_rows.saturating_sub(scroll_margin_rows));
         self.set_scroll_top_row(DisplayRow(new_screen_top), window, cx);
     }
 }

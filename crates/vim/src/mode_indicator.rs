@@ -1,7 +1,8 @@
-use gpui::{Context, Element, Entity, FontWeight, Render, Subscription, WeakEntity, Window, div};
-use settings::Settings;
-use ui::{Tooltip, text_for_keystrokes};
-use workspace::{StatusBarSettings, StatusItemView, item::ItemHandle, ui::prelude::*};
+use gpui::{
+    App, Context, Element, Entity, FontWeight, Render, Subscription, WeakEntity, Window, div,
+};
+use ui::text_for_keystrokes;
+use workspace::{HideStatusItem, StatusItemView, item::ItemHandle, ui::prelude::*};
 
 use crate::{Vim, VimEvent, VimGlobals};
 
@@ -34,7 +35,8 @@ impl ModeIndicator {
             handle.update(cx, |_, cx| {
                 cx.subscribe(&vim, |mode_indicator, vim, event, cx| match event {
                     VimEvent::Focused => {
-                        mode_indicator.vim_subscription = Some(cx.observe(&vim, |_, _, cx| cx.notify()));
+                        mode_indicator.vim_subscription =
+                            Some(cx.observe(&vim, |_, _, cx| cx.notify()));
                         mode_indicator.vim = Some(vim.downgrade());
                     }
                 })
@@ -68,18 +70,25 @@ impl ModeIndicator {
 
         let vim = vim.read(cx);
         recording
-            .chain(cx.global::<VimGlobals>().pre_count.map(|count| format!("{}", count)))
+            .chain(
+                cx.global::<VimGlobals>()
+                    .pre_count
+                    .map(|count| format!("{}", count)),
+            )
             .chain(vim.selected_register.map(|reg| format!("\"{reg}")))
             .chain(vim.operator_stack.iter().map(|item| item.status()))
-            .chain(cx.global::<VimGlobals>().post_count.map(|count| format!("{}", count)))
+            .chain(
+                cx.global::<VimGlobals>()
+                    .post_count
+                    .map(|count| format!("{}", count)),
+            )
             .collect::<Vec<_>>()
-            .join("")
+            .concat()
     }
 }
 
 impl Render for ModeIndicator {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let icon_size = StatusBarSettings::get_global(cx).icon_size;
         let vim = self.vim();
         let Some(vim) = vim else {
             return div().hidden().into_any_element();
@@ -93,7 +102,16 @@ impl Render for ModeIndicator {
         let theme = cx.theme();
         let colors = theme.colors();
         let system_transparent = gpui::hsla(0.0, 0.0, 0.0, 0.0);
-        let vim_mode_text = colors.vim_mode_text;
+        let vim_mode_text = match mode {
+            crate::state::Mode::Normal => colors.vim_normal_foreground,
+            crate::state::Mode::Insert => colors.vim_insert_foreground,
+            crate::state::Mode::Replace => colors.vim_replace_foreground,
+            crate::state::Mode::Visual => colors.vim_visual_foreground,
+            crate::state::Mode::VisualLine => colors.vim_visual_line_foreground,
+            crate::state::Mode::VisualBlock => colors.vim_visual_block_foreground,
+            crate::state::Mode::HelixNormal => colors.vim_helix_normal_foreground,
+            crate::state::Mode::HelixSelect => colors.vim_helix_select_foreground,
+        };
         let bg_color = match mode {
             crate::state::Mode::Normal => colors.vim_normal_background,
             crate::state::Mode::Insert => colors.vim_insert_background,
@@ -105,7 +123,8 @@ impl Render for ModeIndicator {
             crate::state::Mode::HelixSelect => colors.vim_helix_select_background,
         };
 
-        let (label, mode): (SharedString, Option<SharedString>) = if let Some(label) = status_label {
+        let (label, mode): (SharedString, Option<SharedString>) = if let Some(label) = status_label
+        {
             (label, None)
         } else {
             let mode_str = if temp_mode {
@@ -115,28 +134,46 @@ impl Render for ModeIndicator {
             };
 
             let current_operators_description = self.current_operators_description(vim.clone(), cx);
-            let pending = self.pending_keys.as_ref().unwrap_or(&current_operators_description);
-            (pending.into(), Some(mode_str.into()))
+            let pending = self
+                .pending_keys
+                .as_ref()
+                .unwrap_or(&current_operators_description);
+            let mode = if bg_color != system_transparent {
+                mode_str.into()
+            } else {
+                format!("-- {} --", mode_str).into()
+            };
+            (pending.into(), Some(mode))
         };
         h_flex()
+            .h(ButtonSize::Default.rems())
             .gap_1()
             .when(!label.is_empty(), |el| {
                 el.child(
                     Label::new(label)
-                        .line_height_style(LineHeightStyle::UiLabel)
+                        .size(LabelSize::Small)
                         .weight(FontWeight::MEDIUM),
                 )
             })
             .when_some(mode, |el, mode| {
                 el.child(
-                    Button::new("vim-mode-button", &mode)
-                        .label_size(icon_size.label_size())
-                        .style(ButtonStyle::Background(bg_color))
-                        .when(
-                            bg_color != system_transparent && vim_mode_text != system_transparent,
-                            |el| el.color(Color::Custom(vim_mode_text)),
-                        )
-                        .tooltip(Tooltip::text(format!("Active mode: {}", mode))),
+                    v_flex()
+                        .when(bg_color != system_transparent, |el| el.px_2())
+                        // match with other icons at the bottom that use default buttons
+                        .h(ButtonSize::Default.rems())
+                        .justify_center()
+                        .rounded_sm()
+                        .bg(bg_color)
+                        .child(
+                            Label::new(mode)
+                                .size(LabelSize::Small)
+                                .weight(FontWeight::MEDIUM)
+                                .when(
+                                    bg_color != system_transparent
+                                        && vim_mode_text != system_transparent,
+                                    |el| el.color(Color::Custom(vim_mode_text)),
+                                ),
+                        ),
                 )
             })
             .into_any()
@@ -150,5 +187,10 @@ impl StatusItemView for ModeIndicator {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        // The Vim mode indicator is only visible while Vim mode is on.
+        None
     }
 }

@@ -1,26 +1,28 @@
+use super::breakpoint_store::{
+    BreakpointStore, BreakpointStoreEvent, BreakpointUpdatedReason, SourceBreakpoint,
+};
+use super::dap_command::{
+    self, Attach, ConfigurationDone, ContinueCommand, DataBreakpointInfoCommand, DisconnectCommand,
+    EvaluateCommand, Initialize, Launch, LoadedSourcesCommand, LocalDapCommand, LocationsCommand,
+    ModulesCommand, NextCommand, PauseCommand, RestartCommand, RestartStackFrameCommand,
+    ScopesCommand, SetDataBreakpointsCommand, SetExceptionBreakpoints, SetVariableValueCommand,
+    StackTraceCommand, StepBackCommand, StepCommand, StepInCommand, StepOutCommand,
+    TerminateCommand, TerminateThreadsCommand, ThreadsCommand, VariablesCommand,
+};
+use super::dap_store::DapStore;
 use crate::debugger::breakpoint_store::BreakpointSessionState;
 use crate::debugger::dap_command::{DataBreakpointContext, ReadMemory};
 use crate::debugger::memory::{self, Memory, MemoryIterator, MemoryPageBuilder, PageAddress};
-
-use super::breakpoint_store::{BreakpointStore, BreakpointStoreEvent, BreakpointUpdatedReason, SourceBreakpoint};
-use super::dap_command::{
-    self, Attach, ConfigurationDone, ContinueCommand, DataBreakpointInfoCommand, DisconnectCommand, EvaluateCommand,
-    Initialize, Launch, LoadedSourcesCommand, LocalDapCommand, LocationsCommand, ModulesCommand, NextCommand,
-    PauseCommand, RestartCommand, RestartStackFrameCommand, ScopesCommand, SetDataBreakpointsCommand,
-    SetExceptionBreakpoints, SetVariableValueCommand, StackTraceCommand, StepBackCommand, StepCommand, StepInCommand,
-    StepOutCommand, TerminateCommand, TerminateThreadsCommand, ThreadsCommand, VariablesCommand,
-};
-use super::dap_store::DapStore;
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine;
-use collections::{HashMap, HashSet, IndexMap};
+use collections::{HashMap, HashSet, IndexMap, TypeIdHashMap};
 use dap::adapters::{DebugAdapterBinary, DebugAdapterName};
 use dap::messages::Response;
 use dap::requests::{Request, RunInTerminal, StartDebugging};
 use dap::transport::TcpTransport;
 use dap::{
-    Capabilities, ContinueArguments, EvaluateArgumentsContext, Module, Source, StackFrameId, SteppingGranularity,
-    StoppedEvent, VariableReference,
+    Capabilities, ContinueArguments, EvaluateArgumentsContext, Module, Source, StackFrameId,
+    SteppingGranularity, StoppedEvent, VariableReference,
     client::{DebugAdapterClient, SessionId},
     messages::{Events, Message},
 };
@@ -35,24 +37,21 @@ use futures::io::BufReader;
 use futures::{AsyncBufReadExt as _, SinkExt, StreamExt, TryStreamExt};
 use futures::{FutureExt, future::Shared};
 use gpui::{
-    App, AppContext, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, SharedString, Task, WeakEntity,
+    App, AppContext, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, SharedString,
+    Task, TaskExt, WeakEntity,
 };
 use http_client::HttpClient;
-
 use node_runtime::NodeRuntime;
 use remote::RemoteClient;
-use rpc::ErrorExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use smol::net::{TcpListener, TcpStream};
 use std::any::TypeId;
-use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::collections::{BTreeMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
-use std::u64;
 use std::{
     any::Any,
     collections::hash_map::Entry,
@@ -60,12 +59,16 @@ use std::{
     path::Path,
     sync::Arc,
 };
-use task::TaskContext;
+use task::SharedTaskContext;
 use text::{PointUtf16, ToPointUtf16};
 use url::Url;
-use util::command::new_smol_command;
+use util::command::Stdio;
+use util::command::new_command;
 use util::{ResultExt, debug_panic, maybe};
 use worktree::Worktree;
+
+const MAX_TRACKED_OUTPUT_EVENTS: usize = 5000;
+const DEBUG_HISTORY_LIMIT: usize = 10;
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, PartialOrd, Ord, Eq)]
 #[repr(transparent)]
@@ -114,11 +117,11 @@ impl ThreadStatus {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Thread {
     dap: dap::Thread,
     stack_frames: Vec<StackFrame>,
-    stack_frames_error: Option<anyhow::Error>,
+    stack_frames_error: Option<SharedString>,
     _has_stopped: bool,
 }
 
@@ -205,9 +208,8 @@ impl RunningMode {
             }
         });
 
-        let client = if let Some(client) = parent_session
-            .and_then(|session| cx.update(|cx| session.read(cx).adapter_client()).ok())
-            .flatten()
+        let client = if let Some(client) =
+            parent_session.and_then(|session| cx.update(|cx| session.read(cx).adapter_client()))
         {
             client
                 .create_child_connection(session_id, binary.clone(), message_handler, cx)
@@ -245,12 +247,15 @@ impl RunningMode {
             .collect();
 
         cx.background_spawn(async move {
-            futures::future::join_all(tasks).await.iter().for_each(|res| match res {
-                Ok(_) => {}
-                Err(err) => {
-                    log::warn!("Set breakpoints request failed: {}", err);
-                }
-            });
+            futures::future::join_all(tasks)
+                .await
+                .iter()
+                .for_each(|res| match res {
+                    Ok(_) => {}
+                    Err(err) => {
+                        log::warn!("Set breakpoints request failed: {}", err);
+                    }
+                });
         })
     }
 
@@ -261,18 +266,17 @@ impl RunningMode {
         breakpoint_store: &Entity<BreakpointStore>,
         cx: &mut App,
     ) -> Task<()> {
-        let breakpoints = breakpoint_store
-            .read(cx)
-            .source_breakpoints_from_path(&abs_path, cx)
-            .into_iter()
-            .filter(|bp| bp.state.is_enabled())
-            .chain(
-                self.tmp_breakpoint
-                    .iter()
-                    .filter_map(|breakpoint| breakpoint.path.eq(&abs_path).then(|| breakpoint.clone())),
-            )
-            .map(Into::into)
-            .collect();
+        let breakpoints =
+            breakpoint_store
+                .read(cx)
+                .source_breakpoints_from_path(&abs_path, cx)
+                .into_iter()
+                .filter(|bp| bp.state.is_enabled())
+                .chain(self.tmp_breakpoint.iter().filter_map(|breakpoint| {
+                    breakpoint.path.eq(&abs_path).then(|| breakpoint.clone())
+                }))
+                .map(Into::into)
+                .collect();
 
         let raw_breakpoints = breakpoint_store
             .read(cx)
@@ -290,18 +294,19 @@ impl RunningMode {
         let breakpoint_store = breakpoint_store.downgrade();
         cx.spawn(async move |cx| match cx.background_spawn(task).await {
             Ok(breakpoints) => {
-                let breakpoints = breakpoints
-                    .into_iter()
-                    .zip(raw_breakpoints)
-                    .filter_map(|(dap_bp, editor_bp)| {
-                        Some((
-                            editor_bp,
-                            BreakpointSessionState {
-                                id: dap_bp.id?,
-                                verified: dap_bp.verified,
-                            },
-                        ))
-                    });
+                let breakpoints =
+                    breakpoints
+                        .into_iter()
+                        .zip(raw_breakpoints)
+                        .filter_map(|(dap_bp, zed_bp)| {
+                            Some((
+                                zed_bp,
+                                BreakpointSessionState {
+                                    id: dap_bp.id?,
+                                    verified: dap_bp.verified,
+                                },
+                            ))
+                        });
                 breakpoint_store
                     .update(cx, |this, _| {
                         this.mark_breakpoints_verified(session_id, &abs_path, breakpoints);
@@ -377,18 +382,17 @@ impl RunningMode {
                 async move |cx| {
                     let breakpoints = cx.background_spawn(send_request).await?;
 
-                    let breakpoints = breakpoints
-                        .into_iter()
-                        .zip(raw_breakpoints)
-                        .filter_map(|(dap_bp, editor_bp)| {
+                    let breakpoints = breakpoints.into_iter().zip(raw_breakpoints).filter_map(
+                        |(dap_bp, zed_bp)| {
                             Some((
-                                editor_bp,
+                                zed_bp,
                                 BreakpointSessionState {
                                     id: dap_bp.id?,
                                     verified: dap_bp.verified,
                                 },
                             ))
-                        });
+                        },
+                    );
                     breakpoint_store
                         .update(cx, |this, _| {
                             this.mark_breakpoints_verified(session_id, &path, breakpoints);
@@ -421,8 +425,12 @@ impl RunningMode {
 
         // Of relevance: https://github.com/microsoft/vscode/issues/4902#issuecomment-368583522
         let launch = match raw.request {
-            dap::StartDebuggingRequestArgumentsRequest::Launch => self.request(Launch { raw: raw.configuration }),
-            dap::StartDebuggingRequestArgumentsRequest::Attach => self.request(Attach { raw: raw.configuration }),
+            dap::StartDebuggingRequestArgumentsRequest::Launch => self.request(Launch {
+                raw: raw.configuration,
+            }),
+            dap::StartDebuggingRequestArgumentsRequest::Attach => self.request(Attach {
+                raw: raw.configuration,
+            }),
         };
 
         let configuration_done_supported = ConfigurationDone::is_supported(capabilities);
@@ -435,22 +443,28 @@ impl RunningMode {
             .as_ref()
             .is_some_and(|filters| !filters.is_empty())
             || !configuration_done_supported;
-        let supports_exception_filters = capabilities.supports_exception_filter_options.unwrap_or_default();
+        let supports_exception_filters = capabilities
+            .supports_exception_filter_options
+            .unwrap_or_default();
         let this = self.clone();
         let worktree = self.worktree().clone();
-        let mut filters = capabilities.exception_breakpoint_filters.clone().unwrap_or_default();
+        let mut filters = capabilities
+            .exception_breakpoint_filters
+            .clone()
+            .unwrap_or_default();
         let configuration_sequence = cx.spawn({
             async move |session, cx| {
                 let adapter_name = session.read_with(cx, |this, _| this.adapter())?;
-                let (breakpoint_store, adapter_defaults) = dap_store.read_with(cx, |dap_store, _| {
-                    (
-                        dap_store.breakpoint_store().clone(),
-                        dap_store.adapter_options(&adapter_name),
-                    )
-                })?;
+                let (breakpoint_store, adapter_defaults) =
+                    dap_store.read_with(cx, |dap_store, _| {
+                        (
+                            dap_store.breakpoint_store().clone(),
+                            dap_store.adapter_options(&adapter_name),
+                        )
+                    })?;
                 initialized_rx.await?;
                 let errors_by_path = cx
-                    .update(|cx| this.send_source_breakpoints(false, &breakpoint_store, cx))?
+                    .update(|cx| this.send_source_breakpoints(false, &breakpoint_store, cx))
                     .await;
 
                 dap_store.update(cx, |_, cx| {
@@ -572,7 +586,9 @@ impl SessionState {
     {
         match self {
             SessionState::Running(debug_adapter_client) => debug_adapter_client.request(request),
-            SessionState::Booting(_) => Task::ready(Err(anyhow!("no adapter running to send request: {request:?}"))),
+            SessionState::Booting(_) => Task::ready(Err(anyhow!(
+                "no adapter running to send request: {request:?}"
+            ))),
         }
     }
 
@@ -614,38 +630,58 @@ impl ThreadStates {
     }
 
     fn stop_thread(&mut self, thread_id: ThreadId) {
-        self.known_thread_states.insert(thread_id, ThreadStatus::Stopped);
+        self.known_thread_states
+            .insert(thread_id, ThreadStatus::Stopped);
     }
 
     fn continue_thread(&mut self, thread_id: ThreadId) {
-        self.known_thread_states.insert(thread_id, ThreadStatus::Running);
+        self.known_thread_states
+            .insert(thread_id, ThreadStatus::Running);
     }
 
     fn process_step(&mut self, thread_id: ThreadId) {
-        self.known_thread_states.insert(thread_id, ThreadStatus::Stepping);
+        self.known_thread_states
+            .insert(thread_id, ThreadStatus::Stepping);
     }
 
     fn thread_status(&self, thread_id: ThreadId) -> ThreadStatus {
-        self.thread_state(thread_id).unwrap_or(ThreadStatus::Running)
+        self.thread_state(thread_id)
+            .unwrap_or(ThreadStatus::Running)
     }
 
     fn thread_state(&self, thread_id: ThreadId) -> Option<ThreadStatus> {
-        self.known_thread_states.get(&thread_id).copied().or(self.global_state)
+        self.known_thread_states
+            .get(&thread_id)
+            .copied()
+            .or(self.global_state)
     }
 
     fn exit_thread(&mut self, thread_id: ThreadId) {
-        self.known_thread_states.insert(thread_id, ThreadStatus::Exited);
+        self.known_thread_states
+            .insert(thread_id, ThreadStatus::Exited);
     }
 
     fn any_stopped_thread(&self) -> bool {
-        self.global_state.is_some_and(|state| state == ThreadStatus::Stopped)
+        self.global_state
+            .is_some_and(|state| state == ThreadStatus::Stopped)
             || self
                 .known_thread_states
                 .values()
                 .any(|status| *status == ThreadStatus::Stopped)
     }
 }
-const MAX_TRACKED_OUTPUT_EVENTS: usize = 5000;
+
+// TODO(debugger): Wrap dap types with reference counting so the UI doesn't have to clone them on refresh
+#[derive(Default)]
+pub struct SessionSnapshot {
+    threads: IndexMap<ThreadId, Thread>,
+    thread_states: ThreadStates,
+    variables: HashMap<VariableReference, Vec<dap::Variable>>,
+    stack_frames: IndexMap<StackFrameId, StackFrame>,
+    locations: HashMap<u64, dap::LocationsResponse>,
+    modules: Vec<dap::Module>,
+    loaded_sources: Vec<dap::Source>,
+}
 
 type IsEnabled = bool;
 
@@ -653,32 +689,28 @@ type IsEnabled = bool;
 pub struct OutputToken(pub usize);
 /// Represents a current state of a single debug adapter and provides ways to mutate it.
 pub struct Session {
-    pub mode: SessionState,
+    pub state: SessionState,
+    active_snapshot: SessionSnapshot,
+    snapshots: VecDeque<SessionSnapshot>,
+    selected_snapshot_index: Option<usize>,
     id: SessionId,
     label: Option<SharedString>,
     adapter: DebugAdapterName,
     pub(super) capabilities: Capabilities,
     child_session_ids: HashSet<SessionId>,
     parent_session: Option<Entity<Session>>,
-    modules: Vec<dap::Module>,
-    loaded_sources: Vec<dap::Source>,
     output_token: OutputToken,
-    output: Box<circular_buffer::FixedCircularBuffer<dap::OutputEvent, MAX_TRACKED_OUTPUT_EVENTS>>,
-    threads: IndexMap<ThreadId, Thread>,
-    thread_states: ThreadStates,
+    output: Box<circular_buffer::CircularBuffer<MAX_TRACKED_OUTPUT_EVENTS, dap::OutputEvent>>,
     watchers: HashMap<SharedString, Watcher>,
-    variables: HashMap<VariableReference, Vec<dap::Variable>>,
-    stack_frames: IndexMap<StackFrameId, StackFrame>,
-    locations: HashMap<u64, dap::LocationsResponse>,
     is_session_terminated: bool,
-    requests: HashMap<TypeId, HashMap<RequestSlot, Shared<Task<Option<()>>>>>,
+    requests: TypeIdHashMap<HashMap<RequestSlot, Shared<Task<Option<()>>>>>,
     pub(crate) breakpoint_store: Entity<BreakpointStore>,
     ignore_breakpoints: bool,
     exception_breakpoints: BTreeMap<String, (ExceptionBreakpointsFilter, IsEnabled)>,
     data_breakpoints: BTreeMap<String, DataBreakpointState>,
     background_tasks: Vec<Task<()>>,
     restart_task: Option<Task<()>>,
-    task_context: TaskContext,
+    task_context: SharedTaskContext,
     memory: memory::Memory,
     quirks: SessionQuirks,
     remote_client: Option<Entity<RemoteClient>>,
@@ -742,7 +774,11 @@ pub struct CompletionsQuery {
 }
 
 impl CompletionsQuery {
-    pub fn new(buffer: &language::Buffer, cursor_position: language::Anchor, frame_id: Option<u64>) -> Self {
+    pub fn new(
+        buffer: &language::Buffer,
+        cursor_position: language::Anchor,
+        frame_id: Option<u64>,
+    ) -> Self {
         let PointUtf16 { row, column } = cursor_position.to_point_utf16(&buffer.snapshot());
         Self {
             query: buffer.text(),
@@ -770,6 +806,7 @@ pub enum SessionEvent {
     },
     DataBreakpointInfo,
     ConsoleOutput,
+    HistoricSnapshotSelected,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -777,7 +814,9 @@ pub enum SessionStateEvent {
     Running,
     Shutdown,
     Restart,
-    SpawnChildSession { request: StartDebuggingRequestArguments },
+    SpawnChildSession {
+        request: StartDebuggingRequestArguments,
+    },
 }
 
 impl EventEmitter<SessionEvent> for Session {}
@@ -793,7 +832,7 @@ impl Session {
         parent_session: Option<Entity<Session>>,
         label: Option<SharedString>,
         adapter: DebugAdapterName,
-        task_context: TaskContext,
+        task_context: SharedTaskContext,
         quirks: SessionQuirks,
         remote_client: Option<Entity<RemoteClient>>,
         node_runtime: Option<NodeRuntime>,
@@ -803,14 +842,20 @@ impl Session {
         cx.new::<Self>(|cx| {
             cx.subscribe(&breakpoint_store, |this, store, event, cx| match event {
                 BreakpointStoreEvent::BreakpointsUpdated(path, reason) => {
-                    if let Some(local) = (!this.ignore_breakpoints).then(|| this.as_running_mut()).flatten() {
+                    if let Some(local) = (!this.ignore_breakpoints)
+                        .then(|| this.as_running_mut())
+                        .flatten()
+                    {
                         local
                             .send_breakpoints_from_path(path.clone(), *reason, &store, cx)
                             .detach();
                     };
                 }
                 BreakpointStoreEvent::BreakpointsCleared(paths) => {
-                    if let Some(local) = (!this.ignore_breakpoints).then(|| this.as_running_mut()).flatten() {
+                    if let Some(local) = (!this.ignore_breakpoints)
+                        .then(|| this.as_running_mut())
+                        .flatten()
+                    {
                         local.unset_breakpoints_from_paths(paths, cx).detach();
                     }
                 }
@@ -819,24 +864,20 @@ impl Session {
             .detach();
 
             Self {
-                mode: SessionState::Booting(None),
+                state: SessionState::Booting(None),
+                snapshots: VecDeque::with_capacity(DEBUG_HISTORY_LIMIT),
+                selected_snapshot_index: None,
+                active_snapshot: Default::default(),
                 id: session_id,
                 child_session_ids: HashSet::default(),
                 parent_session,
                 capabilities: Capabilities::default(),
                 watchers: HashMap::default(),
-                variables: Default::default(),
-                stack_frames: Default::default(),
-                thread_states: ThreadStates::default(),
                 output_token: OutputToken(0),
-                output: circular_buffer::FixedCircularBuffer::boxed(),
-                requests: HashMap::default(),
-                modules: Vec::default(),
-                loaded_sources: Vec::default(),
-                threads: IndexMap::default(),
+                output: circular_buffer::CircularBuffer::boxed(),
+                requests: Default::default(),
                 background_tasks: Vec::default(),
                 restart_task: None,
-                locations: Default::default(),
                 is_session_terminated: false,
                 ignore_breakpoints: false,
                 breakpoint_store,
@@ -855,12 +896,12 @@ impl Session {
         })
     }
 
-    pub fn task_context(&self) -> &TaskContext {
+    pub fn task_context(&self) -> &SharedTaskContext {
         &self.task_context
     }
 
     pub fn worktree(&self) -> Option<Entity<Worktree>> {
-        match &self.mode {
+        match &self.state {
             SessionState::Booting(_) => None,
             SessionState::Running(local_mode) => local_mode.worktree.upgrade(),
         }
@@ -894,9 +935,11 @@ impl Session {
                 } else if let Message::Request(request) = message {
                     let Ok(_) = this.update(cx, |this, cx| {
                         if request.command == StartDebugging::COMMAND {
-                            this.handle_start_debugging_request(request, cx).detach_and_log_err(cx);
+                            this.handle_start_debugging_request(request, cx)
+                                .detach_and_log_err(cx);
                         } else if request.command == RunInTerminal::COMMAND {
-                            this.handle_run_in_terminal_request(request, cx).detach_and_log_err(cx);
+                            this.handle_run_in_terminal_request(request, cx)
+                                .detach_and_log_err(cx);
                         }
                     }) else {
                         break;
@@ -909,10 +952,17 @@ impl Session {
         let parent_session = self.parent_session.clone();
 
         cx.spawn(async move |this, cx| {
-            let mode =
-                RunningMode::new(id, parent_session, worktree.downgrade(), binary.clone(), message_tx, cx).await?;
+            let mode = RunningMode::new(
+                id,
+                parent_session,
+                worktree.downgrade(),
+                binary.clone(),
+                message_tx,
+                cx,
+            )
+            .await?;
             this.update(cx, |this, cx| {
-                match &mut this.mode {
+                match &mut this.state {
                     SessionState::Booting(task) if task.is_some() => {
                         task.take().unwrap().detach_and_log_err(cx);
                     }
@@ -921,11 +971,12 @@ impl Session {
                         debug_panic!("Attempting to boot a session that is already running");
                     }
                 };
-                this.mode = SessionState::Running(mode);
+                this.state = SessionState::Running(mode);
                 cx.emit(SessionStateEvent::Running);
             })?;
 
-            this.update(cx, |session, cx| session.request_initialize(cx))?.await?;
+            this.update(cx, |session, cx| session.request_initialize(cx))?
+                .await?;
 
             let result = this
                 .update(cx, |session, cx| {
@@ -939,7 +990,8 @@ impl Session {
                 console
                     .send(format!(
                         "Tried to launch debugger with: {}",
-                        serde_json::to_string_pretty(&binary.request_args.configuration).unwrap_or_default(),
+                        serde_json::to_string_pretty(&binary.request_args.configuration)
+                            .unwrap_or_default(),
                     ))
                     .await
                     .ok();
@@ -966,7 +1018,9 @@ impl Session {
     }
 
     pub fn parent_id(&self, cx: &App) -> Option<SessionId> {
-        self.parent_session.as_ref().map(|session| session.read(cx).id)
+        self.parent_session
+            .as_ref()
+            .map(|session| session.read(cx).id)
     }
 
     pub fn parent_session(&self) -> Option<&Entity<Self>> {
@@ -978,12 +1032,17 @@ impl Session {
             return Task::ready(());
         };
 
-        let supports_terminate = self.capabilities.support_terminate_debuggee.unwrap_or(false);
+        let supports_terminate = self
+            .capabilities
+            .support_terminate_debuggee
+            .unwrap_or(false);
 
         cx.background_spawn(async move {
             if supports_terminate {
                 client
-                    .request::<dap::requests::Terminate>(dap::TerminateArguments { restart: Some(false) })
+                    .request::<dap::requests::Terminate>(dap::TerminateArguments {
+                        restart: Some(false),
+                    })
                     .await
                     .ok();
             } else {
@@ -1004,7 +1063,7 @@ impl Session {
     }
 
     pub fn binary(&self) -> Option<&DebugAdapterBinary> {
-        match &self.mode {
+        match &self.state {
             SessionState::Booting(_) => None,
             SessionState::Running(running_mode) => Some(&running_mode.binary),
         }
@@ -1050,25 +1109,25 @@ impl Session {
     }
 
     pub fn is_started(&self) -> bool {
-        match &self.mode {
+        match &self.state {
             SessionState::Booting(_) => false,
             SessionState::Running(running) => running.is_started,
         }
     }
 
     pub fn is_building(&self) -> bool {
-        matches!(self.mode, SessionState::Booting(_))
+        matches!(self.state, SessionState::Booting(_))
     }
 
     pub fn as_running_mut(&mut self) -> Option<&mut RunningMode> {
-        match &mut self.mode {
+        match &mut self.state {
             SessionState::Running(local_mode) => Some(local_mode),
             SessionState::Booting(_) => None,
         }
     }
 
     pub fn as_running(&self) -> Option<&RunningMode> {
-        match &self.mode {
+        match &self.state {
             SessionState::Running(local_mode) => Some(local_mode),
             SessionState::Booting(_) => None,
         }
@@ -1090,13 +1149,22 @@ impl Session {
         if let Some(Ok(request)) = launch_request {
             cx.emit(SessionStateEvent::SpawnChildSession { request });
         } else {
-            log::error!("Failed to parse launch request arguments: {:?}", request.arguments);
+            log::error!(
+                "Failed to parse launch request arguments: {:?}",
+                request.arguments
+            );
             success = false;
         }
 
         cx.spawn(async move |this, cx| {
             this.update(cx, |this, cx| {
-                this.respond_to_client(request_seq, success, StartDebugging::COMMAND.to_string(), None, cx)
+                this.respond_to_client(
+                    request_seq,
+                    success,
+                    StartDebugging::COMMAND.to_string(),
+                    None,
+                    cx,
+                )
             })?
             .await
         })
@@ -1107,40 +1175,41 @@ impl Session {
         request: dap::messages::Request,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        let request_args =
-            match serde_json::from_value::<RunInTerminalRequestArguments>(request.arguments.unwrap_or_default()) {
-                Ok(args) => args,
-                Err(error) => {
-                    return cx.spawn(async move |session, cx| {
-                        let error = serde_json::to_value(dap::ErrorResponse {
-                            error: Some(dap::Message {
-                                id: request.seq,
-                                format: error.to_string(),
-                                variables: None,
-                                send_telemetry: None,
-                                show_user: None,
-                                url: None,
-                                url_label: None,
-                            }),
-                        })
-                        .ok();
+        let request_args = match serde_json::from_value::<RunInTerminalRequestArguments>(
+            request.arguments.unwrap_or_default(),
+        ) {
+            Ok(args) => args,
+            Err(error) => {
+                return cx.spawn(async move |session, cx| {
+                    let error = serde_json::to_value(dap::ErrorResponse {
+                        error: Some(dap::Message {
+                            id: request.seq,
+                            format: error.to_string(),
+                            variables: None,
+                            send_telemetry: None,
+                            show_user: None,
+                            url: None,
+                            url_label: None,
+                        }),
+                    })
+                    .ok();
 
-                        session
-                            .update(cx, |this, cx| {
-                                this.respond_to_client(
-                                    request.seq,
-                                    false,
-                                    StartDebugging::COMMAND.to_string(),
-                                    error,
-                                    cx,
-                                )
-                            })?
-                            .await?;
+                    session
+                        .update(cx, |this, cx| {
+                            this.respond_to_client(
+                                request.seq,
+                                false,
+                                StartDebugging::COMMAND.to_string(),
+                                error,
+                                cx,
+                            )
+                        })?
+                        .await?;
 
-                        Err(anyhow!("Failed to parse RunInTerminalRequestArguments"))
-                    });
-                }
-            };
+                    Err(anyhow!("Failed to parse RunInTerminalRequestArguments"))
+                });
+            }
+        };
 
         let seq = request.seq;
 
@@ -1153,9 +1222,9 @@ impl Session {
 
         cx.spawn(async move |session, cx| {
             let result = util::maybe!(async move {
-                rx.next()
-                    .await
-                    .ok_or_else(|| anyhow!("failed to receive response from spawn terminal".to_string()))?
+                rx.next().await.ok_or_else(|| {
+                    anyhow!("failed to receive response from spawn terminal".to_string())
+                })?
             })
             .await;
             let (success, body) = match result {
@@ -1186,7 +1255,13 @@ impl Session {
 
             session
                 .update(cx, |session, cx| {
-                    session.respond_to_client(seq, success, RunInTerminal::COMMAND.to_string(), body, cx)
+                    session.respond_to_client(
+                        seq,
+                        success,
+                        RunInTerminal::COMMAND.to_string(),
+                        body,
+                        cx,
+                    )
                 })?
                 .await
         })
@@ -1196,8 +1271,10 @@ impl Session {
         let adapter_id = self.adapter().to_string();
         let request = Initialize { adapter_id };
 
-        let SessionState::Running(running) = &self.mode else {
-            return Task::ready(Err(anyhow!("Cannot send initialize request, task still building")));
+        let SessionState::Running(running) = &self.state else {
+            return Task::ready(Err(anyhow!(
+                "Cannot send initialize request, task still building"
+            )));
         };
         let mut response = running.request(request.clone());
 
@@ -1216,7 +1293,8 @@ impl Session {
                         reconnect.await?;
 
                         let Ok(Some(r)) = this.update(cx, |this, _| {
-                            this.as_running().map(|running| running.request(request.clone()))
+                            this.as_running()
+                                .map(|running| running.request(request.clone()))
                         }) else {
                             return Err(e);
                         };
@@ -1241,11 +1319,13 @@ impl Session {
         dap_store: WeakEntity<DapStore>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        match &self.mode {
+        match &self.state {
             SessionState::Running(local_mode) => {
                 local_mode.initialize_sequence(&self.capabilities, initialize_rx, dap_store, cx)
             }
-            SessionState::Booting(_) => Task::ready(Err(anyhow!("cannot initialize, still building"))),
+            SessionState::Booting(_) => {
+                Task::ready(Err(anyhow!("cannot initialize, still building")))
+            }
         }
     }
 
@@ -1255,10 +1335,12 @@ impl Session {
         active_thread_id: ThreadId,
         cx: &mut Context<Self>,
     ) {
-        match &mut self.mode {
+        match &mut self.state {
             SessionState::Running(local_mode) => {
                 if !matches!(
-                    self.thread_states.thread_state(active_thread_id),
+                    self.active_snapshot
+                        .thread_states
+                        .thread_state(active_thread_id),
                     Some(ThreadStatus::Stopped)
                 ) {
                     return;
@@ -1275,7 +1357,7 @@ impl Session {
                 cx.spawn(async move |this, cx| {
                     task.await;
                     this.update(cx, |this, cx| {
-                        this.continue_thread(active_thread_id, cx);
+                        this.continue_program(active_thread_id, cx);
                     })
                 })
                 .detach();
@@ -1288,7 +1370,10 @@ impl Session {
         self.output_token.0.checked_sub(last_update.0).unwrap_or(0) != 0
     }
 
-    pub fn output(&self, since: OutputToken) -> (impl Iterator<Item = &dap::OutputEvent>, OutputToken) {
+    pub fn output(
+        &self,
+        since: OutputToken,
+    ) -> (impl Iterator<Item = &dap::OutputEvent>, OutputToken) {
         if self.output_token.0 == 0 {
             return (self.output.range(0..0), OutputToken(0));
         };
@@ -1297,7 +1382,8 @@ impl Session {
 
         let clamped_events_since = events_since.clamp(0, self.output.len());
         (
-            self.output.range(self.output.len() - clamped_events_since..),
+            self.output
+                .range(self.output.len() - clamped_events_since..),
             self.output_token,
         )
     }
@@ -1329,8 +1415,55 @@ impl Session {
         })
     }
 
+    fn session_state(&self) -> &SessionSnapshot {
+        self.selected_snapshot_index
+            .and_then(|ix| self.snapshots.get(ix))
+            .unwrap_or_else(|| &self.active_snapshot)
+    }
+
+    fn push_to_history(&mut self) {
+        if !self.has_ever_stopped() {
+            return;
+        }
+
+        while self.snapshots.len() >= DEBUG_HISTORY_LIMIT {
+            self.snapshots.pop_front();
+        }
+
+        self.snapshots
+            .push_back(std::mem::take(&mut self.active_snapshot));
+    }
+
+    pub fn historic_snapshots(&self) -> &VecDeque<SessionSnapshot> {
+        &self.snapshots
+    }
+
+    pub fn select_historic_snapshot(&mut self, ix: Option<usize>, cx: &mut Context<Session>) {
+        if self.selected_snapshot_index == ix {
+            return;
+        }
+
+        if self
+            .selected_snapshot_index
+            .is_some_and(|ix| self.snapshots.len() <= ix)
+        {
+            debug_panic!("Attempted to select a debug session with an out of bounds index");
+            return;
+        }
+
+        self.selected_snapshot_index = ix;
+        cx.emit(SessionEvent::HistoricSnapshotSelected);
+        cx.notify();
+    }
+
+    pub fn active_snapshot_index(&self) -> Option<usize> {
+        self.selected_snapshot_index
+    }
+
     fn handle_stopped_event(&mut self, event: StoppedEvent, cx: &mut Context<Self>) {
-        self.mode.stopped();
+        self.push_to_history();
+
+        self.state.stopped();
         // todo(debugger): Find a clean way to get around the clone
         let breakpoint_store = self.breakpoint_store.clone();
         if let Some((local, path)) = self.as_running_mut().and_then(|local| {
@@ -1339,19 +1472,26 @@ impl Session {
             Some((local, path))
         }) {
             local
-                .send_breakpoints_from_path(path, BreakpointUpdatedReason::Toggled, &breakpoint_store, cx)
+                .send_breakpoints_from_path(
+                    path,
+                    BreakpointUpdatedReason::Toggled,
+                    &breakpoint_store,
+                    cx,
+                )
                 .detach();
         };
 
         if event.all_threads_stopped.unwrap_or_default() || event.thread_id.is_none() {
-            self.thread_states.stop_all_threads();
+            self.active_snapshot.thread_states.stop_all_threads();
             self.invalidate_command_type::<StackTraceCommand>();
         }
 
         // Event if we stopped all threads we still need to insert the thread_id
         // to our own data
         if let Some(thread_id) = event.thread_id {
-            self.thread_states.stop_thread(ThreadId(thread_id));
+            self.active_snapshot
+                .thread_states
+                .stop_thread(ThreadId(thread_id));
 
             self.invalidate_state(
                 &StackTraceCommand {
@@ -1364,8 +1504,8 @@ impl Session {
         }
 
         self.invalidate_generic();
-        self.threads.clear();
-        self.variables.clear();
+        self.active_snapshot.threads.clear();
+        self.active_snapshot.variables.clear();
         cx.emit(SessionEvent::Stopped(
             event
                 .thread_id
@@ -1379,17 +1519,23 @@ impl Session {
     pub(crate) fn handle_dap_event(&mut self, event: Box<Events>, cx: &mut Context<Self>) {
         match *event {
             Events::Initialized(_) => {
-                debug_assert!(false, "Initialized event should have been handled in LocalMode");
+                debug_assert!(
+                    false,
+                    "Initialized event should have been handled in LocalMode"
+                );
             }
             Events::Stopped(event) => self.handle_stopped_event(event, cx),
             Events::Continued(event) => {
-                if event.all_threads_continued.unwrap_or_default() {
-                    self.thread_states.continue_all_threads();
+                // DAP defines an omitted `allThreadsContinued` as `true`.
+                if event.all_threads_continued.unwrap_or(true) {
+                    self.active_snapshot.thread_states.continue_all_threads();
                     self.breakpoint_store.update(cx, |store, cx| {
                         store.remove_active_position(Some(self.session_id()), cx)
                     });
                 } else {
-                    self.thread_states.continue_thread(ThreadId(event.thread_id));
+                    self.active_snapshot
+                        .thread_states
+                        .continue_thread(ThreadId(event.thread_id));
                 }
                 // todo(debugger): We should be able to get away with only invalidating generic if all threads were continued
                 self.invalidate_generic();
@@ -1405,10 +1551,12 @@ impl Session {
 
                 match event.reason {
                     dap::ThreadEventReason::Started => {
-                        self.thread_states.continue_thread(thread_id);
+                        self.active_snapshot
+                            .thread_states
+                            .continue_thread(thread_id);
                     }
                     dap::ThreadEventReason::Exited => {
-                        self.thread_states.exit_thread(thread_id);
+                        self.active_snapshot.thread_states.exit_thread(thread_id);
                     }
                     reason => {
                         log::error!("Unhandled thread event reason {:?}", reason);
@@ -1435,15 +1583,22 @@ impl Session {
             Events::Module(event) => {
                 match event.reason {
                     dap::ModuleEventReason::New => {
-                        self.modules.push(event.module);
+                        self.active_snapshot.modules.push(event.module);
                     }
                     dap::ModuleEventReason::Changed => {
-                        if let Some(module) = self.modules.iter_mut().find(|other| event.module.id == other.id) {
+                        if let Some(module) = self
+                            .active_snapshot
+                            .modules
+                            .iter_mut()
+                            .find(|other| event.module.id == other.id)
+                        {
                             *module = event.module;
                         }
                     }
                     dap::ModuleEventReason::Removed => {
-                        self.modules.retain(|other| event.module.id != other.id);
+                        self.active_snapshot
+                            .modules
+                            .retain(|other| event.module.id != other.id);
                     }
                 }
 
@@ -1470,7 +1625,8 @@ impl Session {
                         .entry(filter.filter.clone())
                         .or_insert_with(|| (filter.clone(), default));
                 }
-                self.exception_breakpoints.retain(|k, _| recent_filters.contains_key(k));
+                self.exception_breakpoints
+                    .retain(|k, _| recent_filters.contains_key(k));
                 if self.is_started() {
                     self.send_exception_breakpoints(cx);
                 }
@@ -1510,23 +1666,31 @@ impl Session {
         cx: &mut Context<Self>,
     ) {
         const {
-            assert!(T::CACHEABLE, "Only requests marked as cacheable should invoke `fetch`");
+            assert!(
+                T::CACHEABLE,
+                "Only requests marked as cacheable should invoke `fetch`"
+            );
         }
 
-        if !self.thread_states.any_stopped_thread() && request.type_id() != TypeId::of::<ThreadsCommand>()
+        if (!self.active_snapshot.thread_states.any_stopped_thread()
+            && request.type_id() != TypeId::of::<ThreadsCommand>())
+            || self.selected_snapshot_index.is_some()
             || self.is_session_terminated
         {
             return;
         }
 
-        let request_map = self.requests.entry(std::any::TypeId::of::<T>()).or_default();
+        let request_map = self
+            .requests
+            .entry(std::any::TypeId::of::<T>())
+            .or_default();
 
         if let Entry::Vacant(vacant) = request_map.entry(request.into()) {
             let command = vacant.key().0.clone().as_any_arc().downcast::<T>().unwrap();
 
             let task = Self::request_inner::<Arc<T>>(
                 &self.capabilities,
-                &self.mode,
+                &self.state,
                 command,
                 |this, result, cx| {
                     process_result(this, result, cx);
@@ -1551,11 +1715,19 @@ impl Session {
         capabilities: &Capabilities,
         mode: &SessionState,
         request: T,
-        process_result: impl FnOnce(&mut Self, Result<T::Response>, &mut Context<Self>) -> Option<T::Response> + 'static,
+        process_result: impl FnOnce(
+            &mut Self,
+            Result<T::Response>,
+            &mut Context<Self>,
+        ) -> Option<T::Response>
+        + 'static,
         cx: &mut Context<Self>,
     ) -> Task<Option<T::Response>> {
         if !T::is_supported(capabilities) {
-            log::warn!("Attempted to send a DAP request that isn't supported: {:?}", request);
+            log::warn!(
+                "Attempted to send a DAP request that isn't supported: {:?}",
+                request
+            );
             let error = Err(anyhow::Error::msg(
                 "Couldn't complete request because it's not supported",
             ));
@@ -1578,10 +1750,15 @@ impl Session {
     fn request<T: LocalDapCommand + PartialEq + Eq + Hash>(
         &self,
         request: T,
-        process_result: impl FnOnce(&mut Self, Result<T::Response>, &mut Context<Self>) -> Option<T::Response> + 'static,
+        process_result: impl FnOnce(
+            &mut Self,
+            Result<T::Response>,
+            &mut Context<Self>,
+        ) -> Option<T::Response>
+        + 'static,
         cx: &mut Context<Self>,
     ) -> Task<Option<T::Response>> {
-        Self::request_inner(&self.capabilities, &self.mode, request, process_result, cx)
+        Self::request_inner(&self.capabilities, &self.state, request, process_result, cx)
     }
 
     fn invalidate_command_type<Command: LocalDapCommand>(&mut self) {
@@ -1614,11 +1791,11 @@ impl Session {
     }
 
     pub fn any_stopped_thread(&self) -> bool {
-        self.thread_states.any_stopped_thread()
+        self.active_snapshot.thread_states.any_stopped_thread()
     }
 
     pub fn thread_status(&self, thread_id: ThreadId) -> ThreadStatus {
-        self.thread_states.thread_status(thread_id)
+        self.active_snapshot.thread_states.thread_status(thread_id)
     }
 
     pub fn threads(&mut self, cx: &mut Context<Self>) -> Vec<(dap::Thread, ThreadStatus)> {
@@ -1629,7 +1806,7 @@ impl Session {
                     return;
                 };
 
-                this.threads = result
+                this.active_snapshot.threads = result
                     .into_iter()
                     .map(|thread| (ThreadId(thread.id), Thread::from(thread)))
                     .collect();
@@ -1641,12 +1818,14 @@ impl Session {
             cx,
         );
 
-        self.threads
+        let state = self.session_state();
+        state
+            .threads
             .values()
             .map(|thread| {
                 (
                     thread.dap.clone(),
-                    self.thread_states.thread_status(ThreadId(thread.dap.id)),
+                    state.thread_states.thread_status(ThreadId(thread.dap.id)),
                 )
             })
             .collect()
@@ -1660,14 +1839,14 @@ impl Session {
                     return;
                 };
 
-                this.modules = result;
+                this.active_snapshot.modules = result;
                 cx.emit(SessionEvent::Modules);
                 cx.notify();
             },
             cx,
         );
 
-        &self.modules
+        &self.session_state().modules
     }
 
     // CodeLLDB returns the size of a pointed-to-memory, which we can use to make the experience of go-to-memory better.
@@ -1713,7 +1892,9 @@ impl Session {
         );
         cx.background_spawn(async move {
             let result = request.await?;
-            result.memory_reference.map(|reference| (reference, result.type_))
+            result
+                .memory_reference
+                .map(|reference| (reference, result.type_))
         })
     }
 
@@ -1737,7 +1918,11 @@ impl Session {
         )
         .detach();
     }
-    pub fn read_memory(&mut self, range: RangeInclusive<u64>, cx: &mut Context<Self>) -> MemoryIterator {
+    pub fn read_memory(
+        &mut self,
+        range: RangeInclusive<u64>,
+        cx: &mut Context<Self>,
+    ) -> MemoryIterator {
         // This function is a bit more involved when it comes to fetching data.
         // Since we attempt to read memory in pages, we need to account for some parts
         // of memory being unreadable. Therefore, we start off by fetching a page per request.
@@ -1757,7 +1942,11 @@ impl Session {
             Some(())
         });
     }
-    fn memory_read_fetch_page_recursive(&mut self, mut builder: MemoryPageBuilder, cx: &mut Context<Self>) {
+    fn memory_read_fetch_page_recursive(
+        &mut self,
+        mut builder: MemoryPageBuilder,
+        cx: &mut Context<Self>,
+    ) {
         let Some(next_request) = builder.next_request() else {
             // We're done fetching. Let's grab the page and insert it into our memory store.
             let (address, contents) = builder.build();
@@ -1795,7 +1984,10 @@ impl Session {
         self.ignore_breakpoints
     }
 
-    pub fn toggle_ignore_breakpoints(&mut self, cx: &mut App) -> Task<HashMap<Arc<Path>, anyhow::Error>> {
+    pub fn toggle_ignore_breakpoints(
+        &mut self,
+        cx: &mut App,
+    ) -> Task<HashMap<Arc<Path>, anyhow::Error>> {
         self.set_ignore_breakpoints(!self.ignore_breakpoints, cx)
     }
 
@@ -1822,7 +2014,9 @@ impl Session {
         self.data_breakpoints.values()
     }
 
-    pub fn exception_breakpoints(&self) -> impl Iterator<Item = &(ExceptionBreakpointsFilter, IsEnabled)> {
+    pub fn exception_breakpoints(
+        &self,
+    ) -> impl Iterator<Item = &(ExceptionBreakpointsFilter, IsEnabled)> {
         self.exception_breakpoints.values()
     }
 
@@ -1841,7 +2035,10 @@ impl Session {
                 .filter_map(|(filter, is_enabled)| is_enabled.then(|| filter.clone()))
                 .collect();
 
-            let supports_exception_filters = self.capabilities.supports_exception_filter_options.unwrap_or_default();
+            let supports_exception_filters = self
+                .capabilities
+                .supports_exception_filter_options
+                .unwrap_or_default();
             local
                 .send_exception_breakpoints(exception_filters, supports_exception_filters)
                 .detach_and_log_err(cx);
@@ -1900,17 +2097,20 @@ impl Session {
                 let Some(result) = result.log_err() else {
                     return;
                 };
-                this.loaded_sources = result;
+                this.active_snapshot.loaded_sources = result;
                 cx.emit(SessionEvent::LoadedSources);
                 cx.notify();
             },
             cx,
         );
-
-        &self.loaded_sources
+        &self.session_state().loaded_sources
     }
 
-    fn fallback_to_manual_restart(&mut self, res: Result<()>, cx: &mut Context<Self>) -> Option<()> {
+    fn fallback_to_manual_restart(
+        &mut self,
+        res: Result<()>,
+        cx: &mut Context<Self>,
+    ) -> Option<()> {
         if res.log_err().is_none() {
             cx.emit(SessionStateEvent::Restart);
             return None;
@@ -1925,7 +2125,8 @@ impl Session {
 
     fn on_step_response<T: LocalDapCommand + PartialEq + Eq + Hash>(
         thread_id: ThreadId,
-    ) -> impl FnOnce(&mut Self, Result<T::Response>, &mut Context<Self>) -> Option<T::Response> + 'static {
+    ) -> impl FnOnce(&mut Self, Result<T::Response>, &mut Context<Self>) -> Option<T::Response> + 'static
+    {
         move |this, response, cx| match response.log_err() {
             Some(response) => {
                 this.breakpoint_store.update(cx, |store, cx| {
@@ -1934,32 +2135,79 @@ impl Session {
                 Some(response)
             }
             None => {
-                this.thread_states.stop_thread(thread_id);
+                this.active_snapshot.thread_states.stop_thread(thread_id);
                 cx.notify();
                 None
             }
         }
     }
 
-    fn clear_active_debug_line_response(&mut self, response: Result<()>, cx: &mut Context<Session>) -> Option<()> {
+    fn on_continue_response(
+        thread_id: ThreadId,
+    ) -> impl FnOnce(
+        &mut Self,
+        Result<dap::ContinueResponse>,
+        &mut Context<Self>,
+    ) -> Option<dap::ContinueResponse>
+    + 'static {
+        move |this, response, cx| match response.log_err() {
+            Some(response) => {
+                if response.all_threads_continued.unwrap_or(true) {
+                    this.active_snapshot.thread_states.continue_all_threads();
+                } else {
+                    this.active_snapshot
+                        .thread_states
+                        .continue_thread(thread_id);
+                }
+                this.breakpoint_store.update(cx, |store, cx| {
+                    store.remove_active_position(Some(this.session_id()), cx)
+                });
+                this.invalidate_generic();
+                cx.notify();
+                Some(response)
+            }
+            None => {
+                this.active_snapshot.thread_states.stop_thread(thread_id);
+                cx.notify();
+                None
+            }
+        }
+    }
+
+    fn clear_active_debug_line_response(
+        &mut self,
+        response: Result<()>,
+        cx: &mut Context<Session>,
+    ) -> Option<()> {
         response.log_err()?;
         self.clear_active_debug_line(cx);
         Some(())
     }
 
     fn clear_active_debug_line(&mut self, cx: &mut Context<Session>) {
-        self.breakpoint_store
-            .update(cx, |store, cx| store.remove_active_position(Some(self.id), cx));
+        self.breakpoint_store.update(cx, |store, cx| {
+            store.remove_active_position(Some(self.id), cx)
+        });
     }
 
     pub fn pause_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
-        self.request(PauseCommand { thread_id: thread_id.0 }, Self::empty_response, cx)
-            .detach();
+        self.request(
+            PauseCommand {
+                thread_id: thread_id.0,
+            },
+            Self::empty_response,
+            cx,
+        )
+        .detach();
     }
 
     pub fn restart_stack_frame(&mut self, stack_frame_id: u64, cx: &mut Context<Self>) {
-        self.request(RestartStackFrameCommand { stack_frame_id }, Self::empty_response, cx)
-            .detach();
+        self.request(
+            RestartStackFrameCommand { stack_frame_id },
+            Self::empty_response,
+            cx,
+        )
+        .detach();
     }
 
     pub fn restart(&mut self, args: Option<Value>, cx: &mut Context<Self>) {
@@ -1967,24 +2215,31 @@ impl Session {
             return;
         }
 
-        let supports_dap_restart = self.capabilities.supports_restart_request.unwrap_or(false) && !self.is_terminated();
+        let supports_dap_restart =
+            self.capabilities.supports_restart_request.unwrap_or(false) && !self.is_terminated();
 
         self.restart_task = Some(cx.spawn(async move |this, cx| {
-            let _ = this.update(cx, |session, cx| {
+            this.update(cx, |session, cx| {
                 if supports_dap_restart {
-                    session
-                        .request(
-                            RestartCommand {
-                                raw: args.unwrap_or(Value::Null),
-                            },
-                            Self::fallback_to_manual_restart,
-                            cx,
-                        )
-                        .detach();
+                    session.request(
+                        RestartCommand {
+                            raw: args.unwrap_or(Value::Null),
+                        },
+                        Self::fallback_to_manual_restart,
+                        cx,
+                    )
                 } else {
                     cx.emit(SessionStateEvent::Restart);
+                    Task::ready(None)
                 }
-            });
+            })
+            .unwrap_or_else(|_| Task::ready(None))
+            .await;
+
+            this.update(cx, |session, _cx| {
+                session.restart_task = None;
+            })
+            .ok();
         }));
     }
 
@@ -1994,14 +2249,20 @@ impl Session {
         }
 
         self.is_session_terminated = true;
-        self.thread_states.exit_all_threads();
+        self.active_snapshot.thread_states.exit_all_threads();
         cx.notify();
 
-        let task = match &mut self.mode {
+        let task = match &mut self.state {
             SessionState::Running(_) => {
-                if self.capabilities.supports_terminate_request.unwrap_or_default() {
+                if self
+                    .capabilities
+                    .supports_terminate_request
+                    .unwrap_or_default()
+                {
                     self.request(
-                        TerminateCommand { restart: Some(false) },
+                        TerminateCommand {
+                            restart: Some(false),
+                        },
                         Self::clear_active_debug_line_response,
                         cx,
                     )
@@ -2051,35 +2312,71 @@ impl Session {
         })
     }
 
+    pub fn continue_program(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        self.continue_execution(thread_id, None, cx);
+    }
+
     pub fn continue_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
-        let supports_single_thread_execution_requests = self.capabilities.supports_single_thread_execution_requests;
-        self.thread_states.continue_thread(thread_id);
+        if !self
+            .capabilities
+            .supports_single_thread_execution_requests
+            .unwrap_or_default()
+        {
+            return;
+        }
+
+        self.continue_execution(thread_id, Some(true), cx);
+    }
+
+    fn continue_execution(
+        &mut self,
+        thread_id: ThreadId,
+        single_thread: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_historic_snapshot(None, cx);
+
+        self.active_snapshot
+            .thread_states
+            .continue_thread(thread_id);
         self.request(
             ContinueCommand {
                 args: ContinueArguments {
                     thread_id: thread_id.0,
-                    single_thread: supports_single_thread_execution_requests,
+                    single_thread,
                 },
             },
-            Self::on_step_response::<ContinueCommand>(thread_id),
+            Self::on_continue_response(thread_id),
             cx,
         )
         .detach();
     }
 
     pub fn adapter_client(&self) -> Option<Arc<DebugAdapterClient>> {
-        match self.mode {
+        match self.state {
             SessionState::Running(ref local) => Some(local.client.clone()),
             SessionState::Booting(_) => None,
         }
     }
 
     pub fn has_ever_stopped(&self) -> bool {
-        self.mode.has_ever_stopped()
+        self.state.has_ever_stopped()
     }
-    pub fn step_over(&mut self, thread_id: ThreadId, granularity: SteppingGranularity, cx: &mut Context<Self>) {
-        let supports_single_thread_execution_requests = self.capabilities.supports_single_thread_execution_requests;
-        let supports_stepping_granularity = self.capabilities.supports_stepping_granularity.unwrap_or_default();
+
+    pub fn step_over(
+        &mut self,
+        thread_id: ThreadId,
+        granularity: SteppingGranularity,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_historic_snapshot(None, cx);
+
+        let supports_single_thread_execution_requests =
+            self.capabilities.supports_single_thread_execution_requests;
+        let supports_stepping_granularity = self
+            .capabilities
+            .supports_stepping_granularity
+            .unwrap_or_default();
 
         let command = NextCommand {
             inner: StepCommand {
@@ -2089,14 +2386,29 @@ impl Session {
             },
         };
 
-        self.thread_states.process_step(thread_id);
-        self.request(command, Self::on_step_response::<NextCommand>(thread_id), cx)
-            .detach();
+        self.active_snapshot.thread_states.process_step(thread_id);
+        self.request(
+            command,
+            Self::on_step_response::<NextCommand>(thread_id),
+            cx,
+        )
+        .detach();
     }
 
-    pub fn step_in(&mut self, thread_id: ThreadId, granularity: SteppingGranularity, cx: &mut Context<Self>) {
-        let supports_single_thread_execution_requests = self.capabilities.supports_single_thread_execution_requests;
-        let supports_stepping_granularity = self.capabilities.supports_stepping_granularity.unwrap_or_default();
+    pub fn step_in(
+        &mut self,
+        thread_id: ThreadId,
+        granularity: SteppingGranularity,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_historic_snapshot(None, cx);
+
+        let supports_single_thread_execution_requests =
+            self.capabilities.supports_single_thread_execution_requests;
+        let supports_stepping_granularity = self
+            .capabilities
+            .supports_stepping_granularity
+            .unwrap_or_default();
 
         let command = StepInCommand {
             inner: StepCommand {
@@ -2106,14 +2418,29 @@ impl Session {
             },
         };
 
-        self.thread_states.process_step(thread_id);
-        self.request(command, Self::on_step_response::<StepInCommand>(thread_id), cx)
-            .detach();
+        self.active_snapshot.thread_states.process_step(thread_id);
+        self.request(
+            command,
+            Self::on_step_response::<StepInCommand>(thread_id),
+            cx,
+        )
+        .detach();
     }
 
-    pub fn step_out(&mut self, thread_id: ThreadId, granularity: SteppingGranularity, cx: &mut Context<Self>) {
-        let supports_single_thread_execution_requests = self.capabilities.supports_single_thread_execution_requests;
-        let supports_stepping_granularity = self.capabilities.supports_stepping_granularity.unwrap_or_default();
+    pub fn step_out(
+        &mut self,
+        thread_id: ThreadId,
+        granularity: SteppingGranularity,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_historic_snapshot(None, cx);
+
+        let supports_single_thread_execution_requests =
+            self.capabilities.supports_single_thread_execution_requests;
+        let supports_stepping_granularity = self
+            .capabilities
+            .supports_stepping_granularity
+            .unwrap_or_default();
 
         let command = StepOutCommand {
             inner: StepCommand {
@@ -2123,14 +2450,29 @@ impl Session {
             },
         };
 
-        self.thread_states.process_step(thread_id);
-        self.request(command, Self::on_step_response::<StepOutCommand>(thread_id), cx)
-            .detach();
+        self.active_snapshot.thread_states.process_step(thread_id);
+        self.request(
+            command,
+            Self::on_step_response::<StepOutCommand>(thread_id),
+            cx,
+        )
+        .detach();
     }
 
-    pub fn step_back(&mut self, thread_id: ThreadId, granularity: SteppingGranularity, cx: &mut Context<Self>) {
-        let supports_single_thread_execution_requests = self.capabilities.supports_single_thread_execution_requests;
-        let supports_stepping_granularity = self.capabilities.supports_stepping_granularity.unwrap_or_default();
+    pub fn step_back(
+        &mut self,
+        thread_id: ThreadId,
+        granularity: SteppingGranularity,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_historic_snapshot(None, cx);
+
+        let supports_single_thread_execution_requests =
+            self.capabilities.supports_single_thread_execution_requests;
+        let supports_stepping_granularity = self
+            .capabilities
+            .supports_stepping_granularity
+            .unwrap_or_default();
 
         let command = StepBackCommand {
             inner: StepCommand {
@@ -2140,16 +2482,24 @@ impl Session {
             },
         };
 
-        self.thread_states.process_step(thread_id);
+        self.active_snapshot.thread_states.process_step(thread_id);
 
-        self.request(command, Self::on_step_response::<StepBackCommand>(thread_id), cx)
-            .detach();
+        self.request(
+            command,
+            Self::on_step_response::<StepBackCommand>(thread_id),
+            cx,
+        )
+        .detach();
     }
 
-    pub fn stack_frames(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) -> Result<Vec<StackFrame>> {
-        if self.thread_states.thread_status(thread_id) == ThreadStatus::Stopped
+    pub fn stack_frames(
+        &mut self,
+        thread_id: ThreadId,
+        cx: &mut Context<Self>,
+    ) -> Result<Vec<StackFrame>> {
+        if self.active_snapshot.thread_states.thread_status(thread_id) == ThreadStatus::Stopped
             && self.requests.contains_key(&ThreadsCommand.type_id())
-            && self.threads.contains_key(&thread_id)
+            && self.active_snapshot.threads.contains_key(&thread_id)
         // ^ todo(debugger): We need a better way to check that we're not querying stale data
         // We could still be using an old thread id and have sent a new thread's request
         // This isn't the biggest concern right now because it hasn't caused any issues outside of tests
@@ -2162,22 +2512,30 @@ impl Session {
                     levels: None,
                 },
                 move |this, stack_frames, cx| {
-                    let entry = this.threads.entry(thread_id).and_modify(|thread| match &stack_frames {
-                        Ok(stack_frames) => {
-                            thread.stack_frames = stack_frames.iter().cloned().map(StackFrame::from).collect();
-                            thread.stack_frames_error = None;
-                        }
-                        Err(error) => {
-                            thread.stack_frames.clear();
-                            thread.stack_frames_error = Some(error.cloned());
-                        }
-                    });
+                    let entry =
+                        this.active_snapshot
+                            .threads
+                            .entry(thread_id)
+                            .and_modify(|thread| match &stack_frames {
+                                Ok(stack_frames) => {
+                                    thread.stack_frames = stack_frames
+                                        .iter()
+                                        .cloned()
+                                        .map(StackFrame::from)
+                                        .collect();
+                                    thread.stack_frames_error = None;
+                                }
+                                Err(error) => {
+                                    thread.stack_frames.clear();
+                                    thread.stack_frames_error = Some(error.to_string().into());
+                                }
+                            });
                     debug_assert!(
                         matches!(entry, indexmap::map::Entry::Occupied(_)),
                         "Sent request for thread_id that doesn't exist"
                     );
                     if let Ok(stack_frames) = stack_frames {
-                        this.stack_frames.extend(
+                        this.active_snapshot.stack_frames.extend(
                             stack_frames
                                 .into_iter()
                                 .filter(|frame| {
@@ -2186,7 +2544,8 @@ impl Session {
                                     !(frame.id == 0
                                         && frame.line == 0
                                         && frame.column == 0
-                                        && frame.presentation_hint == Some(StackFramePresentationHint::Label))
+                                        && frame.presentation_hint
+                                            == Some(StackFramePresentationHint::Label))
                                 })
                                 .map(|frame| (frame.id, StackFrame::from(frame))),
                         );
@@ -2201,10 +2560,10 @@ impl Session {
             );
         }
 
-        match self.threads.get(&thread_id) {
+        match self.session_state().threads.get(&thread_id) {
             Some(thread) => {
                 if let Some(error) = &thread.stack_frames_error {
-                    Err(error.cloned())
+                    Err(anyhow!(error.to_string()))
                 } else {
                     Ok(thread.stack_frames.clone())
                 }
@@ -2215,20 +2574,28 @@ impl Session {
 
     pub fn scopes(&mut self, stack_frame_id: u64, cx: &mut Context<Self>) -> &[dap::Scope] {
         if self.requests.contains_key(&TypeId::of::<ThreadsCommand>())
-            && self.requests.contains_key(&TypeId::of::<StackTraceCommand>())
+            && self
+                .requests
+                .contains_key(&TypeId::of::<StackTraceCommand>())
         {
             self.fetch(
                 ScopesCommand { stack_frame_id },
                 move |this, scopes, cx| {
-                    let Some(scopes) = scopes.log_err() else { return };
+                    let Some(scopes) = scopes.log_err() else {
+                        return
+                    };
 
-                    for scope in scopes.iter() {
-                        this.variables(scope.variables_reference, cx);
+                    for scope in scopes.iter().filter(|scope| !scope.expensive) {
+                            this.variables(scope.variables_reference, cx);
                     }
 
-                    let entry = this.stack_frames.entry(stack_frame_id).and_modify(|stack_frame| {
-                        stack_frame.scopes = scopes;
-                    });
+                    let entry = this
+                        .active_snapshot
+                        .stack_frames
+                        .entry(stack_frame_id)
+                        .and_modify(|stack_frame| {
+                            stack_frame.scopes = scopes;
+                        });
 
                     cx.emit(SessionEvent::Variables);
 
@@ -2241,7 +2608,8 @@ impl Session {
             );
         }
 
-        self.stack_frames
+        self.session_state()
+            .stack_frames
             .get(&stack_frame_id)
             .map(|frame| frame.scopes.as_slice())
             .unwrap_or_default()
@@ -2253,7 +2621,8 @@ impl Session {
         globals: bool,
         locals: bool,
     ) -> Vec<dap::Variable> {
-        let Some(stack_frame) = self.stack_frames.get(&stack_frame_id) else {
+        let state = self.session_state();
+        let Some(stack_frame) = state.stack_frames.get(&stack_frame_id) else {
             return Vec::new();
         };
 
@@ -2264,7 +2633,7 @@ impl Session {
                 (scope.name.to_lowercase().contains("local") && locals)
                     || (scope.name.to_lowercase().contains("global") && globals)
             })
-            .filter_map(|scope| self.variables.get(&scope.variables_reference))
+            .filter_map(|scope| state.variables.get(&scope.variables_reference))
             .flatten()
             .cloned()
             .collect()
@@ -2274,8 +2643,13 @@ impl Session {
         &self.watchers
     }
 
-    pub fn add_watcher(&mut self, expression: SharedString, frame_id: u64, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let request = self.mode.request_dap(EvaluateCommand {
+    pub fn add_watcher(
+        &mut self,
+        expression: SharedString,
+        frame_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let request = self.state.request_dap(EvaluateCommand {
             expression: expression.to_string(),
             context: Some(EvaluateArgumentsContext::Watch),
             frame_id: Some(frame_id),
@@ -2303,7 +2677,8 @@ impl Session {
     pub fn refresh_watchers(&mut self, frame_id: u64, cx: &mut Context<Self>) {
         let watches = self.watchers.clone();
         for (_, watch) in watches.into_iter() {
-            self.add_watcher(watch.expression.clone(), frame_id, cx).detach();
+            self.add_watcher(watch.expression.clone(), frame_id, cx)
+                .detach();
         }
     }
 
@@ -2311,7 +2686,11 @@ impl Session {
         self.watchers.remove(&expression);
     }
 
-    pub fn variables(&mut self, variables_reference: VariableReference, cx: &mut Context<Self>) -> Vec<dap::Variable> {
+    pub fn variables(
+        &mut self,
+        variables_reference: VariableReference,
+        cx: &mut Context<Self>,
+    ) -> Vec<dap::Variable> {
         let command = VariablesCommand {
             variables_reference,
             filter: None,
@@ -2323,11 +2702,43 @@ impl Session {
         self.fetch(
             command,
             move |this, variables, cx| {
-                let Some(variables) = variables.log_err() else {
+                let Some(mut variables) = variables.log_err() else {
                     return;
                 };
 
-                this.variables.insert(variables_reference, variables);
+                if this.adapter.0.as_ref() == "Debugpy" {
+                    for variable in variables.iter_mut() {
+                        if variable.type_ == Some("str".into()) {
+                            // reverse Python repr() escaping
+                            let mut unescaped = String::with_capacity(variable.value.len());
+                            let mut chars = variable.value.chars();
+                            while let Some(c) = chars.next() {
+                                if c != '\\' {
+                                    unescaped.push(c);
+                                } else {
+                                    match chars.next() {
+                                        Some('\\') => unescaped.push('\\'),
+                                        Some('n') => unescaped.push('\n'),
+                                        Some('t') => unescaped.push('\t'),
+                                        Some('r') => unescaped.push('\r'),
+                                        Some('\'') => unescaped.push('\''),
+                                        Some('"') => unescaped.push('"'),
+                                        Some(c) => {
+                                            unescaped.push('\\');
+                                            unescaped.push(c);
+                                        }
+                                        None => {}
+                                    }
+                                }
+                            }
+                            variable.value = unescaped;
+                        }
+                    }
+                }
+
+                this.active_snapshot
+                    .variables
+                    .insert(variables_reference, variables);
 
                 cx.emit(SessionEvent::Variables);
                 cx.emit(SessionEvent::InvalidateInlineValue);
@@ -2335,7 +2746,11 @@ impl Session {
             cx,
         );
 
-        self.variables.get(&variables_reference).cloned().unwrap_or_default()
+        self.session_state()
+            .variables
+            .get(&variables_reference)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn data_breakpoint_info(
@@ -2399,7 +2814,7 @@ impl Session {
             location_reference: None,
         };
         self.push_output(event);
-        let request = self.mode.request_dap(EvaluateCommand {
+        let request = self.state.request_dap(EvaluateCommand {
             expression,
             context,
             frame_id,
@@ -2410,6 +2825,8 @@ impl Session {
             this.update(cx, |this, cx| {
                 this.memory.clear(cx.background_executor());
                 this.invalidate_command_type::<ReadMemory>();
+                this.invalidate_command_type::<VariablesCommand>();
+                cx.emit(SessionEvent::Variables);
                 match response {
                     Ok(response) => {
                         let event = dap::OutputEvent {
@@ -2446,22 +2863,58 @@ impl Session {
         })
     }
 
-    pub fn location(&mut self, reference: u64, cx: &mut Context<Self>) -> Option<dap::LocationsResponse> {
+    /// Evaluates an expression to obtain its full value for copying.
+    pub fn evaluate_variable_value(
+        &mut self,
+        expression: String,
+        frame_id: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<String>> {
+        let context = if self
+            .capabilities
+            .supports_clipboard_context
+            .unwrap_or_default()
+        {
+            EvaluateArgumentsContext::Clipboard
+        } else {
+            EvaluateArgumentsContext::Variables
+        };
+        let request = self.request(
+            EvaluateCommand {
+                expression,
+                frame_id,
+                context: Some(context),
+                source: None,
+            },
+            |_, response, _| response.ok(),
+            cx,
+        );
+        cx.background_spawn(async move {
+            let response = request.await?;
+            Some(response.result)
+        })
+    }
+
+    pub fn location(
+        &mut self,
+        reference: u64,
+        cx: &mut Context<Self>,
+    ) -> Option<dap::LocationsResponse> {
         self.fetch(
             LocationsCommand { reference },
             move |this, response, _| {
                 let Some(response) = response.log_err() else {
                     return;
                 };
-                this.locations.insert(reference, response);
+                this.active_snapshot.locations.insert(reference, response);
             },
             cx,
         );
-        self.locations.get(&reference).cloned()
+        self.session_state().locations.get(&reference).cloned()
     }
 
     pub fn is_attached(&self) -> bool {
-        let SessionState::Running(local_mode) = &self.mode else {
+        let SessionState::Running(local_mode) = &self.state else {
             return false;
         };
         local_mode.binary.request_args.request == StartDebuggingRequestArgumentsRequest::Attach
@@ -2478,7 +2931,11 @@ impl Session {
     }
 
     pub fn terminate_threads(&mut self, thread_ids: Option<Vec<ThreadId>>, cx: &mut Context<Self>) {
-        if self.capabilities.supports_terminate_threads_request.unwrap_or_default() {
+        if self
+            .capabilities
+            .supports_terminate_threads_request
+            .unwrap_or_default()
+        {
             self.request(
                 TerminateThreadsCommand {
                     thread_ids: thread_ids.map(|ids| ids.into_iter().map(|id| id.0).collect()),
@@ -2493,7 +2950,7 @@ impl Session {
     }
 
     pub fn thread_state(&self, thread_id: ThreadId) -> Option<ThreadStatus> {
-        self.thread_states.thread_state(thread_id)
+        self.session_state().thread_states.thread_state(thread_id)
     }
 
     pub fn quirks(&self) -> SessionQuirks {
@@ -2518,13 +2975,16 @@ impl Session {
 
         let mut console_output = self.console_output(cx);
         let task = cx.spawn(async move |this, cx| {
-            let forward_ports_process = if remote_client.read_with(cx, |client, _| client.shares_network_interface())? {
-                request
-                    .other
-                    .insert("proxyUri".into(), format!("127.0.0.1:{}", request.server_port).into());
+            let forward_ports_process = if remote_client
+                .read_with(cx, |client, _| client.shares_network_interface())
+            {
+                request.other.insert(
+                    "proxyUri".into(),
+                    format!("127.0.0.1:{}", request.server_port).into(),
+                );
                 None
             } else {
-                let port = TcpTransport::unused_port(Ipv4Addr::LOCALHOST)
+                let port = TcpTransport::unused_port(IpAddr::V4(Ipv4Addr::LOCALHOST))
                     .await
                     .context("getting port for DAP")?;
                 request
@@ -2542,35 +3002,36 @@ impl Session {
 
                 let child = remote_client.update(cx, |client, _| {
                     let command = client.build_forward_ports_command(port_forwards)?;
-                    let child = new_smol_command(command.program)
+                    let child = new_command(command.program)
                         .args(command.args)
                         .envs(command.env)
                         .spawn()
                         .context("spawning port forwarding process")?;
                     anyhow::Ok(child)
-                })??;
+                })?;
                 Some(child)
             };
 
             let mut companion_process = None;
-            let companion_port = if let Some(companion_port) = this.read_with(cx, |this, _| this.companion_port)? {
-                companion_port
-            } else {
-                let task = cx.spawn(async move |cx| spawn_companion(node_runtime, cx).await);
-                match task.await {
-                    Ok((port, child)) => {
-                        companion_process = Some(child);
-                        port
+            let companion_port =
+                if let Some(companion_port) = this.read_with(cx, |this, _| this.companion_port)? {
+                    companion_port
+                } else {
+                    let task = cx.spawn(async move |cx| spawn_companion(node_runtime, cx).await);
+                    match task.await {
+                        Ok((port, child)) => {
+                            companion_process = Some(child);
+                            port
+                        }
+                        Err(e) => {
+                            console_output
+                                .send(format!("Failed to launch browser companion process: {e}"))
+                                .await
+                                .ok();
+                            return Err(e);
+                        }
                     }
-                    Err(e) => {
-                        console_output
-                            .send(format!("Failed to launch browser companion process: {e}"))
-                            .await
-                            .ok();
-                        return Err(e);
-                    }
-                }
-            };
+                };
 
             let mut background_tasks = Vec::new();
             if let Some(mut forward_ports_process) = forward_ports_process {
@@ -2587,7 +3048,10 @@ impl Session {
                         while let Ok(n) = stderr.read_line(&mut line).await
                             && n > 0
                         {
-                            console_output.send(format!("companion stderr: {line}")).await.ok();
+                            console_output
+                                .send(format!("companion stderr: {line}"))
+                                .await
+                                .ok();
                             line.clear();
                         }
                     }));
@@ -2603,7 +3067,9 @@ impl Session {
                                     .ok();
                             } else {
                                 console_output
-                                    .send(format!("Companion process exited abnormally with {status:?}"))
+                                    .send(format!(
+                                        "Companion process exited abnormally with {status:?}"
+                                    ))
                                     .await
                                     .ok();
                             }
@@ -2627,7 +3093,9 @@ impl Session {
                     companion_started = true;
                     break;
                 }
-                cx.background_executor().timer(Duration::from_millis(100)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
             }
             if !companion_started {
                 console_output
@@ -2640,7 +3108,9 @@ impl Session {
             let response = http_client
                 .post_json(
                     &format!("http://{companion_address}/launch-and-attach"),
-                    serde_json::to_string(&request).context("serializing request")?.into(),
+                    serde_json::to_string(&request)
+                        .context("serializing request")?
+                        .into(),
                 )
                 .await;
             match response {
@@ -2687,7 +3157,9 @@ impl Session {
             http_client
                 .post_json(
                     &format!("http://127.0.0.1:{companion_port}/kill"),
-                    serde_json::to_string(&request).context("serializing request")?.into(),
+                    serde_json::to_string(&request)
+                        .context("serializing request")?
+                        .into(),
                 )
                 .await?;
             anyhow::Ok(())
@@ -2711,8 +3183,14 @@ struct KillCompanionBrowserParams {
     launch_id: u64,
 }
 
-async fn spawn_companion(node_runtime: NodeRuntime, cx: &mut AsyncApp) -> Result<(u16, smol::process::Child)> {
-    let binary_path = node_runtime.binary_path().await.context("getting node path")?;
+async fn spawn_companion(
+    node_runtime: NodeRuntime,
+    cx: &mut AsyncApp,
+) -> Result<(u16, util::command::Child)> {
+    let binary_path = node_runtime
+        .binary_path()
+        .await
+        .context("getting node path")?;
     let path = cx
         .spawn(async move |cx| get_or_install_companion(node_runtime, cx).await)
         .await?;
@@ -2730,9 +3208,12 @@ async fn spawn_companion(node_runtime: NodeRuntime, cx: &mut AsyncApp) -> Result
         .to_string_lossy()
         .to_string();
 
-    let child = new_smol_command(binary_path)
+    let child = new_command(binary_path)
         .arg(path)
-        .args([format!("--listen=127.0.0.1:{port}"), format!("--state={dir}")])
+        .args([
+            format!("--listen=127.0.0.1:{port}"),
+            format!("--state={dir}"),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2747,7 +3228,7 @@ async fn get_or_install_companion(node: NodeRuntime, cx: &mut AsyncApp) -> Resul
 
     async fn install_latest_version(dir: PathBuf, node: NodeRuntime) -> Result<PathBuf> {
         let temp_dir = tempfile::tempdir().context("creating temporary directory")?;
-        node.npm_install_packages(temp_dir.path(), &[(PACKAGE_NAME, "latest")])
+        node.npm_install_latest_packages(temp_dir.path(), &[PACKAGE_NAME])
             .await
             .context("installing latest companion package")?;
         let version = node
@@ -2755,10 +3236,11 @@ async fn get_or_install_companion(node: NodeRuntime, cx: &mut AsyncApp) -> Resul
             .await
             .context("getting installed companion version")?
             .context("companion was not installed")?;
-        smol::fs::rename(temp_dir.path(), dir.join(&version))
+        let version_folder = dir.join(version.to_string());
+        smol::fs::rename(temp_dir.path(), &version_folder)
             .await
             .context("moving companion package into place")?;
-        Ok(dir.join(version))
+        Ok(version_folder)
     }
 
     let dir = paths::debug_adapters_dir().join("js-debug-companion");
@@ -2771,19 +3253,27 @@ async fn get_or_install_companion(node: NodeRuntime, cx: &mut AsyncApp) -> Resul
                     .await
                     .context("creating companion installation directory")?;
 
-                let mut children = smol::fs::read_dir(&dir)
+                let children = smol::fs::read_dir(&dir)
                     .await
                     .context("reading companion installation directory")?
                     .try_collect::<Vec<_>>()
                     .await
                     .context("reading companion installation directory entries")?;
-                children.sort_by_key(|child| semver::Version::parse(child.file_name().to_str()?).ok());
 
-                let latest_installed_version = children.last().and_then(|child| {
-                    let version = child.file_name().into_string().ok()?;
-                    Some((child.path(), version))
-                });
-                let latest_version = node.npm_package_latest_version(PACKAGE_NAME).await.log_err();
+                let latest_installed_version = children
+                    .iter()
+                    .filter_map(|child| {
+                        Some((
+                            child.path(),
+                            semver::Version::parse(child.file_name().to_str()?).ok()?,
+                        ))
+                    })
+                    .max_by_key(|(_, version)| version.clone());
+
+                let latest_version = node
+                    .npm_package_latest_version(PACKAGE_NAME)
+                    .await
+                    .log_err();
                 anyhow::Ok((latest_installed_version, latest_version))
             }
         })
@@ -2802,5 +3292,9 @@ async fn get_or_install_companion(node: NodeRuntime, cx: &mut AsyncApp) -> Resul
             .await
     };
 
-    Ok(path?.join("node_modules").join(PACKAGE_NAME).join("out").join("cli.js"))
+    Ok(path?
+        .join("node_modules")
+        .join(PACKAGE_NAME)
+        .join("out")
+        .join("cli.js"))
 }

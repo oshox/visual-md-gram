@@ -1,15 +1,20 @@
 [package]
 name = "ui_prompt"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
 
 [lib]
 path = "src/ui_prompt.rs"
 test = false
 doctest = false
+
+[features]
+default = []
 
 [dependencies]
 gpui.workspace = true
@@ -17,11 +22,6 @@ markdown.workspace = true
 menu.workspace = true
 settings.workspace = true
 theme.workspace = true
+theme_settings.workspace = true
 ui.workspace = true
 workspace.workspace = true
-
-[features]
-default = []
-
-[lints]
-workspace = true

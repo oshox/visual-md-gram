@@ -1,14 +1,12 @@
 mod assertions;
 mod marked_text;
 
-use std::{
-    ffi::OsStr,
-    path::{Path, PathBuf},
-};
-use tempfile::TempDir;
-
 pub use assertions::*;
 pub use marked_text::*;
+
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
 
 pub struct TempTree {
     _temp_dir: TempDir,
@@ -21,7 +19,10 @@ impl TempTree {
         let path = std::fs::canonicalize(dir.path()).unwrap();
         write_tree(path.as_path(), tree);
 
-        Self { _temp_dir: dir, path }
+        Self {
+            _temp_dir: dir,
+            path,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -29,7 +30,6 @@ impl TempTree {
     }
 }
 
-#[allow(clippy::disallowed_methods)]
 fn write_tree(path: &Path, tree: serde_json::Value) {
     use serde_json::Value;
     use std::fs;
@@ -42,16 +42,14 @@ fn write_tree(path: &Path, tree: serde_json::Value) {
                 Value::Object(_) => {
                     fs::create_dir(&path).unwrap();
 
+                    #[cfg(not(target_family = "wasm"))]
+                    #[allow(clippy::disallowed_methods)]
                     if path.file_name() == Some(OsStr::new(".git")) {
                         let output = std::process::Command::new("git")
                             .args(["init", "-b", "main"])
                             .current_dir(path.parent().unwrap())
                             .env("GIT_CONFIG_GLOBAL", "")
                             .env("GIT_CONFIG_SYSTEM", "")
-                            .env("GIT_AUTHOR_NAME", "test")
-                            .env("GIT_AUTHOR_EMAIL", "test@gram-editor.com")
-                            .env("GIT_COMMITTER_NAME", "test")
-                            .env("GIT_COMMITTER_EMAIL", "test@gram-editor.com")
                             .output()
                             .expect("failed to init git repo");
                         assert!(

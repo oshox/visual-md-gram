@@ -9,7 +9,7 @@ use refineable::Refineable;
 use schemars::{JsonSchema, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::borrow::Cow;
-use std::ops::Range;
+use std::ops::{AddAssign, Range};
 use std::{
     cmp::{self, PartialOrd},
     fmt::{self, Display},
@@ -78,6 +78,7 @@ pub trait Along {
     Deserialize,
     JsonSchema,
     Hash,
+    Neg,
 )]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]
@@ -182,12 +183,6 @@ impl<T: Clone + Debug + Default + PartialEq> Along for Point<T> {
     }
 }
 
-impl<T: Clone + Debug + Default + PartialEq + Negate> Negate for Point<T> {
-    fn negate(self) -> Self {
-        self.map(Negate::negate)
-    }
-}
-
 impl Point<Pixels> {
     /// Scales the point by a given factor, which is typically derived from the resolution
     /// of a target display to ensure proper sizing of UI elements.
@@ -231,7 +226,10 @@ where
 {
     /// Get the position of this point, relative to the given origin
     pub fn relative_to(&self, origin: &Point<T>) -> Point<T> {
-        point(self.x.clone() - origin.x.clone(), self.y.clone() - origin.y.clone())
+        point(
+            self.x.clone() - origin.x.clone(),
+            self.y.clone() - origin.y.clone(),
+        )
     }
 }
 
@@ -390,7 +388,9 @@ impl<T: Clone + Debug + Default + PartialEq + Display> Display for Point<T> {
 ///
 /// This struct is generic over the type `T`, which can be any type that implements `Clone`, `Default`, and `Debug`.
 /// It is commonly used to specify dimensions for elements in a UI, such as a window or element.
-#[derive(Refineable, Default, Clone, Copy, PartialEq, Div, Hash, Serialize, Deserialize)]
+#[derive(
+    Add, Clone, Copy, Default, Deserialize, Div, Hash, Neg, PartialEq, Refineable, Serialize, Sub,
+)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]
 pub struct Size<T: Clone + Debug + Default + PartialEq> {
@@ -595,34 +595,6 @@ where
     }
 }
 
-impl<T> Sub for Size<T>
-where
-    T: Sub<Output = T> + Clone + Debug + Default + PartialEq,
-{
-    type Output = Size<T>;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Size {
-            width: self.width - rhs.width,
-            height: self.height - rhs.height,
-        }
-    }
-}
-
-impl<T> Add for Size<T>
-where
-    T: Add<Output = T> + Clone + Debug + Default + PartialEq,
-{
-    type Output = Size<T>;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Size {
-            width: self.width + rhs.width,
-            height: self.height + rhs.height,
-        }
-    }
-}
-
 impl<T, Rhs> Mul<Rhs> for Size<T>
 where
     T: Mul<Rhs, Output = Rhs> + Clone + Debug + Default + PartialEq,
@@ -756,7 +728,10 @@ pub struct Bounds<T: Clone + Debug + Default + PartialEq> {
 }
 
 /// Create a bounds with the given origin and size
-pub fn bounds<T: Clone + Debug + Default + PartialEq>(origin: Point<T>, size: Size<T>) -> Bounds<T> {
+pub fn bounds<T: Clone + Debug + Default + PartialEq>(
+    origin: Point<T>,
+    size: Size<T>,
+) -> Bounds<T> {
     Bounds { origin, size }
 }
 
@@ -768,7 +743,10 @@ impl Bounds<Pixels> {
             .or_else(|| cx.primary_display());
 
         display
-            .map(|display| Bounds::centered_at(display.bounds().center(), size))
+            .map(|display| {
+                let visible_bounds = display.visible_bounds();
+                Bounds::centered_at(visible_bounds.center(), size.min(&visible_bounds.size))
+            })
             .unwrap_or_else(|| Bounds {
                 origin: point(px(0.), px(0.)),
                 size,
@@ -781,10 +759,12 @@ impl Bounds<Pixels> {
             .and_then(|id| cx.find_display(id))
             .or_else(|| cx.primary_display());
 
-        display.map(|display| display.bounds()).unwrap_or_else(|| Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(1024.), px(768.)),
-        })
+        display
+            .map(|display| display.bounds())
+            .unwrap_or_else(|| Bounds {
+                origin: point(px(0.), px(0.)),
+                size: size(px(1024.), px(768.)),
+            })
     }
 }
 
@@ -849,23 +829,44 @@ where
         };
         Bounds { origin, size }
     }
+}
 
+impl<T> Bounds<T>
+where
+    T: Sub<Output = T> + Half + Clone + Debug + Default + PartialEq,
+{
     /// Constructs a `Bounds` from a corner point and size. The specified corner will be placed at
     /// the specified origin.
-    pub fn from_corner_and_size(corner: Corner, origin: Point<T>, size: Size<T>) -> Bounds<T> {
+    pub fn from_anchor_and_size(corner: Anchor, origin: Point<T>, size: Size<T>) -> Bounds<T> {
         let origin = match corner {
-            Corner::TopLeft => origin,
-            Corner::TopRight => Point {
+            Anchor::TopLeft => origin,
+            Anchor::TopRight => Point {
                 x: origin.x - size.width.clone(),
                 y: origin.y,
             },
-            Corner::BottomLeft => Point {
+            Anchor::BottomLeft => Point {
                 x: origin.x,
                 y: origin.y - size.height.clone(),
             },
-            Corner::BottomRight => Point {
+            Anchor::BottomRight => Point {
                 x: origin.x - size.width.clone(),
                 y: origin.y - size.height.clone(),
+            },
+            Anchor::TopCenter => Point {
+                x: origin.x - size.width.half(),
+                y: origin.y,
+            },
+            Anchor::BottomCenter => Point {
+                x: origin.x - size.width.half(),
+                y: origin.y - size.height.clone(),
+            },
+            Anchor::LeftCenter => Point {
+                x: origin.x,
+                y: origin.y - size.height.half(),
+            },
+            Anchor::RightCenter => Point {
+                x: origin.x - size.width.clone(),
+                y: origin.y - size.height.half(),
             },
         };
 
@@ -884,6 +885,43 @@ where
             y: center.y - size.height.half(),
         };
         Self::new(origin, size)
+    }
+}
+
+impl<T> Bounds<T>
+where
+    T: Add<T, Output = T> + Half + Clone + Debug + Default + PartialEq,
+{
+    /// Returns the top center point of the bounds.
+    pub fn top_center(&self) -> Point<T> {
+        Point {
+            x: self.origin.x.clone() + self.size.width.half(),
+            y: self.origin.y.clone(),
+        }
+    }
+
+    /// Returns the bottom center point of the bounds.
+    pub fn bottom_center(&self) -> Point<T> {
+        Point {
+            x: self.origin.x.clone() + self.size.width.half(),
+            y: self.origin.y.clone() + self.size.height.clone(),
+        }
+    }
+
+    /// Returns the left center point of the bounds.
+    pub fn left_center(&self) -> Point<T> {
+        Point {
+            x: self.origin.x.clone(),
+            y: self.origin.y.clone() + self.size.height.half(),
+        }
+    }
+
+    /// Returns the right center point of the bounds.
+    pub fn right_center(&self) -> Point<T> {
+        Point {
+            x: self.origin.x.clone() + self.size.width.clone(),
+            y: self.origin.y.clone() + self.size.height.half(),
+        }
     }
 }
 
@@ -1050,7 +1088,13 @@ where
 
 impl<T> Bounds<T>
 where
-    T: Add<T, Output = T> + Sub<T, Output = T> + Neg<Output = T> + Clone + Debug + Default + PartialEq,
+    T: Add<T, Output = T>
+        + Sub<T, Output = T>
+        + Neg<Output = T>
+        + Clone
+        + Debug
+        + Default
+        + PartialEq,
 {
     /// Inset the bounds by a specified amount. Equivalent to `dilate` with the amount negated.
     ///
@@ -1060,7 +1104,9 @@ where
     }
 }
 
-impl<T: PartialOrd + Add<T, Output = T> + Sub<Output = T> + Clone + Debug + Default + PartialEq> Bounds<T> {
+impl<T: PartialOrd + Add<T, Output = T> + Sub<Output = T> + Clone + Debug + Default + PartialEq>
+    Bounds<T>
+{
     /// Calculates the intersection of two `Bounds` objects.
     ///
     /// This method computes the overlapping region of two `Bounds`. If the bounds do not intersect,
@@ -1096,7 +1142,10 @@ impl<T: PartialOrd + Add<T, Output = T> + Sub<Output = T> + Clone + Debug + Defa
     /// ```
     pub fn intersect(&self, other: &Self) -> Self {
         let upper_left = self.origin.max(&other.origin);
-        let bottom_right = self.bottom_right().min(&other.bottom_right()).max(&upper_left);
+        let bottom_right = self
+            .bottom_right()
+            .min(&other.bottom_right())
+            .max(&upper_left);
         Self::from_corners(upper_left, bottom_right)
     }
 
@@ -1226,6 +1275,15 @@ where
     }
 }
 
+impl<T: Clone + Debug + Default + PartialEq> From<Size<T>> for Point<T> {
+    fn from(size: Size<T>) -> Self {
+        Self {
+            x: size.width,
+            y: size.height,
+        }
+    }
+}
+
 impl<T> Bounds<T>
 where
     T: Add<T, Output = T> + Clone + Debug + Default + PartialEq,
@@ -1337,7 +1395,12 @@ where
             y: self.origin.y.clone() + self.size.height.clone(),
         }
     }
+}
 
+impl<T> Bounds<T>
+where
+    T: Add<T, Output = T> + Half + Clone + Debug + Default + PartialEq,
+{
     /// Returns the requested corner point of the bounds.
     ///
     /// # Returns
@@ -1347,20 +1410,24 @@ where
     /// # Examples
     ///
     /// ```
-    /// use gpui::{Bounds, Corner, Point, Size};
+    /// use gpui::{Bounds, Anchor, Point, Size};
     /// let bounds = Bounds {
     ///     origin: Point { x: 0, y: 0 },
     ///     size: Size { width: 10, height: 20 },
     /// };
-    /// let bottom_left = bounds.corner(Corner::BottomLeft);
+    /// let bottom_left = bounds.corner(Anchor::BottomLeft);
     /// assert_eq!(bottom_left, Point { x: 0, y: 20 });
     /// ```
-    pub fn corner(&self, corner: Corner) -> Point<T> {
+    pub fn corner(&self, corner: Anchor) -> Point<T> {
         match corner {
-            Corner::TopLeft => self.origin.clone(),
-            Corner::TopRight => self.top_right(),
-            Corner::BottomLeft => self.bottom_left(),
-            Corner::BottomRight => self.bottom_right(),
+            Anchor::TopLeft => self.origin.clone(),
+            Anchor::TopRight => self.top_right(),
+            Anchor::BottomLeft => self.bottom_left(),
+            Anchor::BottomRight => self.bottom_right(),
+            Anchor::TopCenter => self.top_center(),
+            Anchor::BottomCenter => self.bottom_center(),
+            Anchor::LeftCenter => self.left_center(),
+            Anchor::RightCenter => self.right_center(),
         }
     }
 }
@@ -1537,7 +1604,8 @@ where
 {
     /// Convert a point to the coordinate space defined by this Bounds
     pub fn localize(&self, point: &Point<T>) -> Option<Point<T>> {
-        self.contains(point).then(|| point.relative_to(&self.origin))
+        self.contains(point)
+            .then(|| point.relative_to(&self.origin))
     }
 }
 
@@ -1560,13 +1628,19 @@ impl<T: PartialOrd + Clone + Debug + Default + PartialEq> Bounds<T> {
 
 impl<T: Clone + Debug + Default + PartialEq + Display + Add<T, Output = T>> Display for Bounds<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} - {} (size {})", self.origin, self.bottom_right(), self.size)
+        write!(
+            f,
+            "{} - {} (size {})",
+            self.origin,
+            self.bottom_right(),
+            self.size
+        )
     }
 }
 
 impl Size<DevicePixels> {
     /// Converts the size from physical to logical pixels.
-    pub(crate) fn to_pixels(self, scale_factor: f32) -> Size<Pixels> {
+    pub fn to_pixels(self, scale_factor: f32) -> Size<Pixels> {
         size(
             px(self.width.0 as f32 / scale_factor),
             px(self.height.0 as f32 / scale_factor),
@@ -1576,7 +1650,7 @@ impl Size<DevicePixels> {
 
 impl Size<Pixels> {
     /// Converts the size from logical to physical pixels.
-    pub(crate) fn to_device_pixels(self, scale_factor: f32) -> Size<DevicePixels> {
+    pub fn to_device_pixels(self, scale_factor: f32) -> Size<DevicePixels> {
         size(
             DevicePixels((self.width.0 * scale_factor).round() as i32),
             DevicePixels((self.height.0 * scale_factor).round() as i32),
@@ -1814,7 +1888,10 @@ impl<T: Clone + Debug + Default + PartialEq> Edges<T> {
     /// assert!(!edges.any(|value| *value > 10));
     /// ```
     pub fn any<F: Fn(&T) -> bool>(&self, predicate: F) -> bool {
-        predicate(&self.top) || predicate(&self.right) || predicate(&self.bottom) || predicate(&self.left)
+        predicate(&self.top)
+            || predicate(&self.right)
+            || predicate(&self.bottom)
+            || predicate(&self.left)
     }
 }
 
@@ -2086,9 +2163,9 @@ impl From<Pixels> for Edges<Pixels> {
     }
 }
 
-/// Identifies a corner of a 2d box.
+/// Identifies a reference point on a 2D box, used to anchor positioned elements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Corner {
+pub enum Anchor {
     /// The top left corner
     TopLeft,
     /// The top right corner
@@ -2097,24 +2174,36 @@ pub enum Corner {
     BottomLeft,
     /// The bottom right corner
     BottomRight,
+    /// The top center position
+    TopCenter,
+    /// The bottom center position
+    BottomCenter,
+    /// The left center position
+    LeftCenter,
+    /// The right center position
+    RightCenter,
 }
 
-impl Corner {
+impl Anchor {
     /// Returns the directly opposite corner.
     ///
     /// # Examples
     ///
     /// ```
-    /// # use gpui::Corner;
-    /// assert_eq!(Corner::TopLeft.opposite_corner(), Corner::BottomRight);
+    /// # use gpui::Anchor;
+    /// assert_eq!(Anchor::TopLeft.opposite(), Anchor::BottomRight);
     /// ```
     #[must_use]
-    pub fn opposite_corner(self) -> Self {
+    pub fn opposite(self) -> Self {
         match self {
-            Corner::TopLeft => Corner::BottomRight,
-            Corner::TopRight => Corner::BottomLeft,
-            Corner::BottomLeft => Corner::TopRight,
-            Corner::BottomRight => Corner::TopLeft,
+            Anchor::TopLeft => Anchor::BottomRight,
+            Anchor::TopRight => Anchor::BottomLeft,
+            Anchor::BottomLeft => Anchor::TopRight,
+            Anchor::BottomRight => Anchor::TopLeft,
+            Anchor::TopCenter => Anchor::BottomCenter,
+            Anchor::BottomCenter => Anchor::TopCenter,
+            Anchor::LeftCenter => Anchor::RightCenter,
+            Anchor::RightCenter => Anchor::LeftCenter,
         }
     }
 
@@ -2123,26 +2212,52 @@ impl Corner {
     /// # Examples
     ///
     /// ```
-    /// # use gpui::{Axis, Corner};
-    /// let result = Corner::TopLeft.other_side_corner_along(Axis::Horizontal);
-    /// assert_eq!(result, Corner::TopRight);
+    /// # use gpui::{Axis, Anchor};
+    /// let result = Anchor::TopLeft.other_side_along(Axis::Horizontal);
+    /// assert_eq!(result, Anchor::TopRight);
     /// ```
     #[must_use]
-    pub fn other_side_corner_along(self, axis: Axis) -> Self {
+    pub fn other_side_along(self, axis: Axis) -> Self {
         match axis {
             Axis::Vertical => match self {
-                Corner::TopLeft => Corner::BottomLeft,
-                Corner::TopRight => Corner::BottomRight,
-                Corner::BottomLeft => Corner::TopLeft,
-                Corner::BottomRight => Corner::TopRight,
+                Anchor::TopLeft => Anchor::BottomLeft,
+                Anchor::TopRight => Anchor::BottomRight,
+                Anchor::BottomLeft => Anchor::TopLeft,
+                Anchor::BottomRight => Anchor::TopRight,
+                Anchor::TopCenter => Anchor::BottomCenter,
+                Anchor::BottomCenter => Anchor::TopCenter,
+                Anchor::LeftCenter => Anchor::LeftCenter,
+                Anchor::RightCenter => Anchor::RightCenter,
             },
             Axis::Horizontal => match self {
-                Corner::TopLeft => Corner::TopRight,
-                Corner::TopRight => Corner::TopLeft,
-                Corner::BottomLeft => Corner::BottomRight,
-                Corner::BottomRight => Corner::BottomLeft,
+                Anchor::TopLeft => Anchor::TopRight,
+                Anchor::TopRight => Anchor::TopLeft,
+                Anchor::BottomLeft => Anchor::BottomRight,
+                Anchor::BottomRight => Anchor::BottomLeft,
+                Anchor::TopCenter => Anchor::TopCenter,
+                Anchor::BottomCenter => Anchor::BottomCenter,
+                Anchor::LeftCenter => Anchor::RightCenter,
+                Anchor::RightCenter => Anchor::LeftCenter,
             },
         }
+    }
+
+    /// Returns whether the anchor is center-positioned.
+    #[inline]
+    pub fn is_center(&self) -> bool {
+        matches!(
+            self,
+            Self::TopCenter | Self::BottomCenter | Self::LeftCenter | Self::RightCenter
+        )
+    }
+
+    /// Returns whether the anchor is bottom-positioned.
+    #[inline]
+    pub fn is_bottom(&self) -> bool {
+        matches!(
+            self,
+            Self::BottomCenter | Self::BottomLeft | Self::BottomRight
+        )
     }
 }
 
@@ -2165,7 +2280,7 @@ pub struct Corners<T: Clone + Debug + Default + PartialEq> {
 
 impl<T> Corners<T>
 where
-    T: Clone + Debug + Default + PartialEq,
+    T: Add<T, Output = T> + Half + Clone + Debug + Default + PartialEq,
 {
     /// Constructs `Corners` where all sides are set to the same specified value.
     ///
@@ -2200,31 +2315,60 @@ where
         }
     }
 
-    /// Returns the requested corner.
+    /// Returns the requested corner value, supporting all eight corner positions.
+    ///
+    /// For the four basic corners (TopLeft, TopRight, BottomLeft, BottomRight),
+    /// this returns the corresponding field value directly.
+    ///
+    /// For the center positions (TopCenter, BottomCenter, LeftCenter, RightCenter),
+    /// this calculates the average of the two adjacent corners.
     ///
     /// # Returns
     ///
-    /// A `Point<T>` representing the corner requested by the parameter.
+    /// A value of type `T` representing the corner requested by the parameter.
     ///
     /// # Examples
     ///
+    /// Basic corner positions:
+    ///
     /// ```
-    /// # use gpui::{Corner, Corners};
+    /// # use gpui::{Anchor, Corners};
     /// let corners = Corners {
-    ///     top_left: 1,
-    ///     top_right: 2,
-    ///     bottom_left: 3,
-    ///     bottom_right: 4
+    ///     top_left: 10,
+    ///     top_right: 20,
+    ///     bottom_left: 30,
+    ///     bottom_right: 40
     /// };
-    /// assert_eq!(corners.corner(Corner::BottomLeft), 3);
+    /// assert_eq!(corners.corner(Anchor::TopLeft), 10);
+    /// assert_eq!(corners.corner(Anchor::BottomRight), 40);
+    /// ```
+    ///
+    /// Center positions (calculated as average of adjacent corners):
+    ///
+    /// ```
+    /// # use gpui::{Anchor, Corners};
+    /// let corners = Corners {
+    ///     top_left: 10,
+    ///     top_right: 20,
+    ///     bottom_left: 30,
+    ///     bottom_right: 40
+    /// };
+    /// assert_eq!(corners.corner(Anchor::TopCenter), 15);
+    /// assert_eq!(corners.corner(Anchor::BottomCenter), 35);
+    /// assert_eq!(corners.corner(Anchor::LeftCenter), 20);
+    /// assert_eq!(corners.corner(Anchor::RightCenter), 30);
     /// ```
     #[must_use]
-    pub fn corner(&self, corner: Corner) -> T {
+    pub fn corner(&self, corner: Anchor) -> T {
         match corner {
-            Corner::TopLeft => self.top_left.clone(),
-            Corner::TopRight => self.top_right.clone(),
-            Corner::BottomLeft => self.bottom_left.clone(),
-            Corner::BottomRight => self.bottom_right.clone(),
+            Anchor::TopLeft => self.top_left.clone(),
+            Anchor::TopRight => self.top_right.clone(),
+            Anchor::BottomLeft => self.bottom_left.clone(),
+            Anchor::BottomRight => self.bottom_right.clone(),
+            Anchor::TopCenter => (self.top_left.clone() + self.top_right.clone()).half(),
+            Anchor::BottomCenter => (self.bottom_left.clone() + self.bottom_right.clone()).half(),
+            Anchor::LeftCenter => (self.top_left.clone() + self.bottom_left.clone()).half(),
+            Anchor::RightCenter => (self.top_right.clone() + self.bottom_right.clone()).half(),
         }
     }
 }
@@ -2330,7 +2474,7 @@ impl<T: Div<f32, Output = T> + Ord + Clone + Debug + Default + PartialEq> Corner
     ///
     /// # Returns
     ///
-    /// Corner radii values clamped to fit.
+    /// Anchor radii values clamped to fit.
     #[must_use]
     pub fn clamp_radii_for_quad_size(self, size: Size<T>) -> Corners<T> {
         let max = cmp::min(size.width, size.height) / 2.;
@@ -2445,7 +2589,20 @@ impl From<Pixels> for Corners<Pixels> {
 
 /// Represents an angle in Radians
 #[derive(
-    Clone, Copy, Default, Add, AddAssign, Sub, SubAssign, Neg, Div, DivAssign, PartialEq, Serialize, Deserialize, Debug,
+    Clone,
+    Copy,
+    Default,
+    Add,
+    AddAssign,
+    Sub,
+    SubAssign,
+    Neg,
+    Div,
+    DivAssign,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    Debug,
 )]
 #[repr(transparent)]
 pub struct Radians(pub f32);
@@ -2457,14 +2614,30 @@ pub fn radians(value: f32) -> Radians {
 
 /// A type representing a percentage value.
 #[derive(
-    Clone, Copy, Default, Add, AddAssign, Sub, SubAssign, Neg, Div, DivAssign, PartialEq, Serialize, Deserialize, Debug,
+    Clone,
+    Copy,
+    Default,
+    Add,
+    AddAssign,
+    Sub,
+    SubAssign,
+    Neg,
+    Div,
+    DivAssign,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    Debug,
 )]
 #[repr(transparent)]
 pub struct Percentage(pub f32);
 
 /// Generate a `Radian` from a percentage of a full circle.
 pub fn percentage(value: f32) -> Percentage {
-    debug_assert!((0.0..=1.0).contains(&value), "Percentage must be between 0 and 1");
+    debug_assert!(
+        (0.0..=1.0).contains(&value),
+        "Percentage must be between 0 and 1"
+    );
     Percentage(value)
 }
 
@@ -2624,6 +2797,11 @@ impl Pixels {
     pub const MAX: Pixels = Pixels(f32::MAX);
     /// The minimum value that can be represented by `Pixels`.
     pub const MIN: Pixels = Pixels(f32::MIN);
+
+    /// Returns the raw `f32` value of this `Pixels`.
+    pub fn as_f32(self) -> f32 {
+        self.0
+    }
 
     /// Floors the `Pixels` value to the nearest whole number.
     ///
@@ -2906,9 +3084,14 @@ impl From<usize> for DevicePixels {
 /// display resolutions.
 #[derive(Clone, Copy, Default, Add, AddAssign, Sub, SubAssign, Div, DivAssign, PartialEq)]
 #[repr(transparent)]
-pub struct ScaledPixels(pub(crate) f32);
+pub struct ScaledPixels(pub f32);
 
 impl ScaledPixels {
+    /// Returns the raw `f32` value of this `ScaledPixels`.
+    pub fn as_f32(self) -> f32 {
+        self.0
+    }
+
     /// Floors the `ScaledPixels` value to the nearest whole number.
     ///
     /// # Returns
@@ -3067,9 +3250,15 @@ impl MulAssign<f32> for ScaledPixels {
 pub struct Rems(pub f32);
 
 impl Rems {
+    /// A length of zero.
+    pub const ZERO: Self = Self(0.0);
     /// Convert this Rem value to pixels.
     pub fn to_pixels(self, rem_size: Pixels) -> Pixels {
         self * rem_size
+    }
+    /// Convert from pixels to Rem
+    pub fn from_pixels(length: Pixels, window: &gpui::Window) -> Self {
+        Self(length / window.rem_size())
     }
 }
 
@@ -3078,6 +3267,12 @@ impl Mul<Pixels> for Rems {
 
     fn mul(self, other: Pixels) -> Pixels {
         Pixels(self.0 * other.0)
+    }
+}
+
+impl AddAssign<Rems> for Rems {
+    fn add_assign(&mut self, rhs: Rems) {
+        self.0 += rhs.0
     }
 }
 
@@ -3343,9 +3538,9 @@ impl TryFrom<&'_ str> for DefiniteLength {
 
     fn try_from(value: &'_ str) -> Result<Self, Self::Error> {
         if let Some(percentage) = value.strip_suffix('%') {
-            let fraction: f32 = percentage
-                .parse::<f32>()
-                .with_context(|| format!("invalid DefiniteLength '{value}', expected {EXPECTED_DEFINITE_LENGTH}"))?;
+            let fraction: f32 = percentage.parse::<f32>().with_context(|| {
+                format!("invalid DefiniteLength '{value}', expected {EXPECTED_DEFINITE_LENGTH}")
+            })?;
             Ok(DefiniteLength::Fraction(fraction / 100.0))
         } else if let Ok(absolute_length) = value.try_into() {
             Ok(DefiniteLength::Absolute(absolute_length))
@@ -3458,7 +3653,9 @@ impl TryFrom<&'_ str> for Length {
         } else if let Ok(definite_length) = value.try_into() {
             Ok(Length::Definite(definite_length))
         } else {
-            Err(anyhow!("invalid Length '{value}', expected {EXPECTED_LENGTH}"))
+            Err(anyhow!(
+                "invalid Length '{value}', expected {EXPECTED_LENGTH}"
+            ))
         }
     }
 }
@@ -3684,48 +3881,6 @@ impl Half for Rems {
     }
 }
 
-/// Provides a trait for types that can negate their values.
-pub trait Negate {
-    /// Returns the negation of the given value
-    fn negate(self) -> Self;
-}
-
-impl Negate for i32 {
-    fn negate(self) -> Self {
-        -self
-    }
-}
-
-impl Negate for f32 {
-    fn negate(self) -> Self {
-        -self
-    }
-}
-
-impl Negate for DevicePixels {
-    fn negate(self) -> Self {
-        Self(-self.0)
-    }
-}
-
-impl Negate for ScaledPixels {
-    fn negate(self) -> Self {
-        Self(-self.0)
-    }
-}
-
-impl Negate for Pixels {
-    fn negate(self) -> Self {
-        Self(-self.0)
-    }
-}
-
-impl Negate for Rems {
-    fn negate(self) -> Self {
-        Self(-self.0)
-    }
-}
-
 /// A trait for checking if a value is zero.
 ///
 /// This trait provides a method to determine if a value is considered to be zero.
@@ -3818,7 +3973,10 @@ where
     T: IsZero + Clone + Debug + Default + PartialEq,
 {
     fn is_zero(&self) -> bool {
-        self.top_left.is_zero() && self.top_right.is_zero() && self.bottom_right.is_zero() && self.bottom_left.is_zero()
+        self.top_left.is_zero()
+            && self.top_right.is_zero()
+            && self.bottom_right.is_zero()
+            && self.bottom_left.is_zero()
     }
 }
 

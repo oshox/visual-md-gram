@@ -7,6 +7,7 @@ use std::{
 use bytes::Bytes;
 use futures::AsyncRead;
 use http_body::{Body, Frame};
+use serde::Serialize;
 
 /// Based on the implementation of AsyncBody in
 /// <https://github.com/sagebind/isahc/blob/5c533f1ef4d6bdf1fd291b5103c22110f41d0bf0/src/body/mod.rs>.
@@ -88,6 +89,19 @@ impl From<&'static str> for AsyncBody {
     }
 }
 
+/// Newtype wrapper that serializes a value as JSON into an `AsyncBody`.
+pub struct Json<T: Serialize>(pub T);
+
+impl<T: Serialize> From<Json<T>> for AsyncBody {
+    fn from(json: Json<T>) -> Self {
+        Self::from_bytes(
+            serde_json::to_vec(&json.0)
+                .expect("failed to serialize JSON")
+                .into(),
+        )
+    }
+}
+
 impl<T: Into<Self>> From<Option<T>> for AsyncBody {
     fn from(body: Option<T>) -> Self {
         match body {
@@ -109,7 +123,9 @@ impl futures::AsyncRead for AsyncBody {
             Inner::Empty => Poll::Ready(Ok(0)),
             // Blocking call is over an in-memory buffer
             Inner::Bytes(cursor) => Poll::Ready(cursor.read(buf)),
-            Inner::AsyncReader(async_reader) => AsyncRead::poll_read(async_reader.as_mut(), cx, buf),
+            Inner::AsyncReader(async_reader) => {
+                AsyncRead::poll_read(async_reader.as_mut(), cx, buf)
+            }
         }
     }
 }

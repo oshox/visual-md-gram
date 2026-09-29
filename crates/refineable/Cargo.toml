@@ -1,19 +1,18 @@
 [package]
 name = "refineable"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-description = "A macro for creating 'refinement' types that can be used to partially initialize or mutate a complex struct"
-repository.workspace = true
-license = "Apache-2.0"
 publish = false
+license = "Apache-2.0"
+description = "A macro for creating 'refinement' types that can be used to partially initialize or mutate a complex struct"
+
+[lints]
+workspace = true
 
 [lib]
-doctest = false
 path = "src/refineable.rs"
+doctest = false
 test = false
 
 [dependencies]
 derive_refineable.workspace = true
-
-[lints]
-workspace = true

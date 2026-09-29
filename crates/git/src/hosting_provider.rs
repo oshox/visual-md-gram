@@ -1,8 +1,10 @@
 use std::{ops::Range, sync::Arc};
 
+use anyhow::Result;
 use async_trait::async_trait;
 use derive_more::{Deref, DerefMut};
 use gpui::{App, Global, SharedString};
+use http_client::HttpClient;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use url::Url;
@@ -29,6 +31,25 @@ impl std::fmt::Debug for GitRemote {
             .field("owner", &self.owner)
             .field("repo", &self.repo)
             .finish()
+    }
+}
+
+impl GitRemote {
+    pub fn host_supports_avatars(&self) -> bool {
+        self.host.supports_avatars()
+    }
+
+    pub async fn avatar_url(
+        &self,
+        commit: SharedString,
+        author_email: Option<SharedString>,
+        client: Arc<dyn HttpClient>,
+    ) -> Option<Url> {
+        self.host
+            .commit_author_avatar_url(&self.owner, &self.repo, commit, author_email, client)
+            .await
+            .ok()
+            .flatten()
     }
 }
 
@@ -63,15 +84,26 @@ pub trait GitHostingProvider {
     fn base_url(&self) -> Url;
 
     /// Returns a permalink to a Git commit on this hosting provider.
-    fn build_commit_permalink(&self, remote: &ParsedGitRemote, params: BuildCommitPermalinkParams) -> Url;
+    fn build_commit_permalink(
+        &self,
+        remote: &ParsedGitRemote,
+        params: BuildCommitPermalinkParams,
+    ) -> Url;
 
     /// Returns a permalink to a file and/or selection on this hosting provider.
     fn build_permalink(&self, remote: ParsedGitRemote, params: BuildPermalinkParams) -> Url;
 
     /// Returns a URL to create a pull request on this hosting provider.
-    fn build_create_pull_request_url(&self, _remote: &ParsedGitRemote, _source_branch: &str) -> Option<Url> {
+    fn build_create_pull_request_url(
+        &self,
+        _remote: &ParsedGitRemote,
+        _source_branch: &str,
+    ) -> Option<Url> {
         None
     }
+
+    /// Returns whether this provider supports avatars.
+    fn supports_avatars(&self) -> bool;
 
     /// Returns a URL fragment to the given line selection.
     fn line_fragment(&self, selection: &Range<u32>) -> String {
@@ -95,8 +127,23 @@ pub trait GitHostingProvider {
 
     fn parse_remote_url(&self, url: &str) -> Option<ParsedGitRemote>;
 
-    fn extract_pull_request(&self, _remote: &ParsedGitRemote, _message: &str) -> Option<PullRequest> {
+    fn extract_pull_request(
+        &self,
+        _remote: &ParsedGitRemote,
+        _message: &str,
+    ) -> Option<PullRequest> {
         None
+    }
+
+    async fn commit_author_avatar_url(
+        &self,
+        _repo_owner: &str,
+        _repo: &str,
+        _commit: SharedString,
+        _author_email: Option<SharedString>,
+        _http_client: Arc<dyn HttpClient>,
+    ) -> Result<Option<Url>> {
+        Ok(None)
     }
 }
 
@@ -133,7 +180,9 @@ impl GitHostingProviderRegistry {
     ///
     /// Inserts a default [`GitHostingProviderRegistry`] if one does not yet exist.
     pub fn default_global(cx: &mut App) -> Arc<Self> {
-        cx.default_global::<GlobalGitHostingProviderRegistry>().0.clone()
+        cx.default_global::<GlobalGitHostingProviderRegistry>()
+            .0
+            .clone()
     }
 
     /// Sets the global [`GitHostingProviderRegistry`].
@@ -152,7 +201,9 @@ impl GitHostingProviderRegistry {
     }
 
     /// Returns the list of all [`GitHostingProvider`]s in the registry.
-    pub fn list_hosting_providers(&self) -> Vec<Arc<dyn GitHostingProvider + Send + Sync + 'static>> {
+    pub fn list_hosting_providers(
+        &self,
+    ) -> Vec<Arc<dyn GitHostingProvider + Send + Sync + 'static>> {
         let state = self.state.read();
         state
             .default_providers
@@ -172,7 +223,10 @@ impl GitHostingProviderRegistry {
     }
 
     /// Adds the provided [`GitHostingProvider`] to the registry.
-    pub fn register_hosting_provider(&self, provider: Arc<dyn GitHostingProvider + Send + Sync + 'static>) {
+    pub fn register_hosting_provider(
+        &self,
+        provider: Arc<dyn GitHostingProvider + Send + Sync + 'static>,
+    ) {
         self.state.write().default_providers.push(provider);
     }
 }
@@ -186,7 +240,10 @@ pub struct ParsedGitRemote {
 pub fn parse_git_remote_url(
     provider_registry: Arc<GitHostingProviderRegistry>,
     url: &str,
-) -> Option<(Arc<dyn GitHostingProvider + Send + Sync + 'static>, ParsedGitRemote)> {
+) -> Option<(
+    Arc<dyn GitHostingProvider + Send + Sync + 'static>,
+    ParsedGitRemote,
+)> {
     provider_registry
         .list_hosting_providers()
         .into_iter()

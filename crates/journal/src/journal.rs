@@ -1,7 +1,7 @@
 use chrono::{Datelike, Local, NaiveTime, Timelike};
 use editor::scroll::Autoscroll;
 use editor::{Editor, SelectionEffects};
-use gpui::{App, AppContext as _, Context, Window, actions};
+use gpui::{App, AppContext as _, Context, TaskExt, Window, actions};
 pub use settings::HourFormat;
 use settings::{RegisterSetting, Settings};
 use std::{
@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use workspace::{AppState, OpenVisible, Workspace};
+use workspace::{AppState, OpenResult, OpenVisible, Workspace};
 
 actions!(
     journal,
@@ -44,11 +44,13 @@ impl settings::Settings for JournalSettings {
 }
 
 pub fn init(_: Arc<AppState>, cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
-        workspace.register_action(|workspace, _: &NewJournalEntry, window, cx| {
-            new_journal_entry(workspace, window, cx);
-        });
-    })
+    cx.observe_new(
+        |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
+            workspace.register_action(|workspace, _: &NewJournalEntry, window, cx| {
+                new_journal_entry(workspace, window, cx);
+            });
+        },
+    )
     .detach();
 }
 
@@ -105,23 +107,34 @@ pub fn new_journal_entry(workspace: &Workspace, window: &mut Window, cx: &mut Ap
         .spawn(cx, async move |cx| {
             let (journal_dir, entry_path) = create_entry.await?;
             let opened = if open_new_workspace {
-                let (new_workspace, _) = cx
+                let OpenResult {
+                    window: new_workspace,
+                    ..
+                } = cx
                     .update(|_window, cx| {
-                        workspace::open_paths(&[journal_dir], app_state, workspace::OpenOptions::default(), cx)
+                        workspace::open_paths(
+                            &[journal_dir],
+                            app_state,
+                            workspace::OpenOptions::default(),
+                            cx,
+                        )
                     })?
                     .await?;
                 new_workspace
-                    .update(cx, |workspace, window, cx| {
-                        workspace.open_paths(
-                            vec![entry_path],
-                            workspace::OpenOptions {
-                                visible: Some(OpenVisible::All),
-                                ..Default::default()
-                            },
-                            None,
-                            window,
-                            cx,
-                        )
+                    .update(cx, |multi_workspace, window, cx| {
+                        let workspace = multi_workspace.workspace().clone();
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.open_paths(
+                                vec![entry_path],
+                                workspace::OpenOptions {
+                                    visible: Some(OpenVisible::All),
+                                    ..Default::default()
+                                },
+                                None,
+                                window,
+                                cx,
+                            )
+                        })
                     })?
                     .await
             } else {
@@ -146,9 +159,12 @@ pub fn new_journal_entry(workspace: &Workspace, window: &mut Window, cx: &mut Ap
             {
                 editor.update_in(cx, |editor, window, cx| {
                     let len = editor.buffer().read(cx).len(cx);
-                    editor.change_selections(SelectionEffects::scroll(Autoscroll::center()), window, cx, |s| {
-                        s.select_ranges([len..len])
-                    });
+                    editor.change_selections(
+                        SelectionEffects::scroll(Autoscroll::center()),
+                        window,
+                        cx,
+                        |s| s.select_ranges([len..len]),
+                    );
                     if len.0 > 0 {
                         editor.insert("\n\n", window, cx);
                     }

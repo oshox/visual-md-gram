@@ -1,22 +1,29 @@
+#[cfg(any(test, feature = "test-support"))]
+use crate::NoopTextSystem;
+#[cfg(any(test, feature = "test-support"))]
+use crate::PathPromptOptions;
 use crate::{
-    AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper, ForegroundExecutor, Keymap,
-    NoopTextSystem, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PromptButton, Task, TestDisplay, TestWindow, WindowAppearance, WindowParams,
+    ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
+    DummyKeyboardMapper, ForegroundExecutor, Keymap, OwnedMenu, Platform, PlatformDisplay,
+    PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, SharedString,
+    SourceMetadata, SystemNotification, SystemNotificationResponse, Task, TestDisplay, TestWindow,
+    ThermalState, WindowAppearance, WindowParams, size,
 };
 use anyhow::Result;
+#[cfg(any(test, feature = "test-support"))]
 use collections::VecDeque;
 use futures::channel::oneshot;
 use parking_lot::Mutex;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
-    sync::Arc,
-};
-#[cfg(target_os = "windows")]
-use windows::Win32::{
-    Graphics::Imaging::{CLSID_WICImagingFactory, IWICImagingFactory},
-    System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 /// TestPlatform implements the Platform trait for use in tests.
@@ -32,15 +39,60 @@ pub(crate) struct TestPlatform {
     current_primary_item: Mutex<Option<ClipboardItem>>,
     #[cfg(target_os = "macos")]
     current_find_pasteboard_item: Mutex<Option<ClipboardItem>>,
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) prompts: RefCell<TestPrompts>,
+    screen_capture_sources: RefCell<Vec<TestScreenCaptureSource>>,
     pub opened_url: RefCell<Option<String>>,
+    pub(crate) system_notifications: RefCell<TestSystemNotifications>,
     pub text_system: Arc<dyn PlatformTextSystem>,
-    pub expect_restart: RefCell<Option<oneshot::Sender<Option<PathBuf>>>>,
-    #[cfg(target_os = "windows")]
-    bitmap_factory: std::mem::ManuallyDrop<IWICImagingFactory>,
+    pub expect_restart:
+        RefCell<Option<oneshot::Sender<(Option<PathBuf>, Vec<std::ffi::OsString>)>>>,
+    idle_sleep_prevention_count: Arc<AtomicUsize>,
+    idle_sleep_prevention_delay: Cell<Duration>,
+    idle_sleep_prevention_fails: Cell<bool>,
+    headless_renderer_factory:
+        Option<Box<dyn Fn() -> anyhow::Result<Option<Box<dyn PlatformHeadlessRenderer>>>>>,
     weak: Weak<Self>,
+    menus: RefCell<Vec<OwnedMenu>>,
 }
 
+#[derive(Clone)]
+/// A fake screen capture source, used for testing.
+pub struct TestScreenCaptureSource {}
+
+/// A fake screen capture stream, used for testing.
+pub struct TestScreenCaptureStream {}
+
+impl ScreenCaptureSource for TestScreenCaptureSource {
+    fn metadata(&self) -> Result<SourceMetadata> {
+        Ok(SourceMetadata {
+            id: 0,
+            is_main: None,
+            label: None,
+            resolution: size(DevicePixels(1), DevicePixels(1)),
+        })
+    }
+
+    fn stream(
+        &self,
+        _foreground_executor: &ForegroundExecutor,
+        _frame_callback: Box<dyn Fn(ScreenCaptureFrame) + Send>,
+    ) -> oneshot::Receiver<Result<Box<dyn ScreenCaptureStream>>> {
+        let (mut tx, rx) = oneshot::channel();
+        let stream = TestScreenCaptureStream {};
+        tx.send(Ok(Box::new(stream) as Box<dyn ScreenCaptureStream>))
+            .ok();
+        rx
+    }
+}
+
+impl ScreenCaptureStream for TestScreenCaptureStream {
+    fn metadata(&self) -> Result<SourceMetadata> {
+        TestScreenCaptureSource {}.metadata()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 struct TestPrompt {
     msg: String,
     detail: Option<String>,
@@ -49,28 +101,59 @@ struct TestPrompt {
 }
 
 #[derive(Default)]
+pub(crate) struct TestSystemNotifications {
+    pub(crate) app_identity: Option<(SharedString, SharedString)>,
+    pub(crate) shown: Vec<SystemNotification>,
+    pub(crate) delivered: Vec<SystemNotification>,
+    pub(crate) dismissed: Vec<SharedString>,
+    response_callback: Option<Box<dyn FnMut(SystemNotificationResponse)>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
 pub(crate) struct TestPrompts {
     multiple_choice: VecDeque<TestPrompt>,
     new_path: VecDeque<(PathBuf, oneshot::Sender<Result<Option<PathBuf>>>)>,
+    paths: VecDeque<(
+        PathPromptOptions,
+        oneshot::Sender<Result<Option<Vec<PathBuf>>>>,
+    )>,
 }
 
 impl TestPlatform {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(executor: BackgroundExecutor, foreground_executor: ForegroundExecutor) -> Rc<Self> {
-        #[cfg(target_os = "windows")]
-        let bitmap_factory = unsafe {
-            windows::Win32::System::Ole::OleInitialize(None).expect("unable to initialize Windows OLE");
-            std::mem::ManuallyDrop::new(
-                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
-                    .expect("Error creating bitmap factory."),
-            )
-        };
+        Self::with_platform(
+            executor,
+            foreground_executor,
+            Arc::new(NoopTextSystem),
+            None,
+        )
+    }
 
-        let text_system = Arc::new(NoopTextSystem);
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_text_system(
+        executor: BackgroundExecutor,
+        foreground_executor: ForegroundExecutor,
+        text_system: Arc<dyn PlatformTextSystem>,
+    ) -> Rc<Self> {
+        Self::with_platform(executor, foreground_executor, text_system, None)
+    }
 
+    pub fn with_platform(
+        executor: BackgroundExecutor,
+        foreground_executor: ForegroundExecutor,
+        text_system: Arc<dyn PlatformTextSystem>,
+        headless_renderer_factory: Option<
+            Box<dyn Fn() -> anyhow::Result<Option<Box<dyn PlatformHeadlessRenderer>>>>,
+        >,
+    ) -> Rc<Self> {
         Rc::new_cyclic(|weak| TestPlatform {
             background_executor: executor,
             foreground_executor,
+            #[cfg(any(test, feature = "test-support"))]
             prompts: Default::default(),
+            screen_capture_sources: Default::default(),
             active_cursor: Default::default(),
             active_display: Rc::new(TestDisplay::new()),
             active_window: Default::default(),
@@ -80,14 +163,19 @@ impl TestPlatform {
             current_primary_item: Mutex::new(None),
             #[cfg(target_os = "macos")]
             current_find_pasteboard_item: Mutex::new(None),
+            idle_sleep_prevention_count: Arc::new(AtomicUsize::new(0)),
+            idle_sleep_prevention_delay: Cell::new(Duration::ZERO),
+            idle_sleep_prevention_fails: Cell::new(false),
             weak: weak.clone(),
             opened_url: Default::default(),
-            #[cfg(target_os = "windows")]
-            bitmap_factory,
+            system_notifications: Default::default(),
             text_system,
+            headless_renderer_factory,
+            menus: Default::default(),
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn simulate_new_path_selection(
         &self,
         select_path: impl FnOnce(&std::path::Path) -> Option<std::path::PathBuf>,
@@ -98,10 +186,39 @@ impl TestPlatform {
             .new_path
             .pop_front()
             .expect("no pending new path prompt");
-        self.background_executor().set_waiting_hint(None);
         tx.send(Ok(select_path(&path))).ok();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn simulate_path_prompt_response(
+        &self,
+        select_paths: impl FnOnce(&PathPromptOptions) -> Option<Vec<std::path::PathBuf>>,
+    ) {
+        let (options, tx) = self
+            .prompts
+            .borrow_mut()
+            .paths
+            .pop_front()
+            .expect("no pending paths prompt");
+        let selection = select_paths(&options);
+        if let Some(paths) = &selection
+            && !options.multiple
+            && paths.len() > 1
+        {
+            panic!(
+                "selected {} paths for a prompt that does not allow multiple selection",
+                paths.len()
+            );
+        }
+        tx.send(Ok(selection)).ok();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn did_prompt_for_paths(&self) -> bool {
+        !self.prompts.borrow().paths.is_empty()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     #[track_caller]
     pub(crate) fn simulate_prompt_answer(&self, response: &str) {
         let prompt = self
@@ -110,7 +227,6 @@ impl TestPlatform {
             .multiple_choice
             .pop_front()
             .expect("no pending multiple choice prompt");
-        self.background_executor().set_waiting_hint(None);
         let Some(ix) = prompt.answers.iter().position(|a| a == response) else {
             panic!(
                 "PROMPT: {}\n{:?}\n{:?}\nCannot respond with {}",
@@ -120,28 +236,60 @@ impl TestPlatform {
         prompt.tx.send(ix).ok();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn has_pending_prompt(&self) -> bool {
         !self.prompts.borrow().multiple_choice.is_empty()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn pending_prompt(&self) -> Option<(String, String)> {
         let prompts = self.prompts.borrow();
         let prompt = prompts.multiple_choice.front()?;
-        Some((prompt.msg.clone(), prompt.detail.clone().unwrap_or_default()))
+        Some((
+            prompt.msg.clone(),
+            prompt.detail.clone().unwrap_or_default(),
+        ))
     }
 
-    pub(crate) fn prompt(&self, msg: &str, detail: Option<&str>, answers: &[PromptButton]) -> oneshot::Receiver<usize> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_screen_capture_sources(&self, sources: Vec<TestScreenCaptureSource>) {
+        *self.screen_capture_sources.borrow_mut() = sources;
+    }
+
+    /// Queues the prompt so a test can later inspect or answer it through
+    /// [`Self::pending_prompt`] and [`Self::simulate_prompt_answer`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn prompt(
+        &self,
+        msg: &str,
+        detail: Option<&str>,
+        answers: &[PromptButton],
+    ) -> oneshot::Receiver<usize> {
         let (tx, rx) = oneshot::channel();
         let answers: Vec<String> = answers.iter().map(|s| s.label().to_string()).collect();
-        self.background_executor()
-            .set_waiting_hint(Some(format!("PROMPT: {:?} {:?}", msg, detail)));
-        self.prompts.borrow_mut().multiple_choice.push_back(TestPrompt {
-            msg: msg.to_string(),
-            detail: detail.map(|s| s.to_string()),
-            answers,
-            tx,
-        });
+        self.prompts
+            .borrow_mut()
+            .multiple_choice
+            .push_back(TestPrompt {
+                msg: msg.to_string(),
+                detail: detail.map(|s| s.to_string()),
+                answers,
+                tx,
+            });
         rx
+    }
+
+    /// Benchmarks have no API to answer a prompt, so this doesn't retain it
+    /// for later inspection; dropping the sender immediately cancels the
+    /// returned receiver instead of leaving it pending indefinitely.
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub(crate) fn prompt(
+        &self,
+        _msg: &str,
+        _detail: Option<&str>,
+        _answers: &[PromptButton],
+    ) -> oneshot::Receiver<usize> {
+        oneshot::channel().1
     }
 
     pub(crate) fn set_active_window(&self, window: Option<TestWindow>) {
@@ -166,8 +314,63 @@ impl TestPlatform {
             .detach();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn did_prompt_for_new_path(&self) -> bool {
         !self.prompts.borrow().new_path.is_empty()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn active_idle_sleep_preventions(&self) -> usize {
+        self.idle_sleep_prevention_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_idle_sleep_prevention_delay(&self, delay: Duration) {
+        self.idle_sleep_prevention_delay.set(delay);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_idle_sleep_prevention_fails(&self, fails: bool) {
+        self.idle_sleep_prevention_fails.set(fails);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn app_identity(&self) -> Option<(SharedString, SharedString)> {
+        self.system_notifications.borrow().app_identity.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn shown_system_notifications(&self) -> Vec<SystemNotification> {
+        self.system_notifications.borrow().shown.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn delivered_system_notifications(&self) -> Vec<SystemNotification> {
+        self.system_notifications.borrow().delivered.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn dismissed_system_notifications(&self) -> Vec<SharedString> {
+        self.system_notifications.borrow().dismissed.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn simulate_system_notification_response(
+        &self,
+        response: SystemNotificationResponse,
+    ) {
+        let callback = self
+            .system_notifications
+            .borrow_mut()
+            .response_callback
+            .take();
+        if let Some(mut callback) = callback {
+            callback(response);
+            self.system_notifications
+                .borrow_mut()
+                .response_callback
+                .get_or_insert(callback);
+        }
     }
 }
 
@@ -194,19 +397,51 @@ impl Platform for TestPlatform {
 
     fn on_keyboard_layout_change(&self, _: Box<dyn FnMut()>) {}
 
+    fn on_thermal_state_change(&self, _: Box<dyn FnMut()>) {}
+
+    fn thermal_state(&self) -> ThermalState {
+        ThermalState::Nominal
+    }
+
+    fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
+        let count = self.idle_sleep_prevention_count.clone();
+        let fails = self.idle_sleep_prevention_fails.get();
+        let reason = reason.to_owned();
+        let acquire = move || {
+            if fails {
+                anyhow::bail!("Idle sleep prevention for {reason:?} is set to fail in this test");
+            }
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(ActivityGuard::new(move || {
+                count.fetch_sub(1, Ordering::SeqCst);
+            }))
+        };
+
+        let delay = self.idle_sleep_prevention_delay.get();
+        if delay.is_zero() {
+            Task::ready(acquire())
+        } else {
+            let delay = self.background_executor.timer(delay);
+            self.foreground_executor.spawn(async move {
+                delay.await;
+                acquire()
+            })
+        }
+    }
+
     fn run(&self, _on_finish_launching: Box<dyn FnOnce()>) {
         unimplemented!()
     }
 
     fn quit(&self) {}
 
-    fn restart(&self, path: Option<PathBuf>) {
+    fn restart(&self, path: Option<PathBuf>, arguments: Vec<std::ffi::OsString>) {
         if let Some(tx) = self.expect_restart.take() {
-            tx.send(path).unwrap();
+            tx.send((path, arguments)).unwrap();
         }
     }
 
-    fn activate(&self) {
+    fn activate(&self, _ignoring_other_apps: bool) {
         //
     }
 
@@ -230,6 +465,24 @@ impl Platform for TestPlatform {
         Some(self.active_display.clone())
     }
 
+    fn is_screen_capture_supported(&self) -> bool {
+        true
+    }
+
+    fn screen_capture_sources(
+        &self,
+    ) -> oneshot::Receiver<Result<Vec<Rc<dyn ScreenCaptureSource>>>> {
+        let (mut tx, rx) = oneshot::channel();
+        tx.send(Ok(self
+            .screen_capture_sources
+            .borrow()
+            .iter()
+            .map(|source| Rc::new(source.clone()) as Rc<dyn ScreenCaptureSource>)
+            .collect()))
+            .ok();
+        rx
+    }
+
     fn active_window(&self) -> Option<crate::AnyWindowHandle> {
         self.active_window
             .borrow()
@@ -242,7 +495,17 @@ impl Platform for TestPlatform {
         handle: AnyWindowHandle,
         params: WindowParams,
     ) -> anyhow::Result<Box<dyn crate::PlatformWindow>> {
-        let window = TestWindow::new(handle, params, self.weak.clone(), self.active_display.clone());
+        let renderer = match self.headless_renderer_factory.as_ref() {
+            Some(factory) => factory()?,
+            None => None,
+        };
+        let window = TestWindow::new(
+            handle,
+            params,
+            self.weak.clone(),
+            self.active_display.clone(),
+            renderer,
+        );
         Ok(Box::new(window))
     }
 
@@ -258,26 +521,57 @@ impl Platform for TestPlatform {
         unimplemented!()
     }
 
+    /// Queues the prompt so a test can later answer it through
+    /// [`Self::simulate_path_prompt_response`].
+    #[cfg(any(test, feature = "test-support"))]
+    fn prompt_for_paths(
+        &self,
+        options: crate::PathPromptOptions,
+    ) -> oneshot::Receiver<Result<Option<Vec<std::path::PathBuf>>>> {
+        let (tx, rx) = oneshot::channel();
+        self.prompts.borrow_mut().paths.push_back((options, tx));
+        rx
+    }
+
+    /// Benchmarks have no API to answer a path prompt, so this doesn't
+    /// retain it for later inspection; dropping the sender immediately
+    /// cancels the returned receiver instead of leaving it pending
+    /// indefinitely.
+    #[cfg(not(any(test, feature = "test-support")))]
     fn prompt_for_paths(
         &self,
         _options: crate::PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<std::path::PathBuf>>>> {
-        unimplemented!()
+        oneshot::channel().1
     }
 
+    /// Queues the prompt so a test can later answer it through
+    /// [`Self::simulate_new_path_selection`].
+    #[cfg(any(test, feature = "test-support"))]
     fn prompt_for_new_path(
         &self,
         directory: &std::path::Path,
         _suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<std::path::PathBuf>>> {
         let (tx, rx) = oneshot::channel();
-        self.background_executor()
-            .set_waiting_hint(Some(format!("PROMPT FOR PATH: {:?}", directory)));
         self.prompts
             .borrow_mut()
             .new_path
             .push_back((directory.to_path_buf(), tx));
         rx
+    }
+
+    /// Benchmarks have no API to answer a new-path prompt, so this doesn't
+    /// retain it for later inspection; dropping the sender immediately
+    /// cancels the returned receiver instead of leaving it pending
+    /// indefinitely.
+    #[cfg(not(any(test, feature = "test-support")))]
+    fn prompt_for_new_path(
+        &self,
+        _directory: &std::path::Path,
+        _suggested_name: Option<&str>,
+    ) -> oneshot::Receiver<Result<Option<std::path::PathBuf>>> {
+        oneshot::channel().1
     }
 
     fn can_select_mixed_files_and_dirs(&self) -> bool {
@@ -288,13 +582,64 @@ impl Platform for TestPlatform {
         unimplemented!()
     }
 
-    fn on_quit(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_quit(&self, _callback: Box<dyn FnMut() -> bool>) {}
 
     fn on_reopen(&self, _callback: Box<dyn FnMut()>) {
         unimplemented!()
     }
 
-    fn set_menus(&self, _menus: Vec<crate::Menu>, _keymap: &Keymap) {}
+    fn on_system_sleep(&self, _callback: Box<dyn FnMut()>) {}
+
+    fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {}
+
+    fn set_app_identity(&self, identifier: &str, name: &str) {
+        self.system_notifications.borrow_mut().app_identity =
+            Some((identifier.to_string().into(), name.to_string().into()));
+    }
+
+    fn show_system_notification(&self, notification: SystemNotification) {
+        let mut system_notifications = self.system_notifications.borrow_mut();
+        if system_notifications.app_identity.is_none() {
+            return;
+        }
+
+        let delivered = system_notifications
+            .delivered
+            .iter_mut()
+            .find(|delivered| delivered.tag == notification.tag);
+        if let Some(delivered) = delivered {
+            *delivered = notification.clone();
+        } else {
+            system_notifications.delivered.push(notification.clone());
+        }
+        system_notifications.shown.push(notification);
+    }
+
+    fn dismiss_system_notification(&self, tag: &str) {
+        let mut system_notifications = self.system_notifications.borrow_mut();
+        system_notifications
+            .delivered
+            .retain(|notification| notification.tag != tag);
+        system_notifications
+            .dismissed
+            .push(SharedString::from(tag.to_string()));
+    }
+
+    fn on_system_notification_response(
+        &self,
+        callback: Box<dyn FnMut(SystemNotificationResponse)>,
+    ) {
+        self.system_notifications.borrow_mut().response_callback = Some(callback);
+    }
+
+    fn set_menus(&self, menus: Vec<crate::Menu>, _keymap: &Keymap) {
+        *self.menus.borrow_mut() = menus.into_iter().map(|menu| menu.owned()).collect()
+    }
+
+    fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
+        Some(self.menus.borrow().clone())
+    }
+
     fn set_dock_menu(&self, _menu: Vec<crate::MenuItem>, _keymap: &Keymap) {}
 
     fn add_recent_document(&self, _paths: &Path) {}
@@ -315,6 +660,12 @@ impl Platform for TestPlatform {
 
     fn set_cursor_style(&self, style: crate::CursorStyle) {
         *self.active_cursor.lock() = style;
+    }
+
+    fn hide_cursor_until_mouse_moves(&self) {}
+
+    fn is_cursor_visible(&self) -> bool {
+        true
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {
@@ -349,6 +700,18 @@ impl Platform for TestPlatform {
         *self.current_find_pasteboard_item.lock() = Some(item);
     }
 
+    fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
+    fn read_credentials(&self, _url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
+        Task::ready(Ok(None))
+    }
+
+    fn delete_credentials(&self, _url: &str) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
     fn register_url_scheme(&self, _: &str) -> Task<anyhow::Result<()>> {
         unimplemented!()
     }
@@ -358,13 +721,11 @@ impl Platform for TestPlatform {
     }
 }
 
-#[cfg(target_os = "windows")]
-impl Drop for TestPlatform {
-    fn drop(&mut self) {
-        unsafe {
-            std::mem::ManuallyDrop::drop(&mut self.bitmap_factory);
-            windows::Win32::System::Ole::OleUninitialize();
-        }
+impl TestScreenCaptureSource {
+    /// Create a fake screen capture source, for testing.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new() -> Self {
+        Self {}
     }
 }
 
@@ -372,10 +733,10 @@ struct TestKeyboardLayout;
 
 impl PlatformKeyboardLayout for TestKeyboardLayout {
     fn id(&self) -> &str {
-        "gram.keyboard.example"
+        "zed.keyboard.example"
     }
 
     fn name(&self) -> &str {
-        "gram.keyboard.example"
+        "zed.keyboard.example"
     }
 }

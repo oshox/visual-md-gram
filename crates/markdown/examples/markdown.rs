@@ -1,7 +1,7 @@
 use assets::Assets;
-use gpui::{Application, Entity, KeyBinding, StyleRefinement, WindowOptions, prelude::*, rgb};
+use gpui::{Entity, KeyBinding, StyleRefinement, WindowOptions, prelude::*, rgb};
 use language::LanguageRegistry;
-use markdown::{Markdown, MarkdownElement, style::MarkdownStyle};
+use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use node_runtime::NodeRuntime;
 use settings::SettingsStore;
 use std::sync::Arc;
@@ -35,13 +35,13 @@ Remember, markdown processors may have slight differences and extensions, so alw
 
 pub fn main() {
     env_logger::init();
-    Application::new().with_assets(Assets).run(|cx| {
+    gpui_platform::application().with_assets(Assets).run(|cx| {
         let store = SettingsStore::test(cx);
         cx.set_global(store);
         cx.bind_keys([KeyBinding::new("cmd-c", markdown::Copy, None)]);
 
         let node_runtime = NodeRuntime::unavailable();
-        theme::init(LoadThemes::JustBase, cx);
+        theme_settings::init(LoadThemes::JustBase, cx);
 
         let fs = fs::FakeFs::new(cx.background_executor().clone());
         let language_registry = LanguageRegistry::new(cx.background_executor().clone());
@@ -50,7 +50,7 @@ pub fn main() {
         languages::init(language_registry.clone(), fs, node_runtime, cx);
         Assets.load_fonts(cx).unwrap();
 
-        cx.activate();
+        cx.activate(true);
         cx.open_window(WindowOptions::default(), |_, cx| {
             cx.new(|cx| MarkdownExample::new(MARKDOWN_EXAMPLE.into(), language_registry, cx))
         })
@@ -64,7 +64,8 @@ struct MarkdownExample {
 
 impl MarkdownExample {
     pub fn new(text: SharedString, language_registry: Arc<LanguageRegistry>, cx: &mut App) -> Self {
-        let markdown = cx.new(|cx| Markdown::new(text, Some(language_registry), Some("TypeScript".into()), cx));
+        let markdown = cx
+            .new(|cx| Markdown::new(text, Some(language_registry), Some("TypeScript".into()), cx));
         Self { markdown }
     }
 }
@@ -73,16 +74,16 @@ impl Render for MarkdownExample {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let markdown_style = MarkdownStyle {
             base_text_style: gpui::TextStyle {
-                font_family: ".GramSans".into(),
+                font_family: ".ZedSans".into(),
                 color: cx.theme().colors().terminal_ansi_black,
                 ..Default::default()
             },
             code_block: StyleRefinement::default()
-                .font_family(".GramMono")
+                .font_family(".ZedMono")
                 .m(rems(1.))
                 .bg(rgb(0xAAAAAAA)),
             inline_code: gpui::TextStyleRefinement {
-                font_family: Some(".GramMono".into()),
+                font_family: Some(".ZedMono".into()),
                 color: Some(cx.theme().colors().editor_foreground),
                 background_color: Some(cx.theme().colors().editor_background),
                 ..Default::default()

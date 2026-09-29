@@ -1,7 +1,9 @@
 use crate::prelude::*;
-use gpui::{AnyElement, App, IntoElement, ParentElement, Rems, RenderOnce, SharedString, Styled, Window, div, rems};
-use settings::Settings;
-use theme::{ActiveTheme, ThemeSettings};
+use gpui::{
+    AnyElement, App, IntoElement, ParentElement, Rems, RenderOnce, SharedString, Styled, Window,
+    div, rems,
+};
+use theme::ActiveTheme;
 
 use crate::{Color, rems_from_px};
 
@@ -9,16 +11,16 @@ use crate::{Color, rems_from_px};
 pub trait StyledTypography: Styled + Sized {
     /// Sets the font family to the buffer font.
     fn font_buffer(self, cx: &App) -> Self {
-        let settings = ThemeSettings::get_global(cx);
-        let buffer_font_family = settings.buffer_font.family.clone();
+        let settings = theme::theme_settings(cx);
+        let buffer_font_family = settings.buffer_font(cx).family.clone();
 
         self.font_family(buffer_font_family)
     }
 
     /// Sets the font family to the UI font.
     fn font_ui(self, cx: &App) -> Self {
-        let settings = ThemeSettings::get_global(cx);
-        let ui_font_family = settings.ui_font.family.clone();
+        let settings = theme::theme_settings(cx);
+        let ui_font_family = settings.ui_font(cx).family.clone();
 
         self.font_family(ui_font_family)
     }
@@ -30,7 +32,7 @@ pub trait StyledTypography: Styled + Sized {
 
     /// The large size for UI text.
     ///
-    /// `1.125rem` or `18px` at the default scale of `1rem` = `16px`.
+    /// `1rem` or `16px` at the default scale of `1rem` = `16px`.
     ///
     /// Note: The absolute size of this text will change based on a user's `ui_scale` setting.
     ///
@@ -79,7 +81,7 @@ pub trait StyledTypography: Styled + Sized {
     /// This should only be used for text that is displayed in a buffer,
     /// or other places that text needs to match the user's buffer font size.
     fn text_buffer(self, cx: &App) -> Self {
-        let settings = ThemeSettings::get_global(cx);
+        let settings = theme::theme_settings(cx);
         self.text_size(settings.buffer_font_size(cx))
     }
 }
@@ -98,21 +100,21 @@ pub enum TextSize {
     Default,
     /// The large size for UI text.
     ///
-    /// `1.125rem` or `18px` at the default scale of `1rem` = `16px`.
+    /// `1rem` or `16px` at the default scale of `1rem` = `16px`.
     ///
     /// Note: The absolute size of this text will change based on a user's `ui_scale` setting.
     Large,
 
     /// The small size for UI text.
     ///
-    /// `0.875rem` or `14px` at the default scale of `1rem` = `16px`.
+    /// `0.75rem` or `12px` at the default scale of `1rem` = `16px`.
     ///
     /// Note: The absolute size of this text will change based on a user's `ui_scale` setting.
     Small,
 
     /// The extra small size for UI text.
     ///
-    /// `0.75rem` or `12px` at the default scale of `1rem` = `16px`.
+    /// `0.625rem` or `10px` at the default scale of `1rem` = `16px`.
     ///
     /// Note: The absolute size of this text will change based on a user's `ui_scale` setting.
     XSmall,
@@ -130,28 +132,28 @@ pub enum TextSize {
 impl TextSize {
     /// Returns the text size in rems.
     pub fn rems(self, cx: &App) -> Rems {
-        let theme_settings = ThemeSettings::get_global(cx);
+        let settings = theme::theme_settings(cx);
 
         match self {
-            Self::Large => rems_from_px(18.0_f32),
-            Self::Default => rems_from_px(16.0_f32),
-            Self::Small => rems_from_px(14.0_f32),
-            Self::XSmall => rems_from_px(12.0_f32),
-            Self::Ui => rems_from_px(theme_settings.ui_font_size(cx)),
-            Self::Editor => rems_from_px(theme_settings.buffer_font_size(cx)),
+            Self::Large => rems_from_px(16_f32),
+            Self::Default => rems_from_px(14_f32),
+            Self::Small => rems_from_px(12_f32),
+            Self::XSmall => rems_from_px(10_f32),
+            Self::Ui => rems_from_px(settings.ui_font_size(cx)),
+            Self::Editor => rems_from_px(settings.buffer_font_size(cx)),
         }
     }
 
     pub fn pixels(self, cx: &App) -> Pixels {
-        let theme_settings = ThemeSettings::get_global(cx);
+        let settings = theme::theme_settings(cx);
 
         match self {
-            Self::Large => px(18.),
-            Self::Default => px(16.),
-            Self::Small => px(14.),
-            Self::XSmall => px(12.),
-            Self::Ui => theme_settings.ui_font_size(cx),
-            Self::Editor => theme_settings.buffer_font_size(cx),
+            Self::Large => px(16.),
+            Self::Default => px(14.),
+            Self::Small => px(12.),
+            Self::XSmall => px(10.),
+            Self::Ui => settings.ui_font_size(cx),
+            Self::Editor => settings.buffer_font_size(cx),
         }
     }
 }
@@ -161,16 +163,16 @@ impl TextSize {
 /// Defaults to a Major Second scale.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, Default)]
 pub enum HeadlineSize {
-    /// An extra small headline - `~16px` @16px/rem
+    /// An extra small headline - `~14px` @16px/rem
     XSmall,
-    /// A small headline - `18px` @16px/rem
+    /// A small headline - `16px` @16px/rem
     Small,
     #[default]
-    /// A medium headline - `~20px` @16px/rem
+    /// A medium headline - `~18px` @16px/rem
     Medium,
-    /// A large headline - `~22px` @16px/rem
+    /// A large headline - `~20px` @16px/rem
     Large,
-    /// An extra large headline - `~24px` @16px/rem
+    /// An extra large headline - `~22px` @16px/rem
     XLarge,
 }
 
@@ -178,22 +180,22 @@ impl HeadlineSize {
     /// Returns the headline size in rems.
     pub fn rems(self) -> Rems {
         match self {
-            Self::XSmall => rems_from_px(16.0_f32),
-            Self::Small => rems_from_px(18.0_f32),
-            Self::Medium => rems_from_px(20.0_f32),
-            Self::Large => rems_from_px(22.0_f32),
-            Self::XLarge => rems_from_px(24.0_f32),
+            Self::XSmall => rems(0.88),
+            Self::Small => rems(1.0),
+            Self::Medium => rems(1.125),
+            Self::Large => rems(1.27),
+            Self::XLarge => rems(1.43),
         }
     }
 
     /// Returns the line height for the headline size.
     pub fn line_height(self) -> Rems {
         match self {
-            Self::XSmall => rems(1.4),
-            Self::Small => rems(1.35),
-            Self::Medium => rems(1.3),
-            Self::Large => rems(1.25),
-            Self::XLarge => rems(1.2),
+            Self::XSmall => rems(1.6),
+            Self::Small => rems(1.6),
+            Self::Medium => rems(1.6),
+            Self::Large => rems(1.6),
+            Self::XLarge => rems(1.6),
         }
     }
 }
@@ -209,7 +211,7 @@ pub struct Headline {
 
 impl RenderOnce for Headline {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let ui_font = ThemeSettings::get_global(cx).ui_font.clone();
+        let ui_font = theme::theme_settings(cx).ui_font(cx).clone();
 
         div()
             .font(ui_font)
@@ -248,42 +250,43 @@ impl Component for Headline {
         ComponentScope::Typography
     }
 
-    fn description() -> Option<&'static str> {
-        Some("A headline element used to emphasize text and create visual hierarchy in the UI.")
+    fn description() -> &'static str {
+        "A headline element used to emphasize text and create visual hierarchy in the UI."
     }
 
-    fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
-        Some(
-            v_flex()
-                .gap_1()
-                .children(vec![
-                    single_example(
-                        "XLarge",
-                        Headline::new("XLarge Headline")
-                            .size(HeadlineSize::XLarge)
-                            .into_any_element(),
-                    ),
-                    single_example(
-                        "Large",
-                        Headline::new("Large Headline")
-                            .size(HeadlineSize::Large)
-                            .into_any_element(),
-                    ),
-                    single_example("Medium (Default)", Headline::new("Medium Headline").into_any_element()),
-                    single_example(
-                        "Small",
-                        Headline::new("Small Headline")
-                            .size(HeadlineSize::Small)
-                            .into_any_element(),
-                    ),
-                    single_example(
-                        "XSmall",
-                        Headline::new("XSmall Headline")
-                            .size(HeadlineSize::XSmall)
-                            .into_any_element(),
-                    ),
-                ])
-                .into_any_element(),
-        )
+    fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
+        v_flex()
+            .gap_1()
+            .children(vec![
+                single_example(
+                    "XLarge",
+                    Headline::new("XLarge Headline")
+                        .size(HeadlineSize::XLarge)
+                        .into_any_element(),
+                ),
+                single_example(
+                    "Large",
+                    Headline::new("Large Headline")
+                        .size(HeadlineSize::Large)
+                        .into_any_element(),
+                ),
+                single_example(
+                    "Medium (Default)",
+                    Headline::new("Medium Headline").into_any_element(),
+                ),
+                single_example(
+                    "Small",
+                    Headline::new("Small Headline")
+                        .size(HeadlineSize::Small)
+                        .into_any_element(),
+                ),
+                single_example(
+                    "XSmall",
+                    Headline::new("XSmall Headline")
+                        .size(HeadlineSize::XSmall)
+                        .into_any_element(),
+                ),
+            ])
+            .into_any_element()
     }
 }

@@ -1,3 +1,4 @@
+#![expect(clippy::result_large_err)]
 use dap::DapRegistry;
 use editor::Editor;
 use gpui::{BackgroundExecutor, TestAppContext, VisualTestContext};
@@ -5,7 +6,10 @@ use project::{FakeFs, Fs as _, Project};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use task::{DebugRequest, DebugScenario, GramDebugConfig, LaunchRequest, TaskContext, VariableName};
+use task::{
+    DebugRequest, DebugScenario, LaunchRequest, SharedTaskContext, TaskContext, VariableName,
+    ZedDebugConfig,
+};
 use text::Point;
 use util::path;
 
@@ -14,7 +18,6 @@ use crate::new_process_modal::NewProcessModal;
 use crate::tests::{init_test, init_test_workspace};
 
 #[gpui::test]
-#[allow(clippy::result_large_err)]
 async fn test_debug_session_substitutes_variables_and_relativizes_paths(
     executor: BackgroundExecutor,
     cx: &mut TestAppContext,
@@ -34,21 +37,28 @@ async fn test_debug_session_substitutes_variables_and_relativizes_paths(
     let workspace = init_test_workspace(&project, cx).await;
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
 
-    let test_variables = vec![(VariableName::WorktreeRoot, path!("/test/worktree/path").to_string())]
-        .into_iter()
-        .collect();
+    let test_variables = vec![(
+        VariableName::WorktreeRoot,
+        path!("/test/worktree/path").to_string(),
+    )]
+    .into_iter()
+    .collect();
 
-    let task_context = TaskContext {
+    let task_context: SharedTaskContext = TaskContext {
         cwd: None,
         task_variables: test_variables,
         project_env: Default::default(),
-    };
+    }
+    .into();
 
     let home_dir = paths::home_dir();
 
     let test_cases: Vec<(&'static str, &'static str)> = vec![
         // Absolute path - should not be relativized
-        (path!("/absolute/path/to/program"), path!("/absolute/path/to/program")),
+        (
+            path!("/absolute/path/to/program"),
+            path!("/absolute/path/to/program"),
+        ),
         // Relative path - should be prefixed with worktree root
         (
             format!(".{0}src{0}program", std::path::MAIN_SEPARATOR).leak(),
@@ -64,9 +74,13 @@ async fn test_debug_session_substitutes_variables_and_relativizes_paths(
                 .to_string()
                 .leak(),
         ),
-        // Path with $GRAM_WORKTREE_ROOT - should be substituted without double appending
+        // Path with $ZED_WORKTREE_ROOT - should be substituted without double appending
         (
-            format!("$GRAM_WORKTREE_ROOT{0}src{0}program", std::path::MAIN_SEPARATOR).leak(),
+            format!(
+                "$ZED_WORKTREE_ROOT{0}src{0}program",
+                std::path::MAIN_SEPARATOR
+            )
+            .leak(),
             path!("/test/worktree/path/src/program"),
         ),
     ];
@@ -97,8 +111,8 @@ async fn test_debug_session_substitutes_variables_and_relativizes_paths(
                             input_path
                         );
 
-                        let expected_other_field = if input_path.contains("$GRAM_WORKTREE_ROOT") {
-                            input_path.replace("$GRAM_WORKTREE_ROOT", path!("/test/worktree/path"))
+                        let expected_other_field = if input_path.contains("$ZED_WORKTREE_ROOT") {
+                            input_path.replace("$ZED_WORKTREE_ROOT", path!("/test/worktree/path"))
                         } else {
                             input_path.to_string()
                         };
@@ -132,8 +146,17 @@ async fn test_debug_session_substitutes_variables_and_relativizes_paths(
         };
 
         workspace
-            .update(cx, |workspace, window, cx| {
-                workspace.start_debug_session(scenario, task_context.clone(), None, None, window, cx)
+            .update(cx, |multi, window, cx| {
+                multi.workspace().update(cx, |workspace, cx| {
+                    workspace.start_debug_session(
+                        scenario,
+                        task_context.clone(),
+                        None,
+                        None,
+                        window,
+                        cx,
+                    );
+                })
             })
             .unwrap();
 
@@ -162,15 +185,19 @@ async fn test_save_debug_scenario_to_file(executor: BackgroundExecutor, cx: &mut
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
 
     workspace
-        .update(cx, |workspace, window, cx| {
-            NewProcessModal::show(workspace, window, NewProcessMode::Debug, None, cx);
+        .update(cx, |multi, window, cx| {
+            multi.workspace().update(cx, |workspace, cx| {
+                NewProcessModal::show(workspace, window, NewProcessMode::Debug, None, cx);
+            });
         })
         .unwrap();
 
     cx.run_until_parked();
 
     let modal = workspace
-        .update(cx, |workspace, _, cx| workspace.active_modal::<NewProcessModal>(cx))
+        .update(cx, |workspace, _, cx| {
+            workspace.active_modal::<NewProcessModal>(cx)
+        })
         .unwrap()
         .expect("Modal should be active");
 
@@ -188,9 +215,9 @@ async fn test_save_debug_scenario_to_file(executor: BackgroundExecutor, cx: &mut
         .unwrap();
 
     let debug_json_content = fs
-        .load(path!("/project/.gram/debug.jsonc").as_ref())
+        .load(path!("/project/.zed/debug.json").as_ref())
         .await
-        .expect("debug.jsonc should exist")
+        .expect("debug.json should exist")
         .lines()
         .filter(|line| !line.starts_with("//"))
         .collect::<Vec<_>>()
@@ -213,7 +240,10 @@ async fn test_save_debug_scenario_to_file(executor: BackgroundExecutor, cx: &mut
 
     editor.update(cx, |editor, cx| {
         assert_eq!(
-            editor.selections.newest::<Point>(&editor.display_snapshot(cx)).head(),
+            editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head(),
             Point::new(5, 2)
         )
     });
@@ -248,9 +278,9 @@ async fn test_save_debug_scenario_to_file(executor: BackgroundExecutor, cx: &mut
         ]"#};
 
     let debug_json_content = fs
-        .load(path!("/project/.gram/debug.jsonc").as_ref())
+        .load(path!("/project/.zed/debug.json").as_ref())
         .await
-        .expect("debug.jsonc should exist")
+        .expect("debug.json should exist")
         .lines()
         .filter(|line| !line.starts_with("//"))
         .collect::<Vec<_>>()
@@ -259,7 +289,10 @@ async fn test_save_debug_scenario_to_file(executor: BackgroundExecutor, cx: &mut
 }
 
 #[gpui::test]
-async fn test_debug_modal_subtitles_with_multiple_worktrees(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+async fn test_debug_modal_subtitles_with_multiple_worktrees(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
     init_test(cx);
 
     let fs = FakeFs::new(executor.clone());
@@ -267,8 +300,8 @@ async fn test_debug_modal_subtitles_with_multiple_worktrees(executor: Background
     fs.insert_tree(
         path!("/workspace1"),
         json!({
-            ".gram": {
-                "debug.jsonc": r#"[
+            ".zed": {
+                "debug.json": r#"[
                     {
                         "adapter": "fake-adapter",
                         "label": "Debug App 1",
@@ -296,25 +329,31 @@ async fn test_debug_modal_subtitles_with_multiple_worktrees(executor: Background
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
 
     workspace
-        .update(cx, |workspace, window, cx| {
-            NewProcessModal::show(workspace, window, NewProcessMode::Debug, None, cx);
+        .update(cx, |multi, window, cx| {
+            multi.workspace().update(cx, |workspace, cx| {
+                NewProcessModal::show(workspace, window, NewProcessMode::Debug, None, cx);
+            });
         })
         .unwrap();
 
     cx.run_until_parked();
 
     let modal = workspace
-        .update(cx, |workspace, _, cx| workspace.active_modal::<NewProcessModal>(cx))
+        .update(cx, |workspace, _, cx| {
+            workspace.active_modal::<NewProcessModal>(cx)
+        })
         .unwrap()
         .expect("Modal should be active");
 
     cx.executor().run_until_parked();
 
-    let subtitles = modal.update_in(cx, |modal, _, cx| modal.debug_picker_candidate_subtitles(cx));
+    let subtitles = modal.update_in(cx, |modal, _, cx| {
+        modal.debug_picker_candidate_subtitles(cx)
+    });
 
     assert_eq!(
         subtitles.as_slice(),
-        [path!(".gram/debug.jsonc"), path!(".gram/debug.jsonc")]
+        [path!(".zed/debug.json"), path!(".zed/debug.json")]
     );
 }
 
@@ -322,14 +361,21 @@ async fn test_debug_modal_subtitles_with_multiple_worktrees(executor: Background
 async fn test_dap_adapter_config_conversion_and_validation(cx: &mut TestAppContext) {
     init_test(cx);
 
-    let mut expected_adapters = vec!["CodeLLDB", "Debugpy", "JavaScript", "Delve", "GDB", "fake-adapter"];
+    let mut expected_adapters = vec![
+        "CodeLLDB",
+        "Debugpy",
+        "JavaScript",
+        "Delve",
+        "GDB",
+        "fake-adapter",
+    ];
 
     let adapter_names = cx.update(|cx| {
         let registry = DapRegistry::global(cx);
         registry.enumerate_adapters::<Vec<_>>()
     });
 
-    let gram_config = GramDebugConfig {
+    let zed_config = ZedDebugConfig {
         label: "test_debug_session".into(),
         adapter: "test_adapter".into(),
         request: DebugRequest::Launch(LaunchRequest {
@@ -354,13 +400,18 @@ async fn test_dap_adapter_config_conversion_and_validation(cx: &mut TestAppConte
             })
             .unwrap_or_else(|| panic!("Adapter {} should exist", adapter_name));
 
-        let mut adapter_specific_config = gram_config.clone();
+        let mut adapter_specific_config = zed_config.clone();
         adapter_specific_config.adapter = adapter_name.to_string().into();
 
         let debug_scenario = adapter
-            .config_from_gram_format(adapter_specific_config)
+            .config_from_zed_format(adapter_specific_config)
             .await
-            .unwrap_or_else(|_| panic!("Adapter {} should successfully convert from Gram format", adapter_name));
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Adapter {} should successfully convert from Zed format",
+                    adapter_name
+                )
+            });
 
         assert!(
             debug_scenario.config.is_object(),
@@ -371,12 +422,20 @@ async fn test_dap_adapter_config_conversion_and_validation(cx: &mut TestAppConte
         let request_type = adapter
             .request_kind(&debug_scenario.config)
             .await
-            .unwrap_or_else(|_| panic!("Adapter {} should validate the config successfully", adapter_name));
+            .unwrap_or_else(|_| {
+                panic!(
+                    "Adapter {} should validate the config successfully",
+                    adapter_name
+                )
+            });
 
         match request_type {
             dap::StartDebuggingRequestArgumentsRequest::Launch => {}
             dap::StartDebuggingRequestArgumentsRequest::Attach => {
-                panic!("Expected Launch request but got Attach for adapter {}", adapter_name);
+                panic!(
+                    "Expected Launch request but got Attach for adapter {}",
+                    adapter_name
+                );
             }
         }
     }

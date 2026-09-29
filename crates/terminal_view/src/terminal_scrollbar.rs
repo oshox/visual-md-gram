@@ -3,7 +3,7 @@ use std::{
     rc::Rc,
 };
 
-use gpui::{Bounds, Point, Size, size};
+use gpui::{Bounds, Point, point, size};
 use terminal::Terminal;
 use ui::{Pixels, ScrollableHandle, px};
 
@@ -46,9 +46,9 @@ impl TerminalScrollHandle {
 }
 
 impl ScrollableHandle for TerminalScrollHandle {
-    fn max_offset(&self) -> Size<Pixels> {
+    fn max_offset(&self) -> Point<Pixels> {
         let state = self.state.borrow();
-        size(
+        point(
             Pixels::ZERO,
             state.total_lines.saturating_sub(state.viewport_lines) as f32 * state.line_height,
         )
@@ -70,14 +70,18 @@ impl ScrollableHandle for TerminalScrollHandle {
         let max_offset = state.total_lines.saturating_sub(state.viewport_lines);
         let display_offset = (max_offset as i32 + offset_delta).clamp(0, max_offset as i32);
 
-        self.future_display_offset.set(Some(display_offset as usize));
+        self.future_display_offset
+            .set(Some(display_offset as usize));
     }
 
     fn viewport(&self) -> Bounds<Pixels> {
         let state = self.state.borrow();
         Bounds::new(
             Point::new(px(0.), px(0.)),
-            size(Pixels::ZERO, state.viewport_lines as f32 * state.line_height),
+            size(
+                Pixels::ZERO,
+                state.viewport_lines as f32 * state.line_height,
+            ),
         )
     }
 }

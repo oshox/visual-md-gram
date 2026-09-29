@@ -2,12 +2,11 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    DeriveInput, Field, FieldsNamed, PredicateType, TraitBound, Type, TypeParamBound, WhereClause, WherePredicate,
-    parse_macro_input, parse_quote,
+    DeriveInput, Field, FieldsNamed, PredicateType, TraitBound, Type, TypeParamBound, WhereClause,
+    WherePredicate, parse_macro_input, parse_quote,
 };
 
 #[proc_macro_derive(Refineable, attributes(refineable))]
-#[allow(clippy::similar_names)]
 pub fn derive_refineable(input: TokenStream) -> TokenStream {
     let DeriveInput {
         ident,
@@ -505,7 +504,9 @@ pub fn derive_refineable(input: TokenStream) -> TokenStream {
 }
 
 fn is_refineable_field(f: &Field) -> bool {
-    f.attrs.iter().any(|attr| attr.path().is_ident("refineable"))
+    f.attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("refineable"))
 }
 
 fn is_optional_field(f: &Field) -> bool {

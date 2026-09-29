@@ -1,3 +1,4 @@
+#![expect(clippy::result_large_err)]
 use crate::tests::{init_test, init_test_workspace, start_debug_session};
 use dap::requests::{StackTrace, Threads};
 use debugger_tools::LogStore;
@@ -8,8 +9,10 @@ use std::cell::OnceCell;
 use util::path;
 
 #[gpui::test]
-#[allow(clippy::result_large_err)]
-async fn test_dap_logger_captures_all_session_rpc_messages(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+async fn test_dap_logger_captures_all_session_rpc_messages(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
     let log_store_cell = std::rc::Rc::new(OnceCell::new());
 
     cx.update(|cx| {

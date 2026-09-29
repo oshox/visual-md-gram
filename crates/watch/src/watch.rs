@@ -1,4 +1,38 @@
+//! Provides single-producer, multiple-consumer channels that retain the latest value.
+//!
+//! Both [`channel`] and [`snapshot::channel`] coalesce publications: receivers
+//! observe the latest value, not a queue of every value sent. Each receiver tracks
+//! changes independently. The initial value is considered seen, every send counts
+//! as a change even if the value is equal, and an unseen final publication is
+//! delivered before reporting that the sender was dropped.
+//!
+//! # Choosing an implementation
+//!
+//! Use [`channel`] for short-lived reads, low contention, bursty updates, or
+//! frequent receiver creation and destruction. It stores the value behind a
+//! reader/writer lock. [`Receiver::borrow`] returns a read guard and marks the
+//! current version as seen. Holding that guard prevents publication, so release
+//! it promptly and do not hold it across an await.
+//!
+//! Use [`snapshot::channel`] when readers need to retain values without delaying
+//! publication, or channel synchronization must not block a thread. It atomically publishes
+//! immutable snapshots. [`snapshot::Receiver::snapshot`] marks the captured
+//! version as seen and returns an owned handle that can outlive the receiver.
+//! Stable subscriptions suit this implementation better than frequent receiver
+//! creation and destruction.
+//!
+//! # Performance tradeoffs
+//!
+//! | Operation | Lock-based channel | Snapshot channel |
+//! | --- | --- | --- |
+//! | Read | Acquires a read lock | Acquires a reference-counted snapshot |
+//! | Send | Replaces the value in place; visits pending waiters | Allocates a snapshot; visits all registered receivers |
+//! | Pending wait or cancellation | Updates a shared waiter tree under a lock | Updates a per-receiver atomic waker |
+//! | Create or drop a receiver | Constant-time bookkeeping, excluding final destruction | Copies the receiver registry; retries under contention |
+//! | Retain a value | Delays writers | Keeps that version alive without delaying writers |
+
 mod error;
+pub mod snapshot;
 
 pub use error::*;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockUpgradableReadGuard};
@@ -19,7 +53,12 @@ pub fn channel<T>(value: T) -> (Sender<T>, Receiver<T>) {
         closed: false,
     }));
 
-    (Sender { state: state.clone() }, Receiver { state, version: 0 })
+    (
+        Sender {
+            state: state.clone(),
+        },
+        Receiver { state, version: 0 },
+    )
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -181,11 +220,15 @@ impl<T: Clone> Receiver<T> {
 
 #[cfg(test)]
 mod tests {
-    use futures::FutureExt;
-
     use super::*;
+    use futures::{FutureExt, select_biased};
+    use gpui::{AppContext, TestAppContext};
+    use std::{
+        pin::pin,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+    };
 
-    #[tokio::test]
+    #[gpui::test]
     async fn test_basic_watch() {
         let (mut sender, mut receiver) = channel(0);
         assert_eq!(sender.send(1), Ok(()));
@@ -212,5 +255,72 @@ mod tests {
         drop(sender);
         assert_eq!(receiver.recv().await, Ok(7));
         assert_eq!(receiver.recv().await, Err(NoSenderError));
+    }
+
+    #[gpui::test(iterations = 1000)]
+    async fn test_watch_random(cx: &mut TestAppContext) {
+        let next_id = Arc::new(AtomicUsize::new(1));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (mut tx, rx) = channel(0);
+        let mut tasks = Vec::new();
+
+        tasks.push(cx.background_spawn({
+            let executor = cx.executor();
+            let next_id = next_id.clone();
+            let closed = closed.clone();
+            async move {
+                for _ in 0..16 {
+                    executor.simulate_random_delay().await;
+                    let id = next_id.fetch_add(1, SeqCst);
+                    zlog::info!("sending {}", id);
+                    tx.send(id).ok();
+                }
+                closed.store(true, SeqCst);
+            }
+        }));
+
+        for receiver_id in 0..16 {
+            let executor = cx.executor().clone();
+            let next_id = next_id.clone();
+            let closed = closed.clone();
+            let mut rx = rx.clone();
+            let mut prev_observed_value = *rx.borrow();
+            tasks.push(cx.background_spawn(async move {
+                for _ in 0..16 {
+                    executor.simulate_random_delay().await;
+
+                    zlog::info!("{}: receiving", receiver_id);
+                    let mut timeout = executor.simulate_random_delay().fuse();
+                    let mut recv = pin!(rx.recv().fuse());
+                    select_biased! {
+                        _ = timeout => {
+                            zlog::info!("{}: dropping recv future", receiver_id);
+                        }
+                        result = recv => {
+                            match result {
+                                Ok(value) => {
+                                    zlog::info!("{}: received {}", receiver_id, value);
+                                    assert_eq!(value, next_id.load(SeqCst) - 1);
+                                    assert_ne!(value, prev_observed_value);
+                                    prev_observed_value = value;
+                                }
+                                Err(NoSenderError) => {
+                                    zlog::info!("{}: closed", receiver_id);
+                                    assert!(closed.load(SeqCst));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
+        futures::future::join_all(tasks).await;
+    }
+
+    #[ctor::ctor(unsafe)]
+    fn init_logger() {
+        zlog::init_test();
     }
 }

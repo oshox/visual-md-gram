@@ -1,14 +1,16 @@
 [package]
 name = "theme_importer"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
-repository.workspace = true
-license = "GPL-3.0-or-later"
 publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["derive"] }
 collections.workspace = true
 gpui.workspace = true
 indexmap.workspace = true
@@ -17,10 +19,8 @@ palette.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_lenient.workspace = true
-simplelog.workspace = true
-strum.workspace = true
+simplelog.workspace= true
+strum = { workspace = true, features = ["derive"] }
 theme.workspace = true
-vscode_theme.workspace = true
-
-[lints]
-workspace = true
+theme_settings.workspace = true
+vscode_theme = "0.2.0"

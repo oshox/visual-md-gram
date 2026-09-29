@@ -18,7 +18,8 @@ impl Snippet {
     pub fn parse(source: &str) -> Result<Self> {
         let mut text = String::with_capacity(source.len());
         let mut tabstops = BTreeMap::new();
-        parse_snippet(source, false, &mut text, &mut tabstops).context("failed to parse snippet")?;
+        parse_snippet(source, false, &mut text, &mut tabstops)
+            .context("failed to parse snippet")?;
 
         let len = text.len() as isize;
         let final_tabstop = tabstops.remove(&0);
@@ -133,13 +134,18 @@ fn parse_tabstop<'a>(
 }
 
 fn parse_int(source: &str) -> Result<(usize, &str)> {
-    let len = source.find(|c: char| !c.is_ascii_digit()).unwrap_or(source.len());
+    let len = source
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(source.len());
     anyhow::ensure!(len > 0, "expected an integer");
     let (prefix, suffix) = source.split_at(len);
     Ok((prefix.parse()?, suffix))
 }
 
-fn parse_choices<'a>(mut source: &'a str, text: &mut String) -> Result<(&'a str, Option<Vec<String>>)> {
+fn parse_choices<'a>(
+    mut source: &'a str,
+    text: &mut String,
+) -> Result<(&'a str, Option<Vec<String>>)> {
     let mut found_default_choice = false;
     let mut current_choice = String::new();
     let mut choices = Vec::new();
@@ -151,8 +157,8 @@ fn parse_choices<'a>(mut source: &'a str, text: &mut String) -> Result<(&'a str,
                 source = &source[1..];
 
                 if let Some(c) = source.chars().next() {
+                    current_choice.push(c);
                     if !found_default_choice {
-                        current_choice.push(c);
                         text.push(c);
                     }
                     source = &source[c.len_utf8()..];
@@ -241,13 +247,17 @@ mod tests {
     fn test_snippet_with_placeholders() {
         let snippet = Snippet::parse("one${1:two}three${2:four}").unwrap();
         assert_eq!(snippet.text, "onetwothreefour");
-        assert_eq!(tabstops(&snippet), &[vec![3..6], vec![11..15], vec![15..15]]);
+        assert_eq!(
+            tabstops(&snippet),
+            &[vec![3..6], vec![11..15], vec![15..15]]
+        );
         assert_eq!(tabstop_choices(&snippet), &[&None, &None, &None]);
     }
 
     #[test]
     fn test_snippet_with_choice_placeholders() {
-        let snippet = Snippet::parse("type ${1|i32, u32|} = $2").expect("Should be able to unpack choice placeholders");
+        let snippet = Snippet::parse("type ${1|i32, u32|} = $2")
+            .expect("Should be able to unpack choice placeholders");
 
         assert_eq!(snippet.text, "type i32 = ");
         assert_eq!(tabstops(&snippet), &[vec![5..8], vec![11..11],]);
@@ -268,9 +278,37 @@ mod tests {
     }
 
     #[test]
+    fn test_snippet_with_escaped_chars_in_non_default_choices() {
+        let snippet = Snippet::parse(r"${1|a,b\,c|}").unwrap();
+        assert_eq!(snippet.text, "a");
+        assert_eq!(tabstops(&snippet), &[vec![0..1], vec![1..1]]);
+        assert_eq!(
+            tabstop_choices(&snippet),
+            &[&Some(vec!["a".to_string(), "b,c".to_string()]), &None]
+        );
+
+        let snippet = Snippet::parse(r"${1|one,two\|2,three\\3|}").unwrap();
+        assert_eq!(snippet.text, "one");
+        assert_eq!(tabstops(&snippet), &[vec![0..3], vec![3..3]]);
+        assert_eq!(
+            tabstop_choices(&snippet),
+            &[
+                &Some(vec![
+                    "one".to_string(),
+                    "two|2".to_string(),
+                    r"three\3".to_string()
+                ]),
+                &None
+            ]
+        );
+    }
+
+    #[test]
     fn test_snippet_with_nested_placeholders() {
-        let snippet =
-            Snippet::parse("for (${1:var ${2:i} = 0; ${2:i} < ${3:${4:array}.length}; ${2:i}++}) {$0}").unwrap();
+        let snippet = Snippet::parse(
+            "for (${1:var ${2:i} = 0; ${2:i} < ${3:${4:array}.length}; ${2:i}++}) {$0}",
+        )
+        .unwrap();
         assert_eq!(snippet.text, "for (var i = 0; i < array.length; i++) {}");
         assert_eq!(
             tabstops(&snippet),
@@ -282,7 +320,10 @@ mod tests {
                 vec![40..40],
             ]
         );
-        assert_eq!(tabstop_choices(&snippet), &[&None, &None, &None, &None, &None]);
+        assert_eq!(
+            tabstop_choices(&snippet),
+            &[&None, &None, &None, &None, &None]
+        );
     }
 
     #[test]

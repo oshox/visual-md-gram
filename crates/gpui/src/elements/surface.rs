@@ -1,13 +1,41 @@
 use crate::{
-    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, ObjectFit, Pixels,
-    Style, StyleRefinement, Styled, Window,
+    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
 };
+#[cfg(target_os = "macos")]
+use core_video::pixel_buffer::CVPixelBuffer;
 use refineable::Refineable;
+
+/// A source of a surface's content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SurfaceSource {
+    /// A macOS image buffer from CoreVideo
+    #[cfg(target_os = "macos")]
+    Surface(CVPixelBuffer),
+}
+
+#[cfg(target_os = "macos")]
+impl From<CVPixelBuffer> for SurfaceSource {
+    fn from(value: CVPixelBuffer) -> Self {
+        SurfaceSource::Surface(value)
+    }
+}
 
 /// A surface element.
 pub struct Surface {
+    source: SurfaceSource,
     object_fit: ObjectFit,
     style: StyleRefinement,
+}
+
+/// Create a new surface element.
+#[cfg(target_os = "macos")]
+pub fn surface(source: impl Into<SurfaceSource>) -> Surface {
+    Surface {
+        source: source.into(),
+        object_fit: ObjectFit::Contain,
+        style: Default::default(),
+    }
 }
 
 impl Surface {
@@ -56,14 +84,25 @@ impl Element for Surface {
 
     fn paint(
         &mut self,
-        _id: Option<&GlobalElementId>,
+        _global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
-        _window: &mut Window,
-        _cx: &mut App,
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] window: &mut Window,
+        _: &mut App,
     ) {
+        match &self.source {
+            #[cfg(target_os = "macos")]
+            SurfaceSource::Surface(surface) => {
+                let size = crate::size(surface.get_width().into(), surface.get_height().into());
+                let new_bounds = self.object_fit.get_bounds(bounds, size);
+                // TODO: Add support for corner_radii
+                window.paint_surface(new_bounds, surface.clone());
+            }
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
     }
 }
 

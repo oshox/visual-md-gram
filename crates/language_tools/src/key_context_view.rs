@@ -1,29 +1,28 @@
 use gpui::{
-    Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, KeyBindingContextPredicate, KeyContext,
-    Keystroke, MouseButton, Render, Subscription, Task, actions,
+    Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable,
+    KeyBindingContextPredicate, KeyContext, Keystroke, MouseButton, Render, Subscription, Task,
 };
 use itertools::Itertools;
 use serde_json::json;
 use ui::{Button, ButtonStyle};
 use ui::{
-    ButtonCommon, Clickable, Context, FluentBuilder, InteractiveElement, Label, LabelCommon, LabelSize, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, h_flex, px, v_flex,
+    ButtonCommon, Clickable, Context, FluentBuilder, InteractiveElement, Label, LabelCommon,
+    LabelSize, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    h_flex, px, v_flex,
 };
 use workspace::{Item, SplitDirection, Workspace};
-
-actions!(
-    dev,
-    [
-        /// Opens the key context view for debugging keybindings.
-        OpenKeyContextView
-    ]
-);
+use zed_actions::dev::OpenKeyContextView;
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &OpenKeyContextView, window, cx| {
             let key_context_view = cx.new(|cx| KeyContextView::new(window, cx));
-            workspace.split_item(SplitDirection::Right, Box::new(key_context_view), window, cx)
+            workspace.split_item(
+                SplitDirection::Right,
+                Box::new(key_context_view),
+                window,
+                cx,
+            )
         });
     })
     .detach();
@@ -45,7 +44,11 @@ impl KeyContextView {
             pending.push(e.keystroke.clone());
             let mut possibilities = cx.all_bindings_for_input(&pending);
             possibilities.reverse();
-            this.last_keystrokes = Some(json!(pending.iter().map(|p| p.unparse()).join(" ")).to_string().into());
+            this.last_keystrokes = Some(
+                json!(pending.iter().map(|p| p.unparse()).join(" "))
+                    .to_string()
+                    .into(),
+            );
             this.context_stack = e.context_stack.clone();
             this.last_possibilities = possibilities
                 .into_iter()
@@ -71,11 +74,15 @@ impl KeyContextView {
                         "".to_string()
                     };
                     let mut name = binding.action().name();
-                    if name == "gram::NoAction" {
+                    if name == "zed::NoAction" {
                         name = "(null)"
                     }
 
-                    (name.to_owned().into(), json!(predicate).to_string().into(), match_state)
+                    (
+                        name.to_owned().into(),
+                        json!(predicate).to_string().into(),
+                        match_state,
+                    )
                 })
                 .collect();
             cx.notify();
@@ -120,7 +127,7 @@ impl KeyContextView {
         if let Some(last_action) = a {
             last_action.partial_eq(b)
         } else {
-            b.name() == "gram::NoAction"
+            b.name() == "zed::NoAction"
         }
     }
 }
@@ -128,10 +135,14 @@ impl KeyContextView {
 impl Item for KeyContextView {
     type Event = ();
 
-    fn to_item_events(_: &Self::Event, _: impl FnMut(workspace::item::ItemEvent)) {}
+    fn to_item_events(_: &Self::Event, _: &mut dyn FnMut(workspace::item::ItemEvent)) {}
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
         "Keyboard Context".into()
+    }
+
+    fn telemetry_event_text(&self) -> Option<&'static str> {
+        None
     }
 
     fn can_split(&self) -> bool {
@@ -182,7 +193,7 @@ impl Render for KeyContextView {
                 }),
             )
             .child(Label::new("Keyboard Context").size(LabelSize::Large))
-            .child(Label::new("This view lets you determine the current context stack for creating custom key bindings in Gram. When a keyboard shortcut is triggered, it also shows all the possible contexts it could have triggered in, and which one matched."))
+            .child(Label::new("This view lets you determine the current context stack for creating custom key bindings in Zed. When a keyboard shortcut is triggered, it also shows all the possible contexts it could have triggered in, and which one matched."))
             .child(
                 h_flex()
                     .mt_4()
@@ -190,25 +201,25 @@ impl Render for KeyContextView {
                     .child(
                         Button::new("open_documentation", "Open Documentation")
                             .style(ButtonStyle::Filled)
-                            .on_click(|_, _, cx| cx.open_url("gram://docs/key-bindings")),
+                            .on_click(|_, _, cx| cx.open_url("https://zed.dev/docs/key-bindings")),
                     )
                     .child(
                         Button::new("view_default_keymap", "View Default Keymap")
                             .style(ButtonStyle::Filled)
                             .key_binding(ui::KeyBinding::for_action(
-                                &app_actions::OpenDefaultKeymap,
+                                &zed_actions::OpenDefaultKeymap,
                                 cx
                             ))
                             .on_click(|_, window, cx| {
-                                window.dispatch_action(app_actions::OpenDefaultKeymap.boxed_clone(), cx);
+                                window.dispatch_action(zed_actions::OpenDefaultKeymap.boxed_clone(), cx);
                             }),
                     )
                     .child(
                         Button::new("edit_your_keymap", "Edit Keymap File")
                             .style(ButtonStyle::Filled)
-                            .key_binding(ui::KeyBinding::for_action(&app_actions::OpenKeymapFile, cx))
+                            .key_binding(ui::KeyBinding::for_action(&zed_actions::OpenKeymapFile, cx))
                             .on_click(|_, window, cx| {
-                                window.dispatch_action(app_actions::OpenKeymapFile.boxed_clone(), cx);
+                                window.dispatch_action(zed_actions::OpenKeymapFile.boxed_clone(), cx);
                             }),
                     ),
             )

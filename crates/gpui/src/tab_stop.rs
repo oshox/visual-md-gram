@@ -90,7 +90,8 @@ impl TabStopMap {
     }
 
     pub fn begin_group(&mut self, tab_index: isize) {
-        self.insertion_history.push(TabStopOperation::Group(tab_index));
+        self.insertion_history
+            .push(TabStopOperation::Group(tab_index));
         self.current_path.0.push(tab_index);
     }
 
@@ -195,6 +196,10 @@ impl TabStopMap {
         self.insertion_history.len()
     }
 
+    pub(crate) fn tab_stop_count(&self) -> usize {
+        self.by_id.values().filter(|node| node.tab_stop).count()
+    }
+
     fn focus_handle_for_order(&self, order: &TabStopNode) -> Option<FocusHandle> {
         let handle = self.insertion_history[order.node_insertion_index].focus_handle();
         debug_assert!(
@@ -297,10 +302,12 @@ mod sum_tree_impl {
             cursor_location: &TabStopNode,
             _: <TabStopOrderNodeSummary as sum_tree::Summary>::Context<'_>,
         ) -> std::cmp::Ordering {
-            Iterator::cmp(self.path.0.iter(), cursor_location.path.0.iter()).then(<usize as Ord>::cmp(
-                &self.node_insertion_index,
-                &cursor_location.node_insertion_index,
-            ))
+            Iterator::cmp(self.path.0.iter(), cursor_location.path.0.iter()).then(
+                <usize as Ord>::cmp(
+                    &self.node_insertion_index,
+                    &cursor_location.node_insertion_index,
+                ),
+            )
         }
     }
 }
@@ -346,26 +353,59 @@ mod tests {
             found.push(handle.id);
         }
 
-        assert_eq!(found, expected.iter().map(|handle| handle.id).collect::<Vec<_>>());
+        assert_eq!(
+            found,
+            expected.iter().map(|handle| handle.id).collect::<Vec<_>>()
+        );
 
         // Select first tab index if no handle is currently focused.
         assert_eq!(tab_index_map.next(None), Some(expected[0].clone()));
         // Select last tab index if no handle is currently focused.
         assert_eq!(tab_index_map.prev(None), expected.last().cloned(),);
 
-        assert_eq!(tab_index_map.next(Some(&expected[0].id)), Some(expected[1].clone()));
-        assert_eq!(tab_index_map.next(Some(&expected[1].id)), Some(expected[2].clone()));
-        assert_eq!(tab_index_map.next(Some(&expected[2].id)), Some(expected[3].clone()));
-        assert_eq!(tab_index_map.next(Some(&expected[3].id)), Some(expected[4].clone()));
-        assert_eq!(tab_index_map.next(Some(&expected[4].id)), Some(expected[0].clone()));
+        assert_eq!(
+            tab_index_map.next(Some(&expected[0].id)),
+            Some(expected[1].clone())
+        );
+        assert_eq!(
+            tab_index_map.next(Some(&expected[1].id)),
+            Some(expected[2].clone())
+        );
+        assert_eq!(
+            tab_index_map.next(Some(&expected[2].id)),
+            Some(expected[3].clone())
+        );
+        assert_eq!(
+            tab_index_map.next(Some(&expected[3].id)),
+            Some(expected[4].clone())
+        );
+        assert_eq!(
+            tab_index_map.next(Some(&expected[4].id)),
+            Some(expected[0].clone())
+        );
 
         // prev
         assert_eq!(tab_index_map.prev(None), Some(expected[4].clone()));
-        assert_eq!(tab_index_map.prev(Some(&expected[0].id)), Some(expected[4].clone()));
-        assert_eq!(tab_index_map.prev(Some(&expected[1].id)), Some(expected[0].clone()));
-        assert_eq!(tab_index_map.prev(Some(&expected[2].id)), Some(expected[1].clone()));
-        assert_eq!(tab_index_map.prev(Some(&expected[3].id)), Some(expected[2].clone()));
-        assert_eq!(tab_index_map.prev(Some(&expected[4].id)), Some(expected[3].clone()));
+        assert_eq!(
+            tab_index_map.prev(Some(&expected[0].id)),
+            Some(expected[4].clone())
+        );
+        assert_eq!(
+            tab_index_map.prev(Some(&expected[1].id)),
+            Some(expected[0].clone())
+        );
+        assert_eq!(
+            tab_index_map.prev(Some(&expected[2].id)),
+            Some(expected[1].clone())
+        );
+        assert_eq!(
+            tab_index_map.prev(Some(&expected[3].id)),
+            Some(expected[2].clone())
+        );
+        assert_eq!(
+            tab_index_map.prev(Some(&expected[4].id)),
+            Some(expected[3].clone())
+        );
     }
 
     #[test]
@@ -409,14 +449,18 @@ mod tests {
 
         #[must_use]
         fn tab_non_stop(mut self, index: isize) -> Self {
-            let handle = FocusHandle::new(&self.focus_map).tab_stop(false).tab_index(index);
+            let handle = FocusHandle::new(&self.focus_map)
+                .tab_stop(false)
+                .tab_index(index);
             self.tab_map.insert(&handle);
             self
         }
 
         #[must_use]
         fn tab_stop(mut self, index: isize, expected: usize) -> Self {
-            let handle = FocusHandle::new(&self.focus_map).tab_stop(true).tab_index(index);
+            let handle = FocusHandle::new(&self.focus_map)
+                .tab_stop(true)
+                .tab_index(index);
             self.tab_map.insert(&handle);
             self.expected.push((expected, handle.id));
             self.expected.sort_by_key(|(expected, _)| *expected);
@@ -454,7 +498,9 @@ mod tests {
 
             // Test overflow. Last to first
             assert_eq!(
-                self.tab_map.next(forward_found.last()).map(|handle| handle.id),
+                self.tab_map
+                    .next(forward_found.last())
+                    .map(|handle| handle.id),
                 expected.first().cloned()
             );
 
@@ -465,7 +511,9 @@ mod tests {
 
             // Test overflow. First to last
             assert_eq!(
-                self.tab_map.prev(reversed_found.last()).map(|handle| handle.id),
+                self.tab_map
+                    .prev(reversed_found.last())
+                    .map(|handle| handle.id),
                 expected.first().cloned(),
             );
         }
@@ -523,7 +571,8 @@ mod tests {
             .tab_stop(0, 0)
             .tab_stop(1, 1)
             .tab_group(2, |t| {
-                t.tab_group(0, |t| t.tab_stop(0, 2).tab_stop(1, 3)).tab_stop(1, 4)
+                t.tab_group(0, |t| t.tab_stop(0, 2).tab_stop(1, 3))
+                    .tab_stop(1, 4)
             })
             .tab_stop(3, 5)
             .tab_stop(4, 6)

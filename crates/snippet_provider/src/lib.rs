@@ -15,6 +15,7 @@ use fs::Fs;
 use futures::stream::StreamExt;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
 pub use registry::*;
+use util::ResultExt;
 
 pub fn init(cx: &mut App) {
     SnippetRegistry::init_global(cx);
@@ -31,28 +32,36 @@ fn file_stem_to_key(stem: &str) -> SnippetKind {
     }
 }
 
-fn file_to_snippets(file_contents: VsSnippetsFile, source: &Path) -> Vec<Arc<Snippet>> {
-    let mut snippets = vec![];
-    for (name, snippet) in file_contents.snippets {
-        let snippet_name = name.clone();
-        let prefixes = snippet
-            .prefix
-            .map_or_else(move || vec![snippet_name], |prefixes| prefixes.into());
-        let description = snippet.description.map(|description| description.to_string());
-        let body = snippet.body.to_string();
-        if let Err(e) = snippet::Snippet::parse(&body) {
-            log::error!("Invalid snippet name '{name}' in {source:?}: {e:#}");
-            continue;
-        }
-        snippets.push(Arc::new(Snippet {
-            body,
-            prefix: prefixes,
-            description,
-            name,
-        }));
-    }
-    snippets
+pub fn file_to_snippets(
+    file_contents: VsSnippetsFile,
+    source: &Path,
+) -> impl Iterator<Item = Result<Arc<Snippet>>> {
+    file_contents
+        .snippets
+        .into_iter()
+        .map(move |(name, snippet)| {
+            let snippet_name = name.clone();
+            let prefixes = snippet
+                .prefix
+                .map_or_else(move || vec![snippet_name], |prefixes| prefixes.into());
+            let description = snippet
+                .description
+                .map(|description| description.to_string());
+            let body = snippet.body.to_string();
+            match snippet::Snippet::parse(&body) {
+                Ok(_) => Ok(Arc::new(Snippet {
+                    body,
+                    prefix: prefixes,
+                    description,
+                    name,
+                })),
+                Err(e) => Err(anyhow::anyhow!(
+                    "Invalid snippet '{name}' in {source:?}: {e:#}"
+                )),
+            }
+        })
 }
+
 // Snippet with all of the metadata
 #[derive(Debug)]
 pub struct Snippet {
@@ -62,10 +71,17 @@ pub struct Snippet {
     pub name: String,
 }
 
-async fn process_updates(this: WeakEntity<SnippetProvider>, entries: Vec<PathBuf>, mut cx: AsyncApp) -> Result<()> {
+async fn process_updates(
+    this: WeakEntity<SnippetProvider>,
+    entries: Vec<PathBuf>,
+    mut cx: AsyncApp,
+) -> Result<()> {
     let fs = this.read_with(&cx, |this, _| this.fs.clone())?;
     for entry_path in entries {
-        if entry_path.extension().is_none_or(|extension| extension != "json") {
+        if entry_path
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
             continue;
         }
         let entry_metadata = fs.metadata(&entry_path).await;
@@ -92,11 +108,13 @@ async fn process_updates(this: WeakEntity<SnippetProvider>, entries: Vec<PathBuf
                 let Some(file_contents) = contents else {
                     return;
                 };
-                let Ok(as_json) = serde_json_lenient::from_str::<VsSnippetsFile>(&file_contents) else {
+                let Ok(as_json) = serde_json_lenient::from_str::<VsSnippetsFile>(&file_contents)
+                else {
                     return;
                 };
                 let snippets = file_to_snippets(as_json, entry_path.as_path());
-                *snippets_of_kind.entry(entry_path).or_default() = snippets;
+                *snippets_of_kind.entry(entry_path).or_default() =
+                    snippets.filter_map(Result::log_err).collect();
             } else {
                 snippets_of_kind.remove(&entry_path);
             }
@@ -105,7 +123,11 @@ async fn process_updates(this: WeakEntity<SnippetProvider>, entries: Vec<PathBuf
     Ok(())
 }
 
-async fn initial_scan(this: WeakEntity<SnippetProvider>, path: Arc<Path>, cx: AsyncApp) -> Result<()> {
+async fn initial_scan(
+    this: WeakEntity<SnippetProvider>,
+    path: Arc<Path>,
+    cx: AsyncApp,
+) -> Result<()> {
     let fs = this.read_with(&cx, |this, _| this.fs.clone())?;
     let entries = fs.read_dir(&path).await;
     if let Ok(entries) = entries {
@@ -171,11 +193,7 @@ impl SnippetProvider {
         self.watch_tasks.push(cx.spawn(async move |this, cx| {
             let fs = this.read_with(cx, |this, _| this.fs.clone())?;
             let watched_path = path.clone();
-            let watcher = fs.watch(
-                &watched_path,
-                Duration::from_secs(1),
-                fs::fs_watcher::WatcherMode::Native,
-            );
+            let watcher = fs.watch(&watched_path, Duration::from_secs(1));
             initial_scan(this.clone(), path, cx.clone()).await?;
 
             let (mut entries, _) = watcher.await;
@@ -206,7 +224,12 @@ impl SnippetProvider {
             .collect();
         if LOOKUP_GLOBALS {
             if let Some(global_watcher) = cx.try_global::<GlobalSnippetWatcher>() {
-                user_snippets.extend(global_watcher.0.read(cx).lookup_snippets::<false>(language, cx));
+                user_snippets.extend(
+                    global_watcher
+                        .0
+                        .read(cx)
+                        .lookup_snippets::<false>(language, cx),
+                );
             }
 
             let Some(registry) = SnippetRegistry::try_global(cx) else {
@@ -221,8 +244,16 @@ impl SnippetProvider {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn add_snippet_for_test(&mut self, language: SnippetKind, path: PathBuf, snippet: Vec<Arc<Snippet>>) {
-        self.snippets.entry(language).or_default().insert(path, snippet);
+    pub fn add_snippet_for_test(
+        &mut self,
+        language: SnippetKind,
+        path: PathBuf,
+        snippet: Vec<Arc<Snippet>>,
+    ) {
+        self.snippets
+            .entry(language)
+            .or_default()
+            .insert(path, snippet);
     }
 
     pub fn snippets_for(&self, language: SnippetKind, cx: &App) -> Vec<Arc<Snippet>> {

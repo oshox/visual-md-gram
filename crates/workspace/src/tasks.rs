@@ -1,15 +1,29 @@
 use std::process::ExitStatus;
 
 use anyhow::Result;
-use gpui::{AppContext, AsyncWindowContext, Context, Entity, Task, WeakEntity};
+use collections::HashSet;
+use gpui::{AppContext, AsyncWindowContext, Context, Entity, Task, TaskExt, WeakEntity};
 use language::Buffer;
 use project::{TaskSourceKind, WorktreeId};
 use remote::ConnectionState;
-use task::{DebugScenario, ResolvedTask, SaveStrategy, SpawnInTerminal, TaskContext, TaskTemplate};
+use task::{
+    DebugScenario, ResolvedTask, SaveStrategy, SharedTaskContext, SpawnInTerminal, TaskContext,
+    TaskHook, TaskTemplate, TaskVariables, VariableName,
+};
 use ui::Window;
 use util::TryFutureExt;
 
 use crate::{SaveIntent, Toast, Workspace, notifications::NotificationId};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduledTaskResult {
+    Success,
+    Failure,
+    SpawnFailed,
+    Cancelled,
+}
+
+type TaskCompletionHandler = Box<dyn FnOnce(ScheduledTaskResult, &mut AsyncWindowContext)>;
 
 impl Workspace {
     pub fn schedule_task(
@@ -34,8 +48,16 @@ impl Workspace {
             }
         }
 
-        if let Some(spawn_in_terminal) = task_to_resolve.resolve_task(&task_source_kind.to_id_base(), task_cx) {
-            self.schedule_resolved_task(task_source_kind, spawn_in_terminal, omit_history, window, cx);
+        if let Some(spawn_in_terminal) =
+            task_to_resolve.resolve_task(&task_source_kind.to_id_base(), task_cx)
+        {
+            self.schedule_resolved_task(
+                task_source_kind,
+                spawn_in_terminal,
+                omit_history,
+                window,
+                cx,
+            );
         }
     }
 
@@ -47,6 +69,44 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        self.schedule_resolved_task_internal(
+            task_source_kind,
+            resolved_task,
+            omit_history,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    pub fn schedule_resolved_task_with_completion(
+        self: &mut Workspace,
+        task_source_kind: TaskSourceKind,
+        resolved_task: ResolvedTask,
+        omit_history: bool,
+        on_complete: impl FnOnce(ScheduledTaskResult, &mut AsyncWindowContext) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        self.schedule_resolved_task_internal(
+            task_source_kind,
+            resolved_task,
+            omit_history,
+            Some(Box::new(on_complete)),
+            window,
+            cx,
+        );
+    }
+
+    fn schedule_resolved_task_internal(
+        self: &mut Workspace,
+        task_source_kind: TaskSourceKind,
+        resolved_task: ResolvedTask,
+        omit_history: bool,
+        on_complete: Option<TaskCompletionHandler>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         let spawn_in_terminal = resolved_task.resolved.clone();
         if !omit_history {
             if let Some(debugger_provider) = self.debugger_provider.as_ref() {
@@ -54,7 +114,9 @@ impl Workspace {
             }
 
             self.project().update(cx, |project, cx| {
-                if let Some(task_inventory) = project.task_store().read(cx).task_inventory().cloned() {
+                if let Some(task_inventory) =
+                    project.task_store().read(cx).task_inventory().cloned()
+                {
                     task_inventory.update(cx, |inventory, _| {
                         inventory.task_scheduled(task_source_kind, resolved_task);
                     })
@@ -70,16 +132,20 @@ impl Workspace {
                     workspace
                         .terminal_provider
                         .as_ref()
-                        .map(|terminal_provider| terminal_provider.spawn(spawn_in_terminal, window, cx))
+                        .map(|terminal_provider| {
+                            terminal_provider.spawn(spawn_in_terminal, window, cx)
+                        })
                 });
                 if let Some(spawn_task) = spawn_task.ok().flatten() {
                     let res = cx.background_spawn(spawn_task).await;
-                    match res {
+                    let result = match res {
                         Some(Ok(status)) => {
                             if status.success() {
                                 log::debug!("Task spawn succeeded");
+                                ScheduledTaskResult::Success
                             } else {
                                 log::debug!("Task spawn failed, code: {:?}", status.code());
+                                ScheduledTaskResult::Failure
                             }
                         }
                         Some(Err(e)) => {
@@ -87,21 +153,34 @@ impl Workspace {
                             _ = workspace.update(cx, |w, cx| {
                                 let id = NotificationId::unique::<ResolvedTask>();
                                 w.show_toast(Toast::new(id, format!("Task spawn failed: {e}")), cx);
-                            })
+                            });
+                            ScheduledTaskResult::SpawnFailed
                         }
-                        None => log::debug!("Task spawn got cancelled"),
+                        None => {
+                            log::debug!("Task spawn got cancelled");
+                            ScheduledTaskResult::Cancelled
+                        }
                     };
+                    if let Some(on_complete) = on_complete {
+                        on_complete(result, cx);
+                    }
+                } else if let Some(on_complete) = on_complete {
+                    on_complete(ScheduledTaskResult::Cancelled, cx);
                 }
             });
             self.scheduled_tasks.push(task);
         }
     }
 
-    pub async fn save_for_task(workspace: &WeakEntity<Self>, save_strategy: SaveStrategy, cx: &mut AsyncWindowContext) {
+    pub async fn save_for_task(
+        workspace: &WeakEntity<Self>,
+        save_strategy: SaveStrategy,
+        cx: &mut AsyncWindowContext,
+    ) {
         let save_action = match save_strategy {
             SaveStrategy::All => {
                 let save_all = workspace.update_in(cx, |workspace, window, cx| {
-                    let task = workspace.save_all_internal(SaveIntent::SaveAll, window, cx);
+                    let task = workspace.save_all_internal(SaveIntent::SaveAll, true, window, cx);
                     cx.background_spawn(async { task.await.map(|_| ()) })
                 });
                 save_all.ok()
@@ -122,14 +201,21 @@ impl Workspace {
     pub fn start_debug_session(
         &mut self,
         scenario: DebugScenario,
-        task_context: TaskContext,
+        task_context: SharedTaskContext,
         active_buffer: Option<Entity<Buffer>>,
         worktree_id: Option<WorktreeId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(provider) = self.debugger_provider.as_mut() {
-            provider.start_session(scenario, task_context, active_buffer, worktree_id, window, cx)
+            provider.start_session(
+                scenario,
+                task_context,
+                active_buffer,
+                worktree_id,
+                window,
+                cx,
+            )
         }
     }
 
@@ -145,9 +231,113 @@ impl Workspace {
             Task::ready(None)
         }
     }
+
+    pub fn run_create_worktree_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.project().clone();
+        let hooks = HashSet::from_iter([TaskHook::CreateWorktree]);
+
+        let worktree_tasks: Vec<(WorktreeId, TaskContext, Vec<TaskTemplate>)> = {
+            let project = project.read(cx);
+            let task_store = project.task_store();
+            let Some(inventory) = task_store.read(cx).task_inventory().cloned() else {
+                return;
+            };
+
+            let git_store = project.git_store().read(cx);
+
+            let mut worktree_tasks = Vec::new();
+            for worktree in project.worktrees(cx) {
+                let worktree = worktree.read(cx);
+                let worktree_id = worktree.id();
+                let worktree_abs_path = worktree.abs_path();
+
+                let templates: Vec<TaskTemplate> = inventory
+                    .read(cx)
+                    .templates_with_hooks(&hooks, worktree_id)
+                    .into_iter()
+                    .map(|(_, template)| template)
+                    .collect();
+
+                if templates.is_empty() {
+                    continue;
+                }
+
+                let mut task_variables = TaskVariables::default();
+                task_variables.insert(
+                    VariableName::WorktreeRoot,
+                    worktree_abs_path.to_string_lossy().into_owned(),
+                );
+
+                if let Some(path) = git_store.original_repo_path_for_worktree(worktree_id, cx) {
+                    task_variables.insert(
+                        VariableName::MainGitWorktree,
+                        path.to_string_lossy().into_owned(),
+                    );
+                }
+
+                let task_context = TaskContext {
+                    cwd: Some(worktree_abs_path.to_path_buf()),
+                    task_variables,
+                    project_env: Default::default(),
+                };
+
+                worktree_tasks.push((worktree_id, task_context, templates));
+            }
+            worktree_tasks
+        };
+
+        if worktree_tasks.is_empty() {
+            return;
+        }
+
+        let task = cx.spawn_in(window, async move |workspace, cx| {
+            let mut tasks = Vec::new();
+            for (worktree_id, task_context, templates) in worktree_tasks {
+                let id_base = format!("worktree_setup_{worktree_id}");
+
+                tasks.push(cx.spawn({
+                    let workspace = workspace.clone();
+                    async move |cx| {
+                        for task_template in templates {
+                            let Some(resolved) =
+                                task_template.resolve_task(&id_base, &task_context)
+                            else {
+                                continue;
+                            };
+
+                            let status = workspace.update_in(cx, |workspace, window, cx| {
+                                workspace.spawn_in_terminal(resolved.resolved, window, cx)
+                            })?;
+
+                            if let Some(result) = status.await {
+                                match result {
+                                    Ok(exit_status) if !exit_status.success() => {
+                                        log::error!(
+                                            "Git worktree setup task failed with status: {:?}",
+                                            exit_status.code()
+                                        );
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        log::error!("Git worktree setup task error: {error:#}");
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        anyhow::Ok(())
+                    }
+                }));
+            }
+
+            futures::future::join_all(tasks).await;
+            anyhow::Ok(())
+        });
+        task.detach_and_log_err(cx);
+    }
 }
 
-/// Test saving tasks
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,7 +364,13 @@ mod tests {
     async fn test_schedule_resolved_task_save_all(cx: &mut TestAppContext) {
         let (fixture, cx) = create_fixture(cx, SaveStrategy::All).await;
         fixture.workspace.update_in(cx, |workspace, window, cx| {
-            workspace.schedule_resolved_task(TaskSourceKind::UserInput, fixture.task, false, window, cx);
+            workspace.schedule_resolved_task(
+                TaskSourceKind::UserInput,
+                fixture.task,
+                false,
+                window,
+                cx,
+            );
         });
         cx.executor().run_until_parked();
 
@@ -188,7 +384,13 @@ mod tests {
         // Add a second inactive dirty item
         let inactive = add_test_item(&fixture.workspace, "file2.txt", false, cx);
         fixture.workspace.update_in(cx, |workspace, window, cx| {
-            workspace.schedule_resolved_task(TaskSourceKind::UserInput, fixture.task, false, window, cx);
+            workspace.schedule_resolved_task(
+                TaskSourceKind::UserInput,
+                fixture.task,
+                false,
+                window,
+                cx,
+            );
         });
         cx.executor().run_until_parked();
 
@@ -203,12 +405,42 @@ mod tests {
     async fn test_schedule_resolved_task_save_none(cx: &mut TestAppContext) {
         let (fixture, cx) = create_fixture(cx, SaveStrategy::None).await;
         fixture.workspace.update_in(cx, |workspace, window, cx| {
-            workspace.schedule_resolved_task(TaskSourceKind::UserInput, fixture.task, false, window, cx);
+            workspace.schedule_resolved_task(
+                TaskSourceKind::UserInput,
+                fixture.task,
+                false,
+                window,
+                cx,
+            );
         });
         cx.executor().run_until_parked();
 
         assert_eq!(*fixture.dirty_before_spawn.lock(), Some(true));
         assert!(cx.read(|cx| fixture.item.read(cx).is_dirty));
+    }
+
+    #[gpui::test]
+    async fn test_schedule_resolved_task_with_completion_reports_success(cx: &mut TestAppContext) {
+        let (fixture, cx) = create_fixture(cx, SaveStrategy::None).await;
+        let task_result = Arc::new(Mutex::new(None));
+        fixture.workspace.update_in(cx, |workspace, window, cx| {
+            workspace.schedule_resolved_task_with_completion(
+                TaskSourceKind::UserInput,
+                fixture.task,
+                false,
+                {
+                    let task_result = task_result.clone();
+                    move |result, _| {
+                        *task_result.lock() = Some(result);
+                    }
+                },
+                window,
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+
+        assert_eq!(*task_result.lock(), Some(ScheduledTaskResult::Success));
     }
 
     async fn create_fixture(
@@ -218,13 +450,15 @@ mod tests {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
-            theme::init(theme::LoadThemes::JustBase, cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             register_serializable_item::<TestItem>(cx);
         });
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/root", json!({ "file.txt": "dirty" })).await;
+        fs.insert_tree("/root", json!({ "file.txt": "dirty" }))
+            .await;
         let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
-        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
         // Add a dirty item to the workspace
         let item = add_test_item(&workspace, "file.txt", true, cx);
@@ -235,7 +469,9 @@ mod tests {
             save: save_strategy,
             ..Default::default()
         };
-        let task = template.resolve_task("test", &task::TaskContext::default()).unwrap();
+        let task = template
+            .resolve_task("test", &task::TaskContext::default())
+            .unwrap();
         let dirty_before_spawn: Arc<Mutex<Option<bool>>> = Arc::default();
         let terminal_provider = Box::new(TestTerminalProvider {
             item: item.clone(),
