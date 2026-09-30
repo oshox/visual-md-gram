@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://www.schemastore.org/github-workflow.json
 #
-# Builds the Zed MD Windows installer and Linux tarball. Runs manually, or on
+# Builds the Zed MD Windows installer, Linux tarball and Linux remote server. Runs manually, or on
 # a `v*` tag, where it also publishes a GitHub release.
 name: Zed MD Packages
 
@@ -53,6 +53,20 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The app looks up its own version's release by tag when it downloads
+      # the remote server, so a tag that disagrees with the crate version
+      # would publish a release the app can never find.
+      - name: Check tag matches app version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -n 1)"
+          if [[ "${GITHUB_REF_NAME}" != "v${app_version}" ]]; then
+            echo "Error: tag ${GITHUB_REF_NAME} does not match crates/zed version v${app_version}" >&2
+            exit 1
+          fi
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.3
         with:
@@ -80,6 +94,15 @@ jobs:
             exit 1
           fi
           cp "${tarball}" "artifacts/zed-md-${version}-linux-x86_64.tar.gz"
+
+          # Served to WSL and SSH hosts by the app (see
+          # `release_asset_matches` in crates/auto_update).
+          remote_server="$(find target -name 'zed-remote-server-linux-x86_64.gz' -print -quit)"
+          if [[ -z "${remote_server}" ]]; then
+            echo "Error: no Linux remote server produced" >&2
+            exit 1
+          fi
+          cp "${remote_server}" "artifacts/zed-remote-server-linux-x86_64.gz"
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
