@@ -199,6 +199,26 @@ pub struct Plan {
     /// collapsed callout's `body_range` even while its title happens to be
     /// showing raw (touched) text.
     pub callouts: Vec<CalloutInfo>,
+    /// Lines that hold nothing but one image (`![alt](path)` or the
+    /// Obsidian-style `![[path]]` embed) and aren't touched by a selection.
+    /// Rendered as a block that replaces the whole line, for the same reason
+    /// `horizontal_rules` are: an image needs the editor's real width, which
+    /// a fold can't stretch to. See `apply_images` in visual_md.rs.
+    pub images: Vec<ImageInfo>,
+}
+
+/// A standalone image line, see `Plan::images`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInfo {
+    /// The line's byte range with leading indentation and the newline
+    /// excluded.
+    pub range: Range<usize>,
+    /// The raw path or URL as written. For an embed this has any `|size` or
+    /// `#heading` suffix already stripped.
+    pub target: String,
+    /// Whether this came from a `![[name]]` embed, which Obsidian resolves by
+    /// name anywhere in the vault rather than strictly relative to the note.
+    pub is_embed: bool,
 }
 
 /// A column's alignment, from its `pipe_table_delimiter_cell`
@@ -337,7 +357,104 @@ pub fn plan_viewport(text: &str, selections: &[Range<usize>], visible_range: Ran
     plan.dimmed_markers = merge_ranges(plan.dimmed_markers);
     plan.hidden_markers = subtract_ranges(&plan.hidden_markers, &plan.dimmed_markers);
 
+    plan_images(text, selections, &visible_range, &mut plan);
+
     plan
+}
+
+/// Finds lines consisting solely of an image. Done as a line scan rather than
+/// through the tree: `![[embed]]` isn't markdown grammar at all, and a
+/// standalone image line is the only shape that can sensibly be swapped for a
+/// block. Fenced code is skipped by tracking the fence markers directly.
+fn plan_images(
+    text: &str,
+    selections: &[Range<usize>],
+    visible_range: &Range<usize>,
+    plan: &mut Plan,
+) {
+    let mut offset = 0;
+    let mut open_fence: Option<(char, usize)> = None;
+    for line in text.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        let content = line.trim_end_matches(['\n', '\r']);
+        let trimmed = content.trim_start_matches(' ');
+        let indentation = content.len() - trimmed.len();
+        if indentation >= 4 {
+            continue;
+        }
+
+        let fence_character = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'));
+        if let Some(fence_character) = fence_character {
+            let run = trimmed
+                .chars()
+                .take_while(|c| *c == fence_character)
+                .count();
+            if run >= 3 {
+                match open_fence {
+                    None => open_fence = Some((fence_character, run)),
+                    Some((open_character, open_run))
+                        if open_character == fence_character
+                            && run >= open_run
+                            && trimmed[run..].trim().is_empty() =>
+                    {
+                        open_fence = None;
+                    }
+                    Some(_) => {}
+                }
+                continue;
+            }
+        }
+        if open_fence.is_some() {
+            continue;
+        }
+
+        let range = (line_start + indentation)..(line_start + content.trim_end().len());
+        if range.start >= range.end
+            || !overlaps(&range, visible_range) && !visible_range.is_empty()
+            || touches_selection(&range, selections)
+        {
+            continue;
+        }
+        if let Some((target, is_embed)) = parse_image_line(&text[range.clone()]) {
+            plan.images.push(ImageInfo {
+                range,
+                target,
+                is_embed,
+            });
+        }
+    }
+}
+
+/// `line` must already be trimmed. Returns the image target and whether it
+/// was a `![[..]]` embed.
+fn parse_image_line(line: &str) -> Option<(String, bool)> {
+    if let Some(inner) = line
+        .strip_prefix("![[")
+        .and_then(|rest| rest.strip_suffix("]]"))
+    {
+        if inner.contains("[[") || inner.contains("]]") {
+            return None;
+        }
+        let name = inner.split(['|', '#']).next()?.trim();
+        return (!name.is_empty()).then(|| (name.to_string(), true));
+    }
+
+    let rest = line.strip_prefix("![")?;
+    let alt_end = rest.find("](")?;
+    if rest[..alt_end].contains(['[', ']']) {
+        return None;
+    }
+    let destination = rest[alt_end + 2..].strip_suffix(')')?;
+    if destination.contains(['(', ')']) && !destination.starts_with('<') {
+        return None;
+    }
+    let destination = destination.trim();
+    let destination = match destination.strip_prefix('<') {
+        Some(bracketed) => bracketed.split('>').next()?,
+        None => destination.split_whitespace().next()?,
+    };
+    (!destination.is_empty()).then(|| (destination.to_string(), false))
 }
 
 /// Sorts and merges overlapping/touching ranges into a minimal disjoint set.
@@ -2322,5 +2439,68 @@ mod tests {
                 .any(|(_, style)| *style == SpanStyle::Bold),
             "bold inside a cell should still be styled"
         );
+    }
+
+    #[test]
+    fn standalone_markdown_image_line_is_planned() {
+        let text = "before\n![alt](pics/a.png)\nafter\n";
+        let result = plan(text, &[]);
+        assert_eq!(
+            result.images,
+            vec![ImageInfo {
+                range: 7..25,
+                target: "pics/a.png".to_string(),
+                is_embed: false,
+            }]
+        );
+        assert_eq!(&text[7..25], "![alt](pics/a.png)");
+    }
+
+    #[test]
+    fn image_title_and_angle_brackets_are_stripped_from_the_target() {
+        let titled = plan("![a](x.png \"a title\")\n", &[]);
+        assert_eq!(titled.images[0].target, "x.png");
+        let bracketed = plan("![a](<my pic.png>)\n", &[]);
+        assert_eq!(bracketed.images[0].target, "my pic.png");
+    }
+
+    #[test]
+    fn embed_strips_size_and_heading_suffixes() {
+        let sized = plan("![[cat.png|300]]\n", &[]);
+        assert_eq!(sized.images[0].target, "cat.png");
+        assert!(sized.images[0].is_embed);
+        let heading = plan("![[cat.png#frag]]\n", &[]);
+        assert_eq!(heading.images[0].target, "cat.png");
+    }
+
+    #[test]
+    fn image_mixed_with_text_is_left_raw() {
+        assert!(plan("see ![a](x.png) here\n", &[]).images.is_empty());
+        assert!(plan("![a](x.png) trailing\n", &[]).images.is_empty());
+        assert!(plan("![a]()\n", &[]).images.is_empty());
+        assert!(plan("![[]]\n", &[]).images.is_empty());
+    }
+
+    #[test]
+    fn touched_image_line_is_excluded() {
+        let text = "![a](x.png)\n";
+        assert!(plan(text, &[3..3]).images.is_empty());
+    }
+
+    #[test]
+    fn images_inside_fenced_or_indented_code_are_ignored() {
+        let fenced = "```\n![a](x.png)\n```\n![b](y.png)\n";
+        let result = plan(fenced, &[]);
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].target, "y.png");
+        assert!(plan("    ![a](x.png)\n", &[]).images.is_empty());
+    }
+
+    #[test]
+    fn images_outside_the_viewport_are_pruned() {
+        let text = "![a](x.png)\n\n\n![b](y.png)\n";
+        let result = plan_viewport(text, &[], 0..12);
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].target, "x.png");
     }
 }
