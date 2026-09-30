@@ -32,6 +32,11 @@ use std::{
 use util::command::new_command;
 use workspace::Workspace;
 
+/// The GitHub repository whose releases are the source of both app updates
+/// and the remote server binary. `Zed MD Packages` publishes a release here
+/// for every `v*` tag.
+const RELEASE_REPOSITORY: &str = "oshox/visual-md-zed";
+
 const SHOULD_SHOW_UPDATE_NOTIFICATION_KEY: &str = "auto-updater-should-show-updated-notification";
 
 #[derive(Debug)]
@@ -108,16 +113,6 @@ actions!(
         ViewReleaseNotes,
     ]
 );
-
-#[derive(Serialize, Debug)]
-pub struct AssetQuery<'a> {
-    asset: &'a str,
-    os: &'a str,
-    arch: &'a str,
-    metrics_id: Option<&'a str>,
-    system_id: Option<&'a str>,
-    is_staff: Option<bool>,
-}
 
 #[derive(Clone, Debug)]
 pub enum AutoUpdateStatus {
@@ -347,18 +342,14 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
     let url = match release_channel {
         ReleaseChannel::Stable | ReleaseChannel::Preview => {
             let auto_updater = AutoUpdater::get(cx)?;
-            let auto_updater = auto_updater.read(cx);
-            let mut current_version = auto_updater.current_version.clone();
+            let mut current_version = auto_updater.read(cx).current_version.clone();
             current_version.pre = semver::Prerelease::EMPTY;
             current_version.build = semver::BuildMetadata::EMPTY;
-            let release_channel = release_channel.dev_name();
-            let path = format!("/releases/{release_channel}/{current_version}");
-            auto_updater.client.http_client().build_url(&path)
+            format!("https://github.com/{RELEASE_REPOSITORY}/releases/tag/v{current_version}")
         }
-        ReleaseChannel::Nightly => {
-            "https://github.com/zed-industries/zed/commits/nightly/".to_string()
+        ReleaseChannel::Nightly | ReleaseChannel::Dev => {
+            format!("https://github.com/{RELEASE_REPOSITORY}/releases")
         }
-        ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
     };
     Some(url)
 }
@@ -674,66 +665,62 @@ impl AutoUpdater {
         Ok(Some(release.url))
     }
 
+    /// Finds `asset` for `os`/`arch` in this project's GitHub releases: the
+    /// release tagged `v<version>` when a version is requested, otherwise the
+    /// newest published non-prerelease. There is one release stream, so the
+    /// release channel plays no part in the lookup.
     async fn get_release_asset(
         this: &Entity<Self>,
-        release_channel: ReleaseChannel,
+        _release_channel: ReleaseChannel,
         version: Option<Version>,
         asset: &str,
         os: &str,
         arch: &str,
         cx: &mut AsyncApp,
     ) -> Result<ReleaseAsset> {
-        let client = this.read_with(cx, |this, _| this.client.clone());
+        let http_client = this.read_with(cx, |this, _| this.client.http_client());
 
-        let (system_id, metrics_id, is_staff) = if client.telemetry().metrics_enabled() {
-            (
-                client.telemetry().system_id(),
-                client.telemetry().metrics_id(),
-                client.telemetry().is_staff(),
-            )
-        } else {
-            (None, None, None)
-        };
+        let release = match version {
+            Some(mut version) => {
+                version.pre = semver::Prerelease::EMPTY;
+                version.build = semver::BuildMetadata::EMPTY;
+                http_client::github::get_release_by_tag_name(
+                    RELEASE_REPOSITORY,
+                    &format!("v{version}"),
+                    http_client,
+                )
+                .await
+            }
+            None => {
+                http_client::github::latest_github_release(
+                    RELEASE_REPOSITORY,
+                    true,
+                    false,
+                    http_client,
+                )
+                .await
+            }
+        }
+        .with_context(|| format!("fetching release from github.com/{RELEASE_REPOSITORY}"))?;
 
-        let version = if let Some(mut version) = version {
-            version.pre = semver::Prerelease::EMPTY;
-            version.build = semver::BuildMetadata::EMPTY;
-            version.to_string()
-        } else {
-            "latest".to_string()
-        };
-        let http_client = client.http_client();
+        let matching_asset = release
+            .assets
+            .iter()
+            .find(|candidate| release_asset_matches(&candidate.name, asset, os, arch))
+            .with_context(|| {
+                format!(
+                    "release {} has no {asset} asset for {os}-{arch}",
+                    release.tag_name
+                )
+            })?;
 
-        let path = format!("/releases/{}/{}/asset", release_channel.dev_name(), version,);
-        let url = http_client.build_zed_cloud_url_with_query(
-            &path,
-            AssetQuery {
-                os,
-                arch,
-                asset,
-                metrics_id: metrics_id.as_deref(),
-                system_id: system_id.as_deref(),
-                is_staff,
-            },
-        )?;
-
-        let mut response = http_client
-            .get(url.as_str(), Default::default(), true)
-            .await?;
-        let mut body = Vec::new();
-        response.body_mut().read_to_end(&mut body).await?;
-
-        anyhow::ensure!(
-            response.status().is_success(),
-            "failed to fetch release: {:?}",
-            String::from_utf8_lossy(&body),
-        );
-
-        serde_json::from_slice(body.as_slice()).with_context(|| {
-            format!(
-                "error deserializing release {:?}",
-                String::from_utf8_lossy(&body),
-            )
+        Ok(ReleaseAsset {
+            version: release
+                .tag_name
+                .strip_prefix('v')
+                .unwrap_or(&release.tag_name)
+                .to_string(),
+            url: matching_asset.browser_download_url.clone(),
         })
     }
 
@@ -993,6 +980,18 @@ impl AutoUpdater {
         cx.background_spawn(async move {
             Ok(kvp.read_kvp(SHOULD_SHOW_UPDATE_NOTIFICATION_KEY)?.is_some())
         })
+    }
+}
+
+/// The asset names `Zed MD Packages` publishes (see
+/// `.github/workflows/zed_md_packages.yml`). The installer and tarball names
+/// embed the version, so they are matched by suffix.
+fn release_asset_matches(name: &str, asset: &str, os: &str, arch: &str) -> bool {
+    match (asset, os) {
+        ("zed-remote-server", _) => name == format!("zed-remote-server-{os}-{arch}.gz"),
+        ("zed", "windows") => name.ends_with(&format!("-{arch}-setup.exe")),
+        ("zed", "linux") => name.ends_with(&format!("-linux-{arch}.tar.gz")),
+        _ => false,
     }
 }
 
@@ -1361,7 +1360,7 @@ mod tests {
     use client::Client;
     use clock::FakeSystemClock;
     use futures::channel::oneshot;
-    use gpui::TestAppContext;
+    use gpui::{BorrowAppContext as _, TestAppContext};
     use http_client::{FakeHttpClient, Response};
     use settings::default_settings;
     use std::{
@@ -1379,6 +1378,65 @@ mod tests {
     }
 
     use super::*;
+
+    /// A GitHub "list releases" response with one release whose assets cover
+    /// every platform the updater can install on, all served from `download`.
+    fn releases_json(tag: &str, download: &str) -> String {
+        let assets: Vec<String> = [
+            format!("zed-md-{tag}-x86_64-setup.exe"),
+            format!("zed-md-{tag}-linux-x86_64.tar.gz"),
+            "zed-remote-server-linux-x86_64.gz".to_string(),
+        ]
+        .iter()
+        .map(|name| {
+            format!(r#"{{"name":"{name}","browser_download_url":"{download}","digest":null}}"#)
+        })
+        .collect();
+        format!(
+            r#"[{{"tag_name":"{tag}","prerelease":false,"tarball_url":"","zipball_url":"","assets":[{}]}}]"#,
+            assets.join(",")
+        )
+    }
+
+    #[test]
+    fn test_release_asset_names_match_the_packages_workflow() {
+        assert!(release_asset_matches(
+            "zed-md-v1.2.3-x86_64-setup.exe",
+            "zed",
+            "windows",
+            "x86_64"
+        ));
+        assert!(!release_asset_matches(
+            "zed-md-v1.2.3-x86_64-setup.exe",
+            "zed",
+            "windows",
+            "aarch64"
+        ));
+        assert!(release_asset_matches(
+            "zed-md-v1.2.3-linux-x86_64.tar.gz",
+            "zed",
+            "linux",
+            "x86_64"
+        ));
+        assert!(release_asset_matches(
+            "zed-remote-server-linux-x86_64.gz",
+            "zed-remote-server",
+            "linux",
+            "x86_64"
+        ));
+        assert!(!release_asset_matches(
+            "zed-md-v1.2.3-linux-x86_64.tar.gz",
+            "zed-remote-server",
+            "linux",
+            "x86_64"
+        ));
+        assert!(!release_asset_matches(
+            "zed-md-v1.2.3-x86_64-setup.exe",
+            "zed",
+            "macos",
+            "aarch64"
+        ));
+    }
 
     pub(super) struct InstallOverride(pub Rc<dyn Fn(&Path, &AsyncApp) -> Result<Option<PathBuf>>>);
     impl Global for InstallOverride {}
@@ -1408,6 +1466,13 @@ mod tests {
 
         cx.update(|cx| {
             settings::init(cx);
+            // Zed MD ships with auto_update off, which keeps the poller from
+            // ever starting; this test is about the download flow.
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(r#"{"auto_update": true}"#, cx)
+                    .expect("Unable to set user settings");
+            });
 
             let current_version = semver::Version::new(0, 100, 0);
             release_channel::init_test(current_version, ReleaseChannel::Stable, cx);
@@ -1419,23 +1484,26 @@ mod tests {
                 let release_available = release_available.load(atomic::Ordering::Relaxed);
                 let dmg_rx = dmg_rx.clone();
                 async move {
-                if req.uri().path() == "/releases/stable/latest/asset" {
-                    if release_available {
-                        return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.1","url":"https://test.example/new-download"}"#.into()
-                        ).unwrap());
-                    } else {
-                        return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.0","url":"https://test.example/old-download"}"#.into()
-                        ).unwrap());
+                    if req.uri().path() == "/repos/oshox/visual-md-zed/releases" {
+                        let (tag, download) = if release_available {
+                            ("v0.100.1", "https://test.example/new-download")
+                        } else {
+                            ("v0.100.0", "https://test.example/old-download")
+                        };
+                        return Ok(Response::builder()
+                            .status(200)
+                            .body(releases_json(tag, download).into())
+                            .unwrap());
+                    } else if req.uri().path() == "/new-download" {
+                        return Ok(Response::builder()
+                            .status(200)
+                            .body({
+                                let dmg_rx = dmg_rx.lock().take().unwrap();
+                                dmg_rx.await.unwrap().into()
+                            })
+                            .unwrap());
                     }
-                } else if req.uri().path() == "/new-download" {
-                    return Ok(Response::builder().status(200).body({
-                        let dmg_rx = dmg_rx.lock().take().unwrap();
-                        dmg_rx.await.unwrap().into()
-                    }).unwrap());
-                }
-                Ok(Response::builder().status(404).body("".into()).unwrap())
+                    Ok(Response::builder().status(404).body("".into()).unwrap())
                 }
             });
             let client = Client::new(clock, fake_client_http, cx);
